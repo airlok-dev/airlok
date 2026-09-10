@@ -1,0 +1,25 @@
+[package]
+name = "airlok-tests"
+description = "Integration tests for airlok against a scripted mock provider."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "agent_loop"
+path = "agent_loop.rs"
+
+[[test]]
+name = "redaction"
+path = "redaction.rs"
+
+[dependencies]
+airlok-core.workspace = true
+airlok-llm.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

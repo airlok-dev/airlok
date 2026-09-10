@@ -1,0 +1,22 @@
+[package]
+name = "airlok"
+description = "A privacy airlock between your code and third-party models: a terminal coding agent that redacts secrets before they leave your machine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+
+[[bin]]
+name = "airlok"
+path = "src/main.rs"
+
+[dependencies]
+airlok-core.workspace = true
+airlok-llm.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
