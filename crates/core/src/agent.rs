@@ -62,7 +62,7 @@ impl Agent {
         let mut history = vec![Message::user_text(prompt)];
         let mut report = RunReport::default();
 
-        for turn in 1..=self.config.max_turns {
+        for turn in 1..=self.config.agent.max_turns {
             report.turns = turn;
             let (request, map) = self.build_request(&system, &history, &specs);
             let response = self.stream_response(request, &map, out).await?;
@@ -86,7 +86,7 @@ impl Agent {
             }
             history.push(Message::tool_results(results));
         }
-        Err(CoreError::TurnLimit(self.config.max_turns))
+        Err(CoreError::TurnLimit(self.config.agent.max_turns))
     }
 
     /// Redacts the whole outbound body. The returned map is what the
@@ -111,8 +111,8 @@ impl Agent {
             })
             .collect();
         let request = Request {
-            model: self.config.model.clone(),
-            max_tokens: self.config.max_tokens,
+            model: self.config.provider.model.clone(),
+            max_tokens: self.config.agent.max_tokens,
             system,
             messages,
             tools: specs.to_vec(),

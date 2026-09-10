@@ -31,10 +31,10 @@ async fn main() -> anyhow::Result<()> {
         ProviderKind::OpenAi => Arc::new(OpenAi::from_env().context("no model credentials")?),
     };
     let mut config = Config::new(cwd.clone());
-    config.model = args
+    config.provider.model = args
         .model
         .unwrap_or_else(|| args.provider.default_model().to_string());
-    let tools = ToolRegistry::defaults(&cwd, config.bash_timeout);
+    let tools = ToolRegistry::defaults(&cwd, config.agent.bash_timeout);
 
     let mut agent = Agent::new(provider, tools, Box::new(SecretRedactor::new()), config);
     let mut out = Stdout::default();

@@ -10,7 +10,7 @@ pub mod session;
 pub mod tools;
 
 pub use agent::{Agent, RunReport};
-pub use config::Config;
+pub use config::{Config, ConfigError};
 
 /// Where user-facing output goes. Implemented by the CLI.
 pub trait Output: Send {
