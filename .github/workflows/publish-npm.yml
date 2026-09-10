@@ -15,9 +15,10 @@ on:
 jobs:
   publish-npm:
     runs-on: ubuntu-latest
+    # Must not exceed what the caller grants (id-token and packages), or
+    # GitHub rejects the whole workflow at startup.
     permissions:
       id-token: write
-      contents: read
     env:
       PLAN: ${{ inputs.plan }}
     steps:
