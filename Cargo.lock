@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "airlok"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "airlok-core",
  "airlok-llm",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "airlok-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "airlok-llm",
  "async-trait",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "airlok-llm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures",
  "reqwest",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "airlok-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "airlok-core",
  "airlok-llm",
