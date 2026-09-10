@@ -28,7 +28,8 @@ pub struct Args {
 pub enum ProviderKind {
     /// Anthropic Messages API, key from ANTHROPIC_API_KEY
     Anthropic,
-    /// OpenAI Chat Completions API, key from OPENAI_API_KEY
+    /// OpenAI Chat Completions API, key from OPENAI_API_KEY. For Azure OpenAI set
+    /// AZURE_OPENAI_API_KEY and OPENAI_BASE_URL=https://<resource>.openai.azure.com/openai/v1
     #[value(name = "openai")]
     OpenAi,
 }
