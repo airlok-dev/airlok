@@ -6,12 +6,12 @@ use std::sync::Arc;
 use airlok_core::redact::SecretRedactor;
 use airlok_core::tools::ToolRegistry;
 use airlok_core::{Agent, Config, Output, RunReport};
-use airlok_llm::Anthropic;
+use airlok_llm::{Anthropic, OpenAi, Provider};
 use anyhow::Context;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use args::Args;
+use args::{Args, ProviderKind};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,17 +26,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
-    let provider = Anthropic::from_env().context("no model credentials")?;
+    let provider: Arc<dyn Provider> = match args.provider {
+        ProviderKind::Anthropic => Arc::new(Anthropic::from_env().context("no model credentials")?),
+        ProviderKind::OpenAi => Arc::new(OpenAi::from_env().context("no model credentials")?),
+    };
     let mut config = Config::new(cwd.clone());
-    config.model = args.model;
+    config.model = args
+        .model
+        .unwrap_or_else(|| args.provider.default_model().to_string());
     let tools = ToolRegistry::defaults(&cwd, config.bash_timeout);
 
-    let mut agent = Agent::new(
-        Arc::new(provider),
-        tools,
-        Box::new(SecretRedactor::new()),
-        config,
-    );
+    let mut agent = Agent::new(provider, tools, Box::new(SecretRedactor::new()), config);
     let mut out = Stdout::default();
     let report = agent.run(&args.prompt, &mut out).await?;
     out.end_line();

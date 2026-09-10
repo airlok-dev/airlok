@@ -6,7 +6,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+/// The agent's default model, which is the Anthropic provider's default.
+pub use airlok_llm::anthropic::DEFAULT_MODEL;
 
 #[derive(Debug, Clone)]
 pub struct Config {

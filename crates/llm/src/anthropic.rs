@@ -5,18 +5,19 @@
 //! (`message_start`, `content_block_start`, `content_block_delta`,
 //! `content_block_stop`, `message_delta`, `message_stop`, `ping`, `error`).
 
-use std::collections::VecDeque;
-
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde_json::Value;
 use tracing::{debug, trace};
 
+use crate::sse;
 use crate::types::{Message, Request, StopReason, StreamEvent, ToolSpec};
 use crate::{LlmError, Provider};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
+pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+const API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 
 pub struct Anthropic {
     client: reqwest::Client,
@@ -27,11 +28,7 @@ pub struct Anthropic {
 impl Anthropic {
     /// Reads the key from `ANTHROPIC_API_KEY`.
     pub fn from_env() -> Result<Self, LlmError> {
-        let key = std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|k| !k.trim().is_empty())
-            .ok_or(LlmError::MissingApiKey)?;
-        Ok(Self::new(key))
+        Ok(Self::new(crate::key_from_env(API_KEY_VAR)?))
     }
 
     pub fn new(api_key: String) -> Self {
@@ -76,115 +73,10 @@ impl Provider for Anthropic {
                 .json(&body)
                 .send()
                 .await?;
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(LlmError::Api {
-                    status: status.as_u16(),
-                    body,
-                });
-            }
-            Ok(
-                SseEvents::new(response.bytes_stream().map_ok(|b| b.to_vec()).boxed())
-                    .into_stream(),
-            )
+            let bytes = sse::body_or_error(response).await?;
+            Ok::<_, LlmError>(sse::events(bytes, BlockAssembler::default()))
         };
         stream::once(open).try_flatten().boxed()
-    }
-}
-
-/// Turns the raw byte stream into [`StreamEvent`]s.
-struct SseEvents {
-    bytes: BoxStream<'static, reqwest::Result<Vec<u8>>>,
-    buffer: String,
-    pending: VecDeque<StreamEvent>,
-    assembler: BlockAssembler,
-    finished: bool,
-}
-
-impl SseEvents {
-    fn new(bytes: BoxStream<'static, reqwest::Result<Vec<u8>>>) -> Self {
-        Self {
-            bytes,
-            buffer: String::new(),
-            pending: VecDeque::new(),
-            assembler: BlockAssembler::default(),
-            finished: false,
-        }
-    }
-
-    fn into_stream(self) -> impl futures::Stream<Item = Result<StreamEvent, LlmError>> + Send {
-        stream::unfold(self, |mut state| async move {
-            loop {
-                if let Some(event) = state.pending.pop_front() {
-                    return Some((Ok(event), state));
-                }
-                if state.finished {
-                    return None;
-                }
-                match state.bytes.next().await {
-                    None => {
-                        state.finished = true;
-                        if !state.assembler.ended {
-                            return Some((
-                                Err(LlmError::Protocol(
-                                    "stream ended before message_stop".into(),
-                                )),
-                                state,
-                            ));
-                        }
-                    }
-                    Some(Err(e)) => {
-                        state.finished = true;
-                        return Some((Err(e.into()), state));
-                    }
-                    Some(Ok(chunk)) => {
-                        state.buffer.push_str(&String::from_utf8_lossy(&chunk));
-                        for payload in drain_sse_payloads(&mut state.buffer) {
-                            match state.assembler.feed(&payload) {
-                                Ok(events) => state.pending.extend(events),
-                                Err(e) => {
-                                    state.finished = true;
-                                    return Some((Err(e), state));
-                                }
-                            }
-                        }
-                        if state.assembler.ended {
-                            state.finished = true;
-                        }
-                    }
-                }
-            }
-        })
-    }
-}
-
-/// Removes every complete SSE event from `buffer` and returns their joined
-/// `data:` payloads. Events are separated by a blank line.
-fn drain_sse_payloads(buffer: &mut String) -> Vec<String> {
-    let mut payloads = Vec::new();
-    while let Some(end) = find_event_boundary(buffer) {
-        let event: String = buffer.drain(..end.0).collect();
-        buffer.drain(..end.1);
-        let data: Vec<&str> = event
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(str::trim_start)
-            .collect();
-        if !data.is_empty() {
-            payloads.push(data.join("\n"));
-        }
-    }
-    payloads
-}
-
-/// Returns (index where the event text ends, length of the separator).
-fn find_event_boundary(buffer: &str) -> Option<(usize, usize)> {
-    let lf = buffer.find("\n\n").map(|i| (i, 2));
-    let crlf = buffer.find("\r\n\r\n").map(|i| (i, 4));
-    match (lf, crlf) {
-        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
-        (a, b) => a.or(b),
     }
 }
 
@@ -206,7 +98,11 @@ enum PartialBlock {
     Ignored,
 }
 
-impl BlockAssembler {
+impl sse::Assembler for BlockAssembler {
+    fn ended(&self) -> bool {
+        self.ended
+    }
+
     fn feed(&mut self, payload: &str) -> Result<Vec<StreamEvent>, LlmError> {
         let value: Value = serde_json::from_str(payload)?;
         let kind = value["type"].as_str().unwrap_or_default();
@@ -244,12 +140,11 @@ impl BlockAssembler {
             }
             "content_block_stop" => {
                 if let Some(PartialBlock::ToolUse { id, name, json }) = self.current.take() {
-                    let input = if json.trim().is_empty() {
-                        Value::Object(Default::default())
-                    } else {
-                        serde_json::from_str(&json)?
-                    };
-                    out.push(StreamEvent::ToolUse { id, name, input });
+                    out.push(StreamEvent::ToolUse {
+                        id,
+                        name,
+                        input: crate::parse_arguments(&json)?,
+                    });
                 }
             }
             "message_delta" => {
@@ -286,6 +181,7 @@ fn string_field(value: &Value, key: &str) -> Result<String, LlmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sse::Assembler;
 
     #[test]
     fn assembles_text_and_tool_use_from_sse() {
@@ -316,16 +212,8 @@ mod tests {
             "data: {\"type\":\"message_stop\"}\n\n",
         );
 
-        // Feed in awkward chunk sizes to exercise buffering.
-        let mut buffer = String::new();
         let mut assembler = BlockAssembler::default();
-        let mut events = Vec::new();
-        for chunk in raw.as_bytes().chunks(17) {
-            buffer.push_str(std::str::from_utf8(chunk).unwrap());
-            for payload in drain_sse_payloads(&mut buffer) {
-                events.extend(assembler.feed(&payload).unwrap());
-            }
-        }
+        let events = sse::assemble_chunked(raw, &mut assembler);
 
         assert_eq!(
             events,
@@ -342,7 +230,7 @@ mod tests {
                 },
             ]
         );
-        assert!(buffer.is_empty());
+        assert!(assembler.ended());
     }
 
     #[test]
