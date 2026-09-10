@@ -38,6 +38,11 @@ impl Anthropic {
             base_url: DEFAULT_BASE_URL.to_string(),
         }
     }
+
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        self.base_url = base_url.trim_end_matches('/').to_string();
+        self
+    }
 }
 
 #[derive(Serialize)]

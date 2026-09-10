@@ -20,6 +20,7 @@ dependencies = [
  "anyhow",
  "clap",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

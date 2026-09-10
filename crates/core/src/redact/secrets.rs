@@ -31,6 +31,8 @@ const PATTERNS: &[(&str, &str)] = &[
     ),
 ];
 
+const MIN_KNOWN_SECRET_LEN: usize = 12;
+
 pub struct SecretRedactor {
     patterns: Vec<Regex>,
     map: RedactionMap,
@@ -53,6 +55,23 @@ impl SecretRedactor {
             map: RedactionMap::new(),
             placeholder_for: HashMap::new(),
         }
+    }
+
+    /// Values to redact wherever they appear, such as the provider key
+    /// the process is running with. Short values are ignored so a weak
+    /// test key cannot redact every occurrence of a common word.
+    pub fn with_known<I, S>(mut self, secrets: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for secret in secrets {
+            let secret = secret.as_ref();
+            if secret.len() >= MIN_KNOWN_SECRET_LEN {
+                self.placeholder(secret);
+            }
+        }
+        self
     }
 
     fn placeholder(&mut self, secret: &str) -> String {
@@ -203,6 +222,15 @@ mod tests {
         assert_eq!(first, "Authorization: Bearer <<SECRET_1>>");
         let (second, _) = redactor.redact(&format!("TOKEN={token}"));
         assert_eq!(second, "TOKEN=<<SECRET_1>>");
+    }
+
+    #[test]
+    fn known_secrets_are_redacted_without_a_pattern() {
+        let mut redactor =
+            SecretRedactor::new().with_known(["0123456789abcdef0123456789abcdef", "short"]);
+        let (out, map) = redactor.redact("key=0123456789abcdef0123456789abcdef short");
+        assert_eq!(out, "key=<<SECRET_1>> short");
+        assert_eq!(map.len(), 1);
     }
 
     #[test]

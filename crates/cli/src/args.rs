@@ -1,21 +1,34 @@
-use clap::{Parser, ValueEnum};
+use airlok_core::config::ProviderName;
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// A privacy airlock between your code and a model you do not control.
 #[derive(Debug, Parser)]
-#[command(name = "airlok", version, about)]
+#[command(
+    name = "airlok",
+    version,
+    about,
+    args_conflicts_with_subcommands = true
+)]
 pub struct Args {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// The task to carry out in the current directory
-    pub prompt: String,
+    pub prompt: Option<String>,
 
     /// Print debug logs to stderr
     #[arg(short, long)]
     pub verbose: bool,
 
-    /// Which model API to talk to
-    #[arg(long, value_enum, default_value_t = ProviderKind::Anthropic)]
-    pub provider: ProviderKind,
+    /// Run without asking: no diff confirmations, no command confirmations
+    #[arg(short, long)]
+    pub yes: bool,
 
-    /// Model id. Defaults to claude-sonnet-4-6 for anthropic and gpt-5.5 for openai
+    /// Which model API to talk to (default: from config, else anthropic)
+    #[arg(long, value_enum)]
+    pub provider: Option<ProviderKind>,
+
+    /// Model id, or the deployment name on Azure (default: from config, else the provider's default)
     #[arg(long)]
     pub model: Option<String>,
 
@@ -24,21 +37,37 @@ pub struct Args {
     pub show_redactions: bool,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Inspect or create the configuration file
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigAction {
+    /// Write a commented default config to the user config path
+    Init,
+    /// Print the effective configuration and where it came from
+    Show,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ProviderKind {
-    /// Anthropic Messages API, key from ANTHROPIC_API_KEY
+    /// Anthropic Messages API
     Anthropic,
-    /// OpenAI Chat Completions API, key from OPENAI_API_KEY. For Azure OpenAI set
-    /// AZURE_OPENAI_API_KEY and OPENAI_BASE_URL=https://<resource>.openai.azure.com/openai/v1
+    /// OpenAI Chat Completions API, including Azure OpenAI
     #[value(name = "openai")]
     OpenAi,
 }
 
-impl ProviderKind {
-    pub fn default_model(self) -> &'static str {
-        match self {
-            ProviderKind::Anthropic => airlok_llm::anthropic::DEFAULT_MODEL,
-            ProviderKind::OpenAi => airlok_llm::openai::DEFAULT_MODEL,
+impl From<ProviderKind> for ProviderName {
+    fn from(kind: ProviderKind) -> Self {
+        match kind {
+            ProviderKind::Anthropic => ProviderName::Anthropic,
+            ProviderKind::OpenAi => ProviderName::OpenAi,
         }
     }
 }
