@@ -19,7 +19,7 @@ airlok "create hello.txt containing hello"     # run one task in the current dir
 airlok -v "..."                                # debug logs on stderr
 airlok -y "..."                                # no confirmations (prints a warning)
 airlok --provider openai --model gpt-5.5 "..." # override the provider and model for one run
-airlok --show-redactions "..."                 # list what was redacted after the run
+airlok --show-redactions "..."                 # list what was redacted (kind and length only)
 airlok config init                             # write a commented config to the user path
 airlok config show                             # print the effective config and the key source
 ```
@@ -56,7 +56,7 @@ For openai, `base_url` falls back to the `OPENAI_BASE_URL` environment variable 
 
 The key is read from exactly one place. `api_key_cmd` wins if set, then `api_key_env`, then the provider default: `ANTHROPIC_API_KEY` for anthropic, and `AZURE_OPENAI_API_KEY` then `OPENAI_API_KEY` for openai. A command runs once per process and its output is never logged. `airlok config show` prints the env var name or the command, never the value. Whatever key is in use is also added to the redactor, so it can never leave the machine inside a file or command output either.
 
-Allow-list entries match on leading tokens (`git status` allows `git status --short`, not `git push`). Deny-list entries match anywhere and win over the allow list. A command with shell operators (`;`, `&&`, `|`, `>`, `$(`, and so on) always asks, whatever its first word.
+Allow-list entries match on leading tokens (`git status` allows `git status --short`, not `git push`). Deny-list entries match anywhere, in every part of a chained command, and win over the allow list. Flags are parsed rather than compared as text: the `rm -rf` entry also catches `rm -fr`, `rm -r -f`, `rm -Rf`, and `rm --recursive --force`, and `git push --force` also catches `git push -f`. A command with shell operators (`;`, `&&`, `|`, `>`, `$(`, and so on) always asks, whatever its first word.
 
 ### Azure OpenAI
 
