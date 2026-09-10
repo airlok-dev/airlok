@@ -52,6 +52,8 @@ bash_allowlist = ["git status", "git diff", "ls", "cat", "pwd", "find", "grep", 
 bash_denylist = ["rm -rf", "git push --force", "sudo"]
 ```
 
+For openai, `base_url` falls back to the `OPENAI_BASE_URL` environment variable when the config does not set it.
+
 The key is read from exactly one place. `api_key_cmd` wins if set, then `api_key_env`, then the provider default: `ANTHROPIC_API_KEY` for anthropic, and `AZURE_OPENAI_API_KEY` then `OPENAI_API_KEY` for openai. A command runs once per process and its output is never logged. `airlok config show` prints the env var name or the command, never the value. Whatever key is in use is also added to the redactor, so it can never leave the machine inside a file or command output either.
 
 Allow-list entries match on leading tokens (`git status` allows `git status --short`, not `git push`). Deny-list entries match anywhere and win over the allow list. A command with shell operators (`;`, `&&`, `|`, `>`, `$(`, and so on) always asks, whatever its first word.

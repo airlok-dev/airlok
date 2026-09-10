@@ -104,11 +104,10 @@ fn build_provider(config: &Config, key: String) -> Arc<dyn Provider> {
             Arc::new(provider)
         }
         ProviderName::OpenAi => {
-            let base_url = config
-                .provider
-                .base_url
-                .clone()
-                .unwrap_or_else(|| airlok_llm::openai::DEFAULT_BASE_URL.to_string());
+            let base_url = openai_base_url(
+                config.provider.base_url.as_deref(),
+                std::env::var("OPENAI_BASE_URL").ok().as_deref(),
+            );
             let key_env = match config.key_source() {
                 KeySource::Env(name) => Some(name),
                 KeySource::Command(_) => None,
@@ -117,6 +116,17 @@ fn build_provider(config: &Config, key: String) -> Arc<dyn Provider> {
             Arc::new(OpenAi::new(auth, base_url))
         }
     }
+}
+
+/// Config file first, then the `OPENAI_BASE_URL` environment variable
+/// (kept from 0.1), then the public endpoint.
+fn openai_base_url(configured: Option<&str>, from_env: Option<&str>) -> String {
+    configured
+        .or(from_env)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .unwrap_or(airlok_llm::openai::DEFAULT_BASE_URL)
+        .to_string()
 }
 
 fn config_init(path: Option<&Path>) -> anyhow::Result<()> {
@@ -219,7 +229,21 @@ fn describe(secret: &str, provider_key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::describe;
+    use super::{describe, openai_base_url};
+
+    #[test]
+    fn base_url_prefers_config_then_env_then_default() {
+        assert_eq!(
+            openai_base_url(Some("https://c/v1"), Some("https://e/v1")),
+            "https://c/v1"
+        );
+        assert_eq!(openai_base_url(None, Some("https://e/v1")), "https://e/v1");
+        assert_eq!(
+            openai_base_url(None, Some("  ")),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(openai_base_url(None, None), "https://api.openai.com/v1");
+    }
 
     #[test]
     fn provider_key_is_never_shown_even_partially() {
