@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
         .resolve_key()
         .with_context(|| format!("cannot read the API key from {}", config.key_source()))?;
     let provider = build_provider(&config, key.clone());
-    let redactor = SecretRedactor::new().with_known([key]);
+    let redactor = SecretRedactor::new().with_known([key.as_str()]);
     let tools = ToolRegistry::defaults(&cwd, config.agent.bash_timeout);
 
     let mut agent = Agent::new(provider, tools, Box::new(redactor), config);
@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
     out.end_line();
 
     if args.show_redactions {
-        print_redactions(&report);
+        print_redactions(&report, &key);
     }
     Ok(())
 }
@@ -196,19 +196,35 @@ impl Output for Stdout {
     }
 }
 
-fn print_redactions(report: &RunReport) {
+/// Lists what was redacted. The provider key is named, never shown, not
+/// even a prefix.
+fn print_redactions(report: &RunReport, provider_key: &str) {
     if report.redactions.is_empty() {
         println!("(nothing was redacted)");
         return;
     }
     println!("Redacted before leaving this machine:");
     for (placeholder, secret) in &report.redactions {
-        println!("  {placeholder}  {}", mask(secret));
+        println!("  {placeholder}  {}", describe(secret, provider_key));
     }
 }
 
-/// Shows enough of a secret to recognise it without printing all of it.
-fn mask(secret: &str) -> String {
+fn describe(secret: &str, provider_key: &str) -> String {
+    if secret == provider_key {
+        return "(the provider API key)".to_string();
+    }
     let shown: String = secret.chars().take(8).collect();
     format!("{shown}… ({} chars)", secret.chars().count())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::describe;
+
+    #[test]
+    fn provider_key_is_never_shown_even_partially() {
+        let key = "0123456789abcdef0123456789abcdef";
+        assert_eq!(describe(key, key), "(the provider API key)");
+        assert_eq!(describe("sk-ant-api03-xyz", key), "sk-ant-a… (16 chars)");
+    }
 }
