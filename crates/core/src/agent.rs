@@ -53,6 +53,10 @@ impl Agent {
         }
     }
 
+    pub fn config_mut(&mut self) -> &mut Config {
+        &mut self.config
+    }
+
     pub async fn run(
         &mut self,
         prompt: &str,

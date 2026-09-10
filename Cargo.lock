@@ -19,6 +19,7 @@ dependencies = [
  "airlok-llm",
  "anyhow",
  "clap",
+ "libc",
  "tokio",
  "toml",
  "tracing",
