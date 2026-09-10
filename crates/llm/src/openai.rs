@@ -5,6 +5,9 @@
 //! `choices[0].delta` carries `content` text and `tool_calls` fragments
 //! keyed by `index`; `finish_reason` arrives in a final chunk, then the
 //! sentinel `data: [DONE]`.
+//!
+//! Azure OpenAI serves the same surface at `<resource>.openai.azure.com/openai/v1`
+//! and authenticates with an `api-key` header instead of a bearer token.
 
 use std::collections::BTreeMap;
 
@@ -16,28 +19,65 @@ use crate::sse;
 use crate::types::{ContentBlock, Request, Role, StopReason, StreamEvent};
 use crate::{LlmError, Provider};
 
-const DEFAULT_BASE_URL: &str = "https://api.openai.com";
+const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_MODEL: &str = "gpt-5.5";
 const API_KEY_VAR: &str = "OPENAI_API_KEY";
+const AZURE_API_KEY_VAR: &str = "AZURE_OPENAI_API_KEY";
+const BASE_URL_VAR: &str = "OPENAI_BASE_URL";
+
+/// How the key is presented. OpenAI wants a bearer token; Azure wants an
+/// `api-key` header.
+pub enum Auth {
+    Bearer(String),
+    ApiKey(String),
+}
+
+impl Auth {
+    fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            Auth::Bearer(key) => request.bearer_auth(key),
+            Auth::ApiKey(key) => request.header("api-key", key),
+        }
+    }
+}
 
 pub struct OpenAi {
     client: reqwest::Client,
-    api_key: String,
+    auth: Auth,
     base_url: String,
 }
 
 impl OpenAi {
-    /// Reads the key from `OPENAI_API_KEY`.
+    /// Reads `AZURE_OPENAI_API_KEY` (sent as `api-key`) or else
+    /// `OPENAI_API_KEY` (sent as a bearer token), and an optional
+    /// `OPENAI_BASE_URL` such as `https://<resource>.openai.azure.com/openai/v1`.
     pub fn from_env() -> Result<Self, LlmError> {
-        Ok(Self::new(crate::key_from_env(API_KEY_VAR)?))
+        let auth = match crate::key_from_env(AZURE_API_KEY_VAR) {
+            Ok(key) => Auth::ApiKey(key),
+            Err(_) => Auth::Bearer(crate::key_from_env(API_KEY_VAR)?),
+        };
+        let base_url = std::env::var(BASE_URL_VAR)
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        Ok(Self::new(auth, base_url))
     }
 
-    pub fn new(api_key: String) -> Self {
+    pub fn new(auth: Auth, base_url: String) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key,
-            base_url: DEFAULT_BASE_URL.to_string(),
+            auth,
+            base_url: base_url.trim_end_matches('/').to_string(),
         }
+    }
+
+    fn request(&self, body: &Value) -> reqwest::RequestBuilder {
+        let builder = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("content-type", "application/json")
+            .json(body);
+        self.auth.apply(builder)
     }
 }
 
@@ -46,14 +86,7 @@ impl Provider for OpenAi {
         let open = async move {
             let body = wire_request(&request);
             debug!(model = %request.model, messages = request.messages.len(), "sending request");
-            let response = self
-                .client
-                .post(format!("{}/v1/chat/completions", self.base_url))
-                .bearer_auth(&self.api_key)
-                .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await?;
+            let response = self.request(&body).send().await?;
             let bytes = sse::body_or_error(response).await?;
             Ok::<_, LlmError>(sse::events(bytes, ChunkAssembler::default()))
         };
@@ -226,6 +259,38 @@ impl sse::Assembler for ChunkAssembler {
 mod tests {
     use super::*;
     use crate::types::{Message, ToolSpec};
+
+    fn built_request(auth: Auth, base_url: &str) -> reqwest::Request {
+        OpenAi::new(auth, base_url.to_string())
+            .request(&json!({}))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn openai_key_goes_in_the_authorization_header() {
+        let request = built_request(Auth::Bearer("k1".into()), DEFAULT_BASE_URL);
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(request.headers()["authorization"], "Bearer k1");
+        assert!(request.headers().get("api-key").is_none());
+    }
+
+    #[test]
+    fn azure_key_goes_in_the_api_key_header() {
+        let request = built_request(
+            Auth::ApiKey("k2".into()),
+            "https://example.openai.azure.com/openai/v1/",
+        );
+        assert_eq!(
+            request.url().as_str(),
+            "https://example.openai.azure.com/openai/v1/chat/completions"
+        );
+        assert_eq!(request.headers()["api-key"], "k2");
+        assert!(request.headers().get("authorization").is_none());
+    }
 
     #[test]
     fn assembles_text_and_split_tool_call_from_chunks() {

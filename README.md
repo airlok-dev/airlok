@@ -12,7 +12,14 @@ npm install -g airlok
 brew install airlok-dev/tap/airlok
 ```
 
-Set `ANTHROPIC_API_KEY` in your environment, or `OPENAI_API_KEY` if you use `--provider openai`.
+Environment variables:
+
+| Variable | Used when | Meaning |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | `--provider anthropic` (default) | Anthropic API key |
+| `OPENAI_API_KEY` | `--provider openai` | OpenAI API key, sent as a bearer token |
+| `AZURE_OPENAI_API_KEY` | `--provider openai` | Azure OpenAI key, sent as an `api-key` header. Takes precedence over `OPENAI_API_KEY` |
+| `OPENAI_BASE_URL` | `--provider openai` | Base URL, default `https://api.openai.com/v1`. For Azure: `https://<resource>.openai.azure.com/openai/v1`, and pass the deployment name as `--model` |
 
 ## Usage
 

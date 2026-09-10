@@ -17,9 +17,15 @@ path = "agent_loop.rs"
 name = "redaction"
 path = "redaction.rs"
 
+[[test]]
+name = "logging"
+path = "logging.rs"
+
 [dependencies]
 airlok-core.workspace = true
 airlok-llm.workspace = true
 futures.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
