@@ -2,6 +2,12 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.2.1] - 2026-09-11
+
+### Changed
+
+- npm publishing uses trusted publishing (OIDC) through a custom cargo-dist publish job instead of an `NPM_TOKEN` secret. No change to the binary.
+
 ## [0.2.0] - 2026-09-11
 
 ### Added
