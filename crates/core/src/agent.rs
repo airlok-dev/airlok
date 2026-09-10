@@ -4,8 +4,8 @@
 //! at send time, and every response is rehydrated before it is stored or
 //! acted on. The provider only ever sees placeholders.
 //!
-//! TODO(stage N): context injection (repo map, instructions file), diff
-//! preview before writes, compaction when history grows, subagents.
+//! TODO(stage N): context injection (repo map, instructions file),
+//! compaction when history grows, subagents.
 
 use std::sync::Arc;
 
@@ -18,7 +18,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::redact::{split_incomplete_placeholder, RedactionMap, Redactor};
-use crate::tools::ToolRegistry;
+use crate::safety::{CommandVerdict, Confirmation, Decision};
+use crate::tools::{Plan, Tool, ToolError, ToolRegistry};
 use crate::{CoreError, Output};
 
 pub struct Agent {
@@ -61,6 +62,7 @@ impl Agent {
         let specs = self.tools.specs();
         let mut history = vec![Message::user_text(prompt)];
         let mut report = RunReport::default();
+        let mut approved = Approved::default();
 
         for turn in 1..=self.config.agent.max_turns {
             report.turns = turn;
@@ -76,7 +78,7 @@ impl Agent {
                 .collect();
             let wants_tools = response.stop_reason == StopReason::ToolUse && !tool_calls.is_empty();
             let results = if wants_tools {
-                self.execute_tools(&tool_calls, out).await
+                self.execute_tools(&tool_calls, out, &mut approved).await
             } else {
                 Vec::new()
             };
@@ -220,6 +222,7 @@ impl Agent {
         &self,
         calls: &[&ContentBlock],
         out: &mut dyn Output,
+        approved: &mut Approved,
     ) -> Vec<ContentBlock> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
@@ -229,14 +232,7 @@ impl Agent {
             let (content, is_error) = match self.tools.get(name) {
                 Some(tool) => {
                     out.tool_call(name, &tool.summary(input));
-                    info!(tool = %name, "executing");
-                    match tool.execute(input.clone()).await {
-                        Ok(output) => (output, false),
-                        Err(e) => {
-                            warn!(tool = %name, error = %e, "tool failed");
-                            (format!("error: {e}"), true)
-                        }
-                    }
+                    self.run_tool(name, tool, input, out, approved).await
                 }
                 None => {
                     warn!(tool = %name, "unknown tool requested");
@@ -252,6 +248,107 @@ impl Agent {
         }
         results
     }
+
+    /// Plans, asks if the policy says so, then executes.
+    async fn run_tool(
+        &self,
+        name: &str,
+        tool: &dyn Tool,
+        input: &Value,
+        out: &mut dyn Output,
+        approved: &mut Approved,
+    ) -> (String, bool) {
+        match self.gate(tool, input, out, approved).await {
+            Ok(Gate::Proceed) => {
+                info!(tool = %name, "executing");
+                match tool.execute(input.clone()).await {
+                    Ok(output) => (output, false),
+                    Err(e) => {
+                        warn!(tool = %name, error = %e, "tool failed");
+                        (format!("error: {e}"), true)
+                    }
+                }
+            }
+            Ok(Gate::Stop(reason)) => {
+                info!(tool = %name, "not executed");
+                (reason, true)
+            }
+            Err(e) => {
+                warn!(tool = %name, error = %e, "tool could not be planned");
+                (format!("error: {e}"), true)
+            }
+        }
+    }
+
+    async fn gate(
+        &self,
+        tool: &dyn Tool,
+        input: &Value,
+        out: &mut dyn Output,
+        approved: &mut Approved,
+    ) -> Result<Gate, ToolError> {
+        let safety = &self.config.safety;
+        let gate = match tool.plan(input).await? {
+            Plan::Safe => Gate::Proceed,
+            Plan::Write { path, diff } => {
+                if !safety.confirm_writes || approved.writes {
+                    return Ok(Gate::Proceed);
+                }
+                match out.confirm(&Confirmation::Write {
+                    path: &path,
+                    diff: &diff,
+                }) {
+                    Decision::Approve => Gate::Proceed,
+                    Decision::ApproveAll => {
+                        approved.writes = true;
+                        Gate::Proceed
+                    }
+                    Decision::Reject => Gate::Stop(format!(
+                        "The user rejected this change to {}. Do not retry it unchanged; \
+                         explain what you intended or propose a different approach.",
+                        path.display()
+                    )),
+                }
+            }
+            Plan::Command { command } => match safety.classify(&command) {
+                CommandVerdict::Denied(entry) => Gate::Stop(format!(
+                    "Refused: `{command}` matches the deny list entry `{entry}`. \
+                     Do not retry it; explain what you intended or propose a different approach."
+                )),
+                CommandVerdict::Allowed => Gate::Proceed,
+                CommandVerdict::Confirm => {
+                    if !safety.confirm_bash || approved.bash {
+                        return Ok(Gate::Proceed);
+                    }
+                    match out.confirm(&Confirmation::Command { command: &command }) {
+                        Decision::Approve => Gate::Proceed,
+                        Decision::ApproveAll => {
+                            approved.bash = true;
+                            Gate::Proceed
+                        }
+                        Decision::Reject => Gate::Stop(format!(
+                            "The user declined to run `{command}`. Do not retry it unchanged; \
+                             explain what you intended or propose a different approach."
+                        )),
+                    }
+                }
+            },
+        };
+        Ok(gate)
+    }
+}
+
+/// "Yes to all" state for one run, per kind of prompt.
+#[derive(Default)]
+struct Approved {
+    writes: bool,
+    bash: bool,
+}
+
+enum Gate {
+    Proceed,
+    /// Not executed; the string goes back to the model as an error result.
+    Stop(String),
 }
 
 fn system_prompt(config: &Config) -> String {

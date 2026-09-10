@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
-use super::{required_str, Tool, ToolError};
+use super::{required_str, Plan, Tool, ToolError};
 
 pub struct Bash {
     cwd: PathBuf,
@@ -43,6 +43,12 @@ impl Tool for Bash {
 
     fn summary(&self, input: &Value) -> String {
         input["command"].as_str().unwrap_or("?").to_string()
+    }
+
+    async fn plan(&self, input: &Value) -> Result<Plan, ToolError> {
+        Ok(Plan::Command {
+            command: required_str(input, "command")?.to_string(),
+        })
     }
 
     async fn execute(&self, input: Value) -> Result<String, ToolError> {
