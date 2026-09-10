@@ -19,7 +19,7 @@ use crate::sse;
 use crate::types::{ContentBlock, Request, Role, StopReason, StreamEvent};
 use crate::{LlmError, Provider};
 
-const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_MODEL: &str = "gpt-5.5";
 const API_KEY_VAR: &str = "OPENAI_API_KEY";
 const AZURE_API_KEY_VAR: &str = "AZURE_OPENAI_API_KEY";
@@ -33,6 +33,22 @@ pub enum Auth {
 }
 
 impl Auth {
+    /// Picks the header style for a key: Azure OpenAI hosts and the Azure
+    /// env var take `api-key`, everything else a bearer token.
+    pub fn for_endpoint(base_url: &str, key_env: Option<&str>, key: String) -> Auth {
+        let host = base_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        if host.ends_with(".openai.azure.com") || key_env == Some(AZURE_API_KEY_VAR) {
+            Auth::ApiKey(key)
+        } else {
+            Auth::Bearer(key)
+        }
+    }
+
     fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self {
             Auth::Bearer(key) => request.bearer_auth(key),
@@ -290,6 +306,36 @@ mod tests {
         );
         assert_eq!(request.headers()["api-key"], "k2");
         assert!(request.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn auth_style_follows_host_or_env_name() {
+        let is_api_key = |a: Auth| matches!(a, Auth::ApiKey(_));
+        assert!(is_api_key(Auth::for_endpoint(
+            "https://x.openai.azure.com/openai/v1",
+            None,
+            "k".into()
+        )));
+        assert!(is_api_key(Auth::for_endpoint(
+            DEFAULT_BASE_URL,
+            Some("AZURE_OPENAI_API_KEY"),
+            "k".into()
+        )));
+        assert!(!is_api_key(Auth::for_endpoint(
+            DEFAULT_BASE_URL,
+            Some("OPENAI_API_KEY"),
+            "k".into()
+        )));
+        assert!(!is_api_key(Auth::for_endpoint(
+            DEFAULT_BASE_URL,
+            None,
+            "k".into()
+        )));
+        assert!(!is_api_key(Auth::for_endpoint(
+            "https://proxy.example/openai.azure.com/v1",
+            None,
+            "k".into()
+        )));
     }
 
     #[test]

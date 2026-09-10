@@ -33,6 +33,11 @@ async fn runs_tool_calls_until_the_model_stops() {
                 name: "write_file".into(),
                 summary: "hello.txt".into()
             },
+            Shown::ConfirmWrite {
+                path: dir.path().join("hello.txt"),
+                diff: "--- a/hello.txt\n+++ b/hello.txt\n@@ -0,0 +1 @@\n+hello\n\\ No newline at end of file\n".into(),
+            },
+            // `cat` is allow-listed, so no confirmation for it.
             Shown::ToolCall {
                 name: "bash".into(),
                 summary: "cat hello.txt".into()
@@ -56,7 +61,7 @@ async fn runs_tool_calls_until_the_model_stops() {
             is_error: false,
         }]
     );
-    assert_eq!(requests[0].tools.len(), 3);
+    assert_eq!(requests[0].tools.len(), 4);
 }
 
 #[tokio::test]

@@ -1,13 +1,13 @@
 //! Tools the model may call.
 //!
-//! TODO(stage N): edit/patch tool with diff preview, glob and grep, and a
-//! permission gate in front of `execute`.
+//! TODO(stage N): glob and grep tools.
 
 pub mod bash;
+pub mod edit;
 pub mod read;
 pub mod write;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use airlok_llm::ToolSpec;
@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 pub use bash::Bash;
+pub use edit::EditFile;
 pub use read::ReadFile;
 pub use write::WriteFile;
 
@@ -28,6 +29,17 @@ pub enum ToolError {
     Timeout(Duration),
 }
 
+/// What a call would do, decided before it runs so the user can be asked.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Plan {
+    /// Nothing to confirm.
+    Safe,
+    /// A file will change. `diff` is a plain unified diff.
+    Write { path: PathBuf, diff: String },
+    /// A shell command will run.
+    Command { command: String },
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
@@ -36,6 +48,11 @@ pub trait Tool: Send + Sync {
     fn schema(&self) -> Value;
     /// One line describing a call, shown to the user as `> name: summary`.
     fn summary(&self, input: &Value) -> String;
+    /// Describes the effect of `execute` without performing it.
+    async fn plan(&self, input: &Value) -> Result<Plan, ToolError> {
+        let _ = input;
+        Ok(Plan::Safe)
+    }
     async fn execute(&self, input: Value) -> Result<String, ToolError>;
 }
 
@@ -49,11 +66,12 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// The 0.1 tool set: read_file, write_file, bash.
+    /// The built-in tool set: read_file, write_file, edit_file, bash.
     pub fn defaults(cwd: &Path, bash_timeout: Duration) -> Self {
         Self::new()
             .with(ReadFile::new(cwd))
             .with(WriteFile::new(cwd))
+            .with(EditFile::new(cwd))
             .with(Bash::new(cwd, bash_timeout))
     }
 
@@ -89,6 +107,15 @@ fn required_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolError> {
 }
 
 /// Resolves a model-supplied path against the working directory.
-fn resolve(cwd: &Path, path: &str) -> std::path::PathBuf {
+fn resolve(cwd: &Path, path: &str) -> PathBuf {
     cwd.join(path)
+}
+
+/// Plain unified diff with `a/` and `b/` headers, three lines of context.
+pub fn unified_diff(path: &str, old: &str, new: &str) -> String {
+    similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string()
 }

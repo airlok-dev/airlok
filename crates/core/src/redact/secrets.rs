@@ -31,10 +31,16 @@ const PATTERNS: &[(&str, &str)] = &[
     ),
 ];
 
+const MIN_KNOWN_SECRET_LEN: usize = 12;
+
 pub struct SecretRedactor {
-    patterns: Vec<Regex>,
+    patterns: Vec<(&'static str, Regex)>,
     map: RedactionMap,
     placeholder_for: HashMap<String, String>,
+    /// Placeholder to the kind of value it replaced.
+    kinds: HashMap<String, String>,
+    /// Values registered through `with_known`, with their labels.
+    known: Vec<(String, String)>,
 }
 
 impl Default for SecretRedactor {
@@ -48,14 +54,28 @@ impl SecretRedactor {
         Self {
             patterns: PATTERNS
                 .iter()
-                .map(|(_, p)| Regex::new(p).expect("built-in pattern is valid"))
+                .map(|(kind, p)| (*kind, Regex::new(p).expect("built-in pattern is valid")))
                 .collect(),
             map: RedactionMap::new(),
             placeholder_for: HashMap::new(),
+            kinds: HashMap::new(),
+            known: Vec::new(),
         }
     }
 
-    fn placeholder(&mut self, secret: &str) -> String {
+    /// A value to redact wherever it appears, such as the provider key the
+    /// process is running with, labelled for display. Short values are
+    /// ignored so a weak test key cannot redact every occurrence of a
+    /// common word.
+    pub fn with_known(mut self, label: &str, secret: &str) -> Self {
+        if secret.len() >= MIN_KNOWN_SECRET_LEN {
+            self.known.push((label.to_string(), secret.to_string()));
+            self.placeholder(secret, label);
+        }
+        self
+    }
+
+    fn placeholder(&mut self, secret: &str, kind: &str) -> String {
         if let Some(existing) = self.placeholder_for.get(secret) {
             return existing.clone();
         }
@@ -63,6 +83,7 @@ impl SecretRedactor {
         self.map.insert(placeholder.clone(), secret.to_string());
         self.placeholder_for
             .insert(secret.to_string(), placeholder.clone());
+        self.kinds.insert(placeholder.clone(), kind.to_string());
         placeholder
     }
 
@@ -72,23 +93,32 @@ impl SecretRedactor {
     /// Values already redacted once are matched literally as well. A
     /// context-dependent detector (Bearer) would otherwise miss the same
     /// value when it reappears without its context.
-    fn spans(&self, input: &str) -> Vec<(usize, usize)> {
-        let known = self
-            .placeholder_for
-            .keys()
-            .flat_map(|secret| input.match_indices(secret.as_str()))
-            .map(|(start, found)| (start, start + found.len()));
-        let detected = self.patterns.iter().flat_map(|re| {
+    fn spans(&self, input: &str) -> Vec<Span> {
+        let known = self.placeholder_for.keys().flat_map(|secret| {
+            let kind = self.kinds[&self.placeholder_for[secret]].clone();
+            input
+                .match_indices(secret.as_str())
+                .map(move |(start, found)| Span {
+                    start,
+                    end: start + found.len(),
+                    kind: kind.clone(),
+                })
+        });
+        let detected = self.patterns.iter().flat_map(|(kind, re)| {
             re.captures_iter(input).map(|caps| {
                 let m = caps.get(1).unwrap_or_else(|| caps.get(0).unwrap());
-                (m.start(), m.end())
+                Span {
+                    start: m.start(),
+                    end: m.end(),
+                    kind: kind.to_string(),
+                }
             })
         });
-        let mut spans: Vec<(usize, usize)> = known.chain(detected).collect();
-        spans.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        let mut kept: Vec<(usize, usize)> = Vec::new();
+        let mut spans: Vec<Span> = known.chain(detected).collect();
+        spans.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+        let mut kept: Vec<Span> = Vec::new();
         for span in spans {
-            if kept.last().is_none_or(|last| span.0 >= last.1) {
+            if kept.last().is_none_or(|last| span.start >= last.end) {
                 kept.push(span);
             }
         }
@@ -96,14 +126,20 @@ impl SecretRedactor {
     }
 }
 
+struct Span {
+    start: usize,
+    end: usize,
+    kind: String,
+}
+
 impl Redactor for SecretRedactor {
     fn redact(&mut self, input: &str) -> (String, RedactionMap) {
         let mut out = String::with_capacity(input.len());
         let mut cursor = 0;
-        for (start, end) in self.spans(input) {
-            out.push_str(&input[cursor..start]);
-            out.push_str(&self.placeholder(&input[start..end]));
-            cursor = end;
+        for span in self.spans(input) {
+            out.push_str(&input[cursor..span.start]);
+            out.push_str(&self.placeholder(&input[span.start..span.end], &span.kind));
+            cursor = span.end;
         }
         out.push_str(&input[cursor..]);
         (out, self.map.clone())
@@ -117,6 +153,10 @@ impl Redactor for SecretRedactor {
             }
         }
         out
+    }
+
+    fn kind_of(&self, placeholder: &str) -> Option<&str> {
+        self.kinds.get(placeholder).map(String::as_str)
     }
 }
 
@@ -203,6 +243,27 @@ mod tests {
         assert_eq!(first, "Authorization: Bearer <<SECRET_1>>");
         let (second, _) = redactor.redact(&format!("TOKEN={token}"));
         assert_eq!(second, "TOKEN=<<SECRET_1>>");
+    }
+
+    #[test]
+    fn known_secrets_are_redacted_without_a_pattern() {
+        let mut redactor = SecretRedactor::new()
+            .with_known("provider api key", "0123456789abcdef0123456789abcdef")
+            .with_known("too short", "short");
+        let (out, map) = redactor.redact("key=0123456789abcdef0123456789abcdef short");
+        assert_eq!(out, "key=<<SECRET_1>> short");
+        assert_eq!(map.len(), 1);
+        assert_eq!(redactor.kind_of("<<SECRET_1>>"), Some("provider api key"));
+    }
+
+    #[test]
+    fn every_placeholder_has_a_kind() {
+        let mut redactor = SecretRedactor::new();
+        let (_, map) = redactor.redact(&format!("{} and {}", SAMPLES[0], SAMPLES[4]));
+        assert_eq!(redactor.kind_of("<<SECRET_1>>"), Some("anthropic api key"));
+        assert_eq!(redactor.kind_of("<<SECRET_2>>"), Some("aws access key id"));
+        assert_eq!(map.len(), 2);
+        assert_eq!(redactor.kind_of("<<SECRET_3>>"), None);
     }
 
     #[test]

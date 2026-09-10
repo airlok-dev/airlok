@@ -138,3 +138,50 @@ async fn secret_reused_by_the_model_out_of_context_still_never_reaches_the_provi
         assert!(!wire.contains(token), "secret leaked to provider: {wire}");
     }
 }
+
+/// The `--show-redactions` listing is built from RunReport::redaction_lines.
+/// Every line must be exactly a placeholder, a kind, and a length, with no
+/// fragment of the value, for detected secrets and known ones alike.
+#[tokio::test]
+async fn redaction_listing_shows_only_kind_and_length() {
+    let dir = TempDir::new("listing");
+    let azure_key = "6zKtMEXkQm3pLw9vN2rTb8yHc4dFg7jAs1eUi5oPx0zR";
+    std::fs::write(
+        dir.path().join(".env"),
+        format!("ANTHROPIC_API_KEY={KEY}\nAZURE_KEY={azure_key}\nAWS=AKIAIOSFODNN7EXAMPLE\n"),
+    )
+    .unwrap();
+    let provider = MockProvider::scripted(vec![
+        tool_call("toolu_1", "read_file", json!({"path": ".env"})),
+        reply("read it"),
+    ]);
+    let mut out = RecordingOutput::default();
+    let config = airlok_core::Config::new(dir.path().to_path_buf());
+    let tools = airlok_core::tools::ToolRegistry::defaults(dir.path(), config.agent.bash_timeout);
+    let redactor =
+        airlok_core::redact::SecretRedactor::new().with_known("the provider API key", azure_key);
+    let mut agent = airlok_core::Agent::new(provider, tools, Box::new(redactor), config);
+
+    let report = agent.run("read .env", &mut out).await.unwrap();
+
+    let lines = report.redaction_lines();
+    assert_eq!(
+        lines,
+        vec![
+            format!(
+                "<<SECRET_1>>  the provider API key ({} chars)",
+                azure_key.len()
+            ),
+            format!("<<SECRET_2>>  anthropic api key ({} chars)", KEY.len()),
+            "<<SECRET_3>>  aws access key id (20 chars)".to_string(),
+        ]
+    );
+    for line in &lines {
+        for secret in report.redactions.values() {
+            for window in secret.as_bytes().windows(4) {
+                let fragment = std::str::from_utf8(window).unwrap();
+                assert!(!line.contains(fragment), "{line:?} leaks {fragment:?}");
+            }
+        }
+    }
+}

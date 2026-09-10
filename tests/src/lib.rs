@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use airlok_core::redact::SecretRedactor;
 use airlok_core::tools::ToolRegistry;
-use airlok_core::{Agent, Config, Output};
+use airlok_core::{Agent, Config, Confirmation, Decision, Output};
 use airlok_llm::{LlmError, Provider, Request, StopReason, StreamEvent};
 use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::Value;
@@ -73,14 +73,26 @@ pub fn tool_call(id: &str, name: &str, input: Value) -> Vec<StreamEvent> {
 pub enum Shown {
     Text(String),
     ToolCall { name: String, summary: String },
+    ConfirmWrite { path: PathBuf, diff: String },
+    ConfirmCommand { command: String },
 }
 
+/// Records everything shown and answers confirmations from a script.
+/// Unscripted confirmations are approved.
 #[derive(Default)]
 pub struct RecordingOutput {
     pub events: Vec<Shown>,
+    pub decisions: VecDeque<Decision>,
 }
 
 impl RecordingOutput {
+    pub fn answering(decisions: Vec<Decision>) -> Self {
+        Self {
+            events: Vec::new(),
+            decisions: decisions.into(),
+        }
+    }
+
     /// All streamed text joined, as the user would read it.
     pub fn text(&self) -> String {
         self.events
@@ -103,6 +115,19 @@ impl Output for RecordingOutput {
             name: name.to_string(),
             summary: summary.to_string(),
         });
+    }
+
+    fn confirm(&mut self, request: &Confirmation<'_>) -> Decision {
+        self.events.push(match request {
+            Confirmation::Write { path, diff } => Shown::ConfirmWrite {
+                path: path.to_path_buf(),
+                diff: diff.to_string(),
+            },
+            Confirmation::Command { command } => Shown::ConfirmCommand {
+                command: command.to_string(),
+            },
+        });
+        self.decisions.pop_front().unwrap_or(Decision::Approve)
     }
 }
 
@@ -164,6 +189,6 @@ impl Drop for TempDir {
 /// An agent with the default tools and the real secret redactor.
 pub fn agent(provider: Arc<MockProvider>, cwd: &Path) -> Agent {
     let config = Config::new(cwd.to_path_buf());
-    let tools = ToolRegistry::defaults(cwd, config.bash_timeout);
+    let tools = ToolRegistry::defaults(cwd, config.agent.bash_timeout);
     Agent::new(provider, tools, Box::new(SecretRedactor::new()), config)
 }

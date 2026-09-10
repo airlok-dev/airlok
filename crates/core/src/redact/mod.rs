@@ -21,6 +21,10 @@ pub trait Redactor: Send {
 
     /// Puts the original values back in place of their placeholders.
     fn rehydrate(&self, input: &str, map: &RedactionMap) -> String;
+
+    /// What kind of value a placeholder stands for, such as
+    /// "anthropic api key", for display without the value.
+    fn kind_of(&self, placeholder: &str) -> Option<&str>;
 }
 
 /// Longest placeholder we will ever hold back while streaming. Anything held

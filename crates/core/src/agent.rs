@@ -4,9 +4,10 @@
 //! at send time, and every response is rehydrated before it is stored or
 //! acted on. The provider only ever sees placeholders.
 //!
-//! TODO(stage N): context injection (repo map, instructions file), diff
-//! preview before writes, compaction when history grows, subagents.
+//! TODO(stage N): context injection (repo map, instructions file),
+//! compaction when history grows, subagents.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use airlok_llm::{
@@ -18,7 +19,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::redact::{split_incomplete_placeholder, RedactionMap, Redactor};
-use crate::tools::ToolRegistry;
+use crate::safety::{CommandVerdict, Confirmation, Decision};
+use crate::tools::{Plan, Tool, ToolError, ToolRegistry};
 use crate::{CoreError, Output};
 
 pub struct Agent {
@@ -33,8 +35,23 @@ pub struct Agent {
 pub struct RunReport {
     /// Every placeholder issued during the run and the value it stood for.
     pub redactions: RedactionMap,
+    /// Placeholder to the kind of value it stood for, for display.
+    pub kinds: BTreeMap<String, String>,
     /// Model round-trips made.
     pub turns: usize,
+}
+
+impl RunReport {
+    /// One line per redaction naming the kind and length, never the value.
+    pub fn redaction_lines(&self) -> Vec<String> {
+        self.redactions
+            .iter()
+            .map(|(placeholder, secret)| {
+                let kind = self.kinds.get(placeholder).map_or("secret", String::as_str);
+                format!("{placeholder}  {kind} ({} chars)", secret.chars().count())
+            })
+            .collect()
+    }
 }
 
 impl Agent {
@@ -52,6 +69,10 @@ impl Agent {
         }
     }
 
+    pub fn config_mut(&mut self) -> &mut Config {
+        &mut self.config
+    }
+
     pub async fn run(
         &mut self,
         prompt: &str,
@@ -61,11 +82,16 @@ impl Agent {
         let specs = self.tools.specs();
         let mut history = vec![Message::user_text(prompt)];
         let mut report = RunReport::default();
+        let mut approved = Approved::default();
 
-        for turn in 1..=self.config.max_turns {
+        for turn in 1..=self.config.agent.max_turns {
             report.turns = turn;
             let (request, map) = self.build_request(&system, &history, &specs);
             let response = self.stream_response(request, &map, out).await?;
+            report.kinds = map
+                .keys()
+                .filter_map(|p| self.redactor.kind_of(p).map(|k| (p.clone(), k.to_string())))
+                .collect();
             report.redactions = map;
             debug!(turn, stop_reason = ?response.stop_reason, "turn complete");
 
@@ -76,7 +102,7 @@ impl Agent {
                 .collect();
             let wants_tools = response.stop_reason == StopReason::ToolUse && !tool_calls.is_empty();
             let results = if wants_tools {
-                self.execute_tools(&tool_calls, out).await
+                self.execute_tools(&tool_calls, out, &mut approved).await
             } else {
                 Vec::new()
             };
@@ -86,7 +112,7 @@ impl Agent {
             }
             history.push(Message::tool_results(results));
         }
-        Err(CoreError::TurnLimit(self.config.max_turns))
+        Err(CoreError::TurnLimit(self.config.agent.max_turns))
     }
 
     /// Redacts the whole outbound body. The returned map is what the
@@ -111,8 +137,8 @@ impl Agent {
             })
             .collect();
         let request = Request {
-            model: self.config.model.clone(),
-            max_tokens: self.config.max_tokens,
+            model: self.config.provider.model.clone(),
+            max_tokens: self.config.agent.max_tokens,
             system,
             messages,
             tools: specs.to_vec(),
@@ -220,6 +246,7 @@ impl Agent {
         &self,
         calls: &[&ContentBlock],
         out: &mut dyn Output,
+        approved: &mut Approved,
     ) -> Vec<ContentBlock> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
@@ -229,14 +256,7 @@ impl Agent {
             let (content, is_error) = match self.tools.get(name) {
                 Some(tool) => {
                     out.tool_call(name, &tool.summary(input));
-                    info!(tool = %name, "executing");
-                    match tool.execute(input.clone()).await {
-                        Ok(output) => (output, false),
-                        Err(e) => {
-                            warn!(tool = %name, error = %e, "tool failed");
-                            (format!("error: {e}"), true)
-                        }
-                    }
+                    self.run_tool(name, tool, input, out, approved).await
                 }
                 None => {
                     warn!(tool = %name, "unknown tool requested");
@@ -252,6 +272,107 @@ impl Agent {
         }
         results
     }
+
+    /// Plans, asks if the policy says so, then executes.
+    async fn run_tool(
+        &self,
+        name: &str,
+        tool: &dyn Tool,
+        input: &Value,
+        out: &mut dyn Output,
+        approved: &mut Approved,
+    ) -> (String, bool) {
+        match self.gate(tool, input, out, approved).await {
+            Ok(Gate::Proceed) => {
+                info!(tool = %name, "executing");
+                match tool.execute(input.clone()).await {
+                    Ok(output) => (output, false),
+                    Err(e) => {
+                        warn!(tool = %name, error = %e, "tool failed");
+                        (format!("error: {e}"), true)
+                    }
+                }
+            }
+            Ok(Gate::Stop(reason)) => {
+                info!(tool = %name, "not executed");
+                (reason, true)
+            }
+            Err(e) => {
+                warn!(tool = %name, error = %e, "tool could not be planned");
+                (format!("error: {e}"), true)
+            }
+        }
+    }
+
+    async fn gate(
+        &self,
+        tool: &dyn Tool,
+        input: &Value,
+        out: &mut dyn Output,
+        approved: &mut Approved,
+    ) -> Result<Gate, ToolError> {
+        let safety = &self.config.safety;
+        let gate = match tool.plan(input).await? {
+            Plan::Safe => Gate::Proceed,
+            Plan::Write { path, diff } => {
+                if !safety.confirm_writes || approved.writes {
+                    return Ok(Gate::Proceed);
+                }
+                match out.confirm(&Confirmation::Write {
+                    path: &path,
+                    diff: &diff,
+                }) {
+                    Decision::Approve => Gate::Proceed,
+                    Decision::ApproveAll => {
+                        approved.writes = true;
+                        Gate::Proceed
+                    }
+                    Decision::Reject => Gate::Stop(format!(
+                        "The user rejected this change to {}. Do not retry it unchanged; \
+                         explain what you intended or propose a different approach.",
+                        path.display()
+                    )),
+                }
+            }
+            Plan::Command { command } => match safety.classify(&command) {
+                CommandVerdict::Denied(entry) => Gate::Stop(format!(
+                    "Refused: `{command}` matches the deny list entry `{entry}`. \
+                     Do not retry it; explain what you intended or propose a different approach."
+                )),
+                CommandVerdict::Allowed => Gate::Proceed,
+                CommandVerdict::Confirm => {
+                    if !safety.confirm_bash || approved.bash {
+                        return Ok(Gate::Proceed);
+                    }
+                    match out.confirm(&Confirmation::Command { command: &command }) {
+                        Decision::Approve => Gate::Proceed,
+                        Decision::ApproveAll => {
+                            approved.bash = true;
+                            Gate::Proceed
+                        }
+                        Decision::Reject => Gate::Stop(format!(
+                            "The user declined to run `{command}`. Do not retry it unchanged; \
+                             explain what you intended or propose a different approach."
+                        )),
+                    }
+                }
+            },
+        };
+        Ok(gate)
+    }
+}
+
+/// "Yes to all" state for one run, per kind of prompt.
+#[derive(Default)]
+struct Approved {
+    writes: bool,
+    bash: bool,
+}
+
+enum Gate {
+    Proceed,
+    /// Not executed; the string goes back to the model as an error result.
+    Stop(String),
 }
 
 fn system_prompt(config: &Config) -> String {
