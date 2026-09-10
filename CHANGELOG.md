@@ -2,6 +2,12 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.2.2] - 2026-09-11
+
+### Fixed
+
+- The v0.2.1 release workflow was rejected by GitHub at startup because the npm publish job requested more permissions than its caller grants. No 0.2.1 release or npm package was produced. No change to the binary.
+
 ## [0.2.1] - 2026-09-11
 
 ### Changed
