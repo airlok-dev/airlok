@@ -7,6 +7,7 @@
 //! TODO(stage N): context injection (repo map, instructions file),
 //! compaction when history grows, subagents.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use airlok_llm::{
@@ -34,8 +35,23 @@ pub struct Agent {
 pub struct RunReport {
     /// Every placeholder issued during the run and the value it stood for.
     pub redactions: RedactionMap,
+    /// Placeholder to the kind of value it stood for, for display.
+    pub kinds: BTreeMap<String, String>,
     /// Model round-trips made.
     pub turns: usize,
+}
+
+impl RunReport {
+    /// One line per redaction naming the kind and length, never the value.
+    pub fn redaction_lines(&self) -> Vec<String> {
+        self.redactions
+            .iter()
+            .map(|(placeholder, secret)| {
+                let kind = self.kinds.get(placeholder).map_or("secret", String::as_str);
+                format!("{placeholder}  {kind} ({} chars)", secret.chars().count())
+            })
+            .collect()
+    }
 }
 
 impl Agent {
@@ -72,6 +88,10 @@ impl Agent {
             report.turns = turn;
             let (request, map) = self.build_request(&system, &history, &specs);
             let response = self.stream_response(request, &map, out).await?;
+            report.kinds = map
+                .keys()
+                .filter_map(|p| self.redactor.kind_of(p).map(|k| (p.clone(), k.to_string())))
+                .collect();
             report.redactions = map;
             debug!(turn, stop_reason = ?response.stop_reason, "turn complete");
 

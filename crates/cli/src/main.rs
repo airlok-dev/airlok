@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
         .resolve_key()
         .with_context(|| format!("cannot read the API key from {}", config.key_source()))?;
     let provider = build_provider(&config, key.clone());
-    let redactor = SecretRedactor::new().with_known([key.as_str()]);
+    let redactor = SecretRedactor::new().with_known("the provider API key", &key);
     let tools = ToolRegistry::defaults(&cwd, config.agent.bash_timeout);
 
     let mut agent = Agent::new(provider, tools, Box::new(redactor), config);
@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
     out.end_line();
 
     if args.show_redactions {
-        print_redactions(&report, &key);
+        print_redactions(&report);
     }
     Ok(())
 }
@@ -206,30 +206,22 @@ impl Output for Stdout {
     }
 }
 
-/// Lists what was redacted. The provider key is named, never shown, not
-/// even a prefix.
-fn print_redactions(report: &RunReport, provider_key: &str) {
+/// Lists what was redacted as kind and length only. Values never appear,
+/// not even a prefix.
+fn print_redactions(report: &RunReport) {
     if report.redactions.is_empty() {
         println!("(nothing was redacted)");
         return;
     }
     println!("Redacted before leaving this machine:");
-    for (placeholder, secret) in &report.redactions {
-        println!("  {placeholder}  {}", describe(secret, provider_key));
+    for line in report.redaction_lines() {
+        println!("  {line}");
     }
-}
-
-fn describe(secret: &str, provider_key: &str) -> String {
-    if secret == provider_key {
-        return "(the provider API key)".to_string();
-    }
-    let shown: String = secret.chars().take(8).collect();
-    format!("{shown}… ({} chars)", secret.chars().count())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{describe, openai_base_url};
+    use super::openai_base_url;
 
     #[test]
     fn base_url_prefers_config_then_env_then_default() {
@@ -243,12 +235,5 @@ mod tests {
             "https://api.openai.com/v1"
         );
         assert_eq!(openai_base_url(None, None), "https://api.openai.com/v1");
-    }
-
-    #[test]
-    fn provider_key_is_never_shown_even_partially() {
-        let key = "0123456789abcdef0123456789abcdef";
-        assert_eq!(describe(key, key), "(the provider API key)");
-        assert_eq!(describe("sk-ant-api03-xyz", key), "sk-ant-a… (16 chars)");
     }
 }
