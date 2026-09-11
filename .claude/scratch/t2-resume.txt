@@ -1,5 +1,0 @@
-warning: confirmations are off; writes and commands will run without asking
-resumed session ac925c34 (3 turns, last updated 2026-09-11T09:05:35Z)
-- **Core crate:** Implements the terminal-agnostic agent loop, sessions, configuration, context gathering, redaction, safety checks, interrupts, REPL behavior, and file-system tools.
-- **LLM crate:** Defines the provider abstraction and shared model message types, with streaming Anthropic and OpenAI-compatible API implementations.
-- **Tests:** The core functionality is covered by **10 integration test files** under `tests/`; the llm crate has **0 dedicated test files**.
