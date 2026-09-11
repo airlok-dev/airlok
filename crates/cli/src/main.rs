@@ -4,7 +4,7 @@ mod repl;
 mod terminal;
 
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use airlok_core::config::{self, KeySource, Overrides, ProviderConfig, ProviderName, Sources};
@@ -159,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut out = Stdout::new(terminal, args.verbose);
     let Some(prompt) = prompt else {
-        return run_repl(agent, session, &store, key, &mut out).await;
+        return run_repl(agent, session, &store, key, user_instructions, &mut out).await;
     };
     let result = agent.turn(&mut session, &prompt, &mut out).await;
     out.finish();
@@ -197,6 +197,7 @@ async fn run_repl(
     session: airlok_core::Session,
     store: &SessionStore,
     key: String,
+    user_instructions: Option<PathBuf>,
     out: &mut Stdout,
 ) -> anyhow::Result<()> {
     let interrupt = Interrupt::new();
@@ -220,6 +221,7 @@ async fn run_repl(
         startup: agent.config().provider.clone(),
         config: agent.config().clone(),
         key,
+        user_instructions,
     };
     let mut repl = Repl {
         agent: &mut agent,
@@ -267,6 +269,8 @@ struct CliBackend {
     startup: ProviderConfig,
     config: Config,
     key: String,
+    /// `~/.config/airlok/AIRLOK.md`, for rebuilding the context block.
+    user_instructions: Option<PathBuf>,
 }
 
 impl Backend for CliBackend {
@@ -302,6 +306,17 @@ impl Backend for CliBackend {
             provider,
             redactor: Box::new(redactor),
         })
+    }
+
+    fn context(&mut self) -> Option<String> {
+        Some(
+            context::build(&ContextInput {
+                cwd: &self.config.cwd,
+                user_instructions: self.user_instructions.as_deref(),
+                max_bytes: self.config.context.max_bytes,
+            })
+            .text,
+        )
     }
 }
 

@@ -1,13 +1,17 @@
 use std::time::Duration;
 
 use airlok_core::agent::INTERRUPTED_MARKER;
-use airlok_core::repl::{Line, Repl};
+use airlok_core::config::{ModelConfig, ProviderName};
+use airlok_core::redact::{RedactionMap, Redactor, SecretRedactor};
+use airlok_core::repl::{Backend, Line, Repl, Switch};
+use airlok_core::tools::READ_ONLY_TOOLS;
 use airlok_core::{Interrupt, SessionStore};
-use airlok_llm::ContentBlock;
+use airlok_llm::{ContentBlock, Request};
 use airlok_tests::{
-    agent, partial, reply, MockProvider, RecordingOutput, ScriptedLines, Shown, TempDir,
-    TestBackend,
+    agent, partial, reply, tool_call, with_usage, MockProvider, RecordingOutput, ScriptedLines,
+    Shown, TempDir, TestBackend,
 };
+use serde_json::json;
 
 const TOKEN_A: &str = concat!("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789");
 const TOKEN_B: &str = concat!("ghp_", "zyxwvutsrqponmlkjihgfedcba9876543210");
@@ -144,7 +148,10 @@ async fn ctrl_c_keeps_the_partial_reply_marked_interrupted() {
         statuses.contains(&"interrupted".to_string()),
         "{statuses:?}"
     );
-    assert!(statuses.contains(&"(use /exit or Ctrl-D to quit)".to_string()));
+    assert!(
+        !statuses.iter().any(|s| s.contains("quit")),
+        "Ctrl-C at the prompt prints nothing: {statuses:?}"
+    );
     // The next request carried the marked partial reply.
     let second = &provider.requests()[1];
     assert_eq!(second.messages.len(), 3);
@@ -265,4 +272,302 @@ async fn a_model_switch_is_saved_before_the_next_turn() {
     let session = repl.run(session, &mut lines, &mut out).await;
     let saved = store.load(dir.path(), Some(&session.id)).unwrap().unwrap();
     assert_eq!(saved.model, "other-model");
+}
+
+fn user_texts(request: &Request) -> Vec<&str> {
+    request
+        .messages
+        .iter()
+        .filter(|m| m.role == airlok_llm::Role::User)
+        .filter_map(|m| match m.content.first() {
+            Some(ContentBlock::Text { text }) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_names(request: &Request) -> Vec<String> {
+    let mut names: Vec<String> = request.tools.iter().map(|t| t.name.clone()).collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn slash_prefixes_run_the_first_match_and_typos_get_a_suggestion() {
+    let dir = TempDir::new("repl-slash");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider.clone(), dir.path());
+    let mut repl = Repl {
+        agent: &mut agent,
+        store: None,
+        interrupt: Interrupt::new(),
+        backend: Box::new(TestBackend::default()),
+    };
+    let session = repl.agent.new_session();
+    let mut lines = ScriptedLines::typed(&["/co", "/modle x", "/", "/quit", "never read"]);
+    let mut out = RecordingOutput::default();
+
+    repl.run(session, &mut lines, &mut out).await;
+
+    let statuses = out.statuses();
+    assert!(
+        statuses.iter().any(|s| s.starts_with("input ")),
+        "/co ran /cost: {statuses:?}"
+    );
+    assert!(statuses
+        .contains(&"unknown command /modle; did you mean /model? /help lists them".to_string()));
+    assert!(
+        statuses.iter().any(|s| s.starts_with("/plan ")),
+        "/ alone ran /help"
+    );
+    assert!(provider.requests().is_empty());
+    assert_eq!(lines.prompts.len(), 4, "/quit ended the session");
+}
+
+#[tokio::test]
+async fn a_bang_command_runs_here_and_the_next_turn_sees_it() {
+    let dir = TempDir::new("repl-bang");
+    let store = SessionStore::new(dir.path().join("data"));
+    let provider = MockProvider::scripted(vec![reply("It printed hello.")]);
+    let mut agent = agent(provider.clone(), dir.path());
+    let mut repl = Repl {
+        agent: &mut agent,
+        store: Some(&store),
+        interrupt: Interrupt::new(),
+        backend: Box::new(TestBackend::default()),
+    };
+    let session = repl.agent.new_session();
+    let mut lines = ScriptedLines::typed(&[
+        "! echo hello-from-shell; pwd",
+        "what did it print?",
+        "/exit",
+    ]);
+    let mut out = RecordingOutput::default();
+
+    let session = repl.run(session, &mut lines, &mut out).await;
+
+    let statuses = out.statuses();
+    assert!(
+        statuses.contains(&"hello-from-shell".to_string()),
+        "{statuses:?}"
+    );
+    let cwd = dir.path().canonicalize().unwrap();
+    assert!(
+        statuses.contains(&cwd.display().to_string()),
+        "runs in the working directory: {statuses:?}"
+    );
+    let request = &provider.requests()[0];
+    let texts = user_texts(request);
+    assert_eq!(texts.len(), 2);
+    assert!(
+        texts[0].contains("$ echo hello-from-shell; pwd\nhello-from-shell\n"),
+        "{}",
+        texts[0]
+    );
+    assert_eq!(texts[1], "what did it print?");
+    let saved = store.load(dir.path(), Some(&session.id)).unwrap().unwrap();
+    assert_eq!(saved.messages, session.messages);
+    assert_eq!(saved.messages.len(), 3);
+}
+
+/// A backend whose `context` returns a fixed block, standing in for the
+/// rebuild after AIRLOK.md changes.
+struct Reloading(&'static str);
+
+impl Backend for Reloading {
+    fn fresh_redactor(&mut self) -> Box<dyn Redactor> {
+        Box::new(SecretRedactor::new())
+    }
+
+    fn switch(&mut self, _name: ProviderName, _seed: &RedactionMap) -> Result<Switch, String> {
+        Err("not in this test".into())
+    }
+
+    fn context(&mut self) -> Option<String> {
+        Some(self.0.to_string())
+    }
+}
+
+#[tokio::test]
+async fn a_hash_note_is_appended_to_airlok_md_and_applies_next_turn() {
+    let dir = TempDir::new("repl-hash");
+    let file = dir.path().join("AIRLOK.md");
+    std::fs::write(&file, "# rules\n- existing").unwrap();
+    let provider = MockProvider::scripted(vec![reply("ok")]);
+    let mut agent = agent(provider.clone(), dir.path());
+    let mut repl = Repl {
+        agent: &mut agent,
+        store: None,
+        interrupt: Interrupt::new(),
+        backend: Box::new(Reloading("RELOADED CONTEXT")),
+    };
+    let session = repl.agent.new_session();
+    let mut lines = ScriptedLines::typed(&["# always run the tests", "#- keep it short", "hi"]);
+    let mut out = RecordingOutput::default();
+
+    repl.run(session, &mut lines, &mut out).await;
+
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "# rules\n- existing\n- always run the tests\n- keep it short\n"
+    );
+    let statuses = out.statuses();
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| *s == "added to ./AIRLOK.md")
+            .count(),
+        2
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "a note is not a turn");
+    assert!(requests[0].system.contains("RELOADED CONTEXT"));
+}
+
+#[tokio::test]
+async fn a_hash_note_creates_airlok_md_and_says_what_it_hides() {
+    let dir = TempDir::new("repl-hash-new");
+    std::fs::write(dir.path().join("CLAUDE.md"), "- tabs\n").unwrap();
+    let mut agent = agent(MockProvider::scripted(vec![]), dir.path());
+    let mut repl = Repl {
+        agent: &mut agent,
+        store: None,
+        interrupt: Interrupt::new(),
+        backend: Box::new(TestBackend::default()),
+    };
+    let session = repl.agent.new_session();
+    let mut lines = ScriptedLines::typed(&["# prefer spaces"]);
+    let mut out = RecordingOutput::default();
+
+    repl.run(session, &mut lines, &mut out).await;
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("AIRLOK.md")).unwrap(),
+        "- prefer spaces\n"
+    );
+    assert_eq!(
+        out.statuses(),
+        vec!["added to ./AIRLOK.md (new file, read instead of CLAUDE.md from now on)"]
+    );
+}
+
+#[tokio::test]
+async fn plan_then_go_researches_read_only_then_runs_with_every_tool() {
+    const MODEL: &str = "gpt-6-astra";
+    let dir = TempDir::new("repl-plan");
+    let provider = MockProvider::scripted(vec![
+        tool_call("t1", "glob", json!({"pattern": "*"})),
+        reply("1. Create hello.txt containing hello."),
+        tool_call(
+            "t2",
+            "write_file",
+            json!({"path": "hello.txt", "content": "hello\n"}),
+        ),
+        reply("Created hello.txt."),
+    ]);
+    let mut agent = agent(provider.clone(), dir.path());
+    agent.config_mut().provider.model = MODEL.into();
+    agent.config_mut().models.insert(
+        MODEL.into(),
+        ModelConfig {
+            reasoning_effort: Some("none".into()),
+        },
+    );
+    let mut repl = Repl {
+        agent: &mut agent,
+        store: None,
+        interrupt: Interrupt::new(),
+        backend: Box::new(TestBackend::default()),
+    };
+    let session = repl.agent.new_session();
+    let mut lines =
+        ScriptedLines::typed(&["/go", "/plan", "/go", "add a greeting file", "/go", "/exit"]);
+    let mut out = RecordingOutput::default();
+
+    repl.run(session, &mut lines, &mut out).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    let mut read_only: Vec<String> = READ_ONLY_TOOLS.iter().map(|n| n.to_string()).collect();
+    read_only.sort();
+    for planning in &requests[..2] {
+        assert_eq!(tool_names(planning), read_only);
+        assert!(planning.system.contains("Plan mode is on"));
+    }
+    for running in &requests[2..] {
+        for name in ["write_file", "edit_file", "bash", "read_file"] {
+            assert!(tool_names(running).contains(&name.to_string()), "{name}");
+        }
+        assert!(!running.system.contains("Plan mode"));
+    }
+    assert_eq!(
+        user_texts(&requests[2]).last().copied(),
+        Some("Carry out this plan:\n\n1. Create hello.txt containing hello.")
+    );
+    for request in &requests {
+        assert_eq!(request.reasoning_effort.as_deref(), Some("none"));
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+        "hello\n"
+    );
+    let statuses = out.statuses();
+    assert!(statuses.contains(&"not in plan mode; /plan starts it".to_string()));
+    assert!(statuses.contains(&"no plan yet: describe the task and wait for the plan".to_string()));
+    assert!(
+        lines.prompts[2].ends_with(" [plan]> "),
+        "{:?}",
+        lines.prompts
+    );
+    assert!(!lines.prompts[5].contains("[plan]"), "{:?}", lines.prompts);
+}
+
+#[tokio::test]
+async fn plan_again_leaves_without_running_the_plan() {
+    let dir = TempDir::new("repl-plan-leave");
+    let provider = MockProvider::scripted(vec![reply("1. Do the thing.")]);
+    let mut agent = agent(provider.clone(), dir.path());
+    let mut repl = Repl {
+        agent: &mut agent,
+        store: None,
+        interrupt: Interrupt::new(),
+        backend: Box::new(TestBackend::default()),
+    };
+    let session = repl.agent.new_session();
+    let mut lines = ScriptedLines::typed(&["/plan", "plan it", "/plan", "/go"]);
+    let mut out = RecordingOutput::default();
+
+    repl.run(session, &mut lines, &mut out).await;
+
+    assert_eq!(provider.requests().len(), 1);
+    let statuses = out.statuses();
+    assert!(statuses.contains(&"plan mode off".to_string()));
+    assert!(statuses.contains(&"not in plan mode; /plan starts it".to_string()));
+}
+
+#[tokio::test]
+async fn a_footer_follows_each_turn() {
+    let dir = TempDir::new("repl-footer");
+    let provider = MockProvider::scripted(vec![with_usage(50_000, 10, reply("hi"))]);
+    let mut agent = agent(provider, dir.path());
+    let mut repl = Repl {
+        agent: &mut agent,
+        store: None,
+        interrupt: Interrupt::new(),
+        backend: Box::new(TestBackend::default()),
+    };
+    let session = repl.agent.new_session();
+    let mut lines = ScriptedLines::typed(&["hello"]);
+    let mut out = RecordingOutput::default();
+
+    let session = repl.run(session, &mut lines, &mut out).await;
+
+    assert_eq!(
+        out.statuses().last().cloned(),
+        Some(format!(
+            "{} · context 25% · session {}",
+            airlok_llm::anthropic::DEFAULT_MODEL,
+            session.id
+        ))
+    );
 }

@@ -1,15 +1,21 @@
-//! The interactive loop: read a line, run a turn or a slash command, save.
-//! Input arrives through [`LineSource`] so the binary can use readline and
-//! tests can feed a script.
+//! The interactive loop: read a line, then run a turn, a slash command, a
+//! `!` command, or a `#` note, and save. Input arrives through
+//! [`LineSource`] so the binary can use readline and tests can feed a
+//! script.
 
+use std::io::Write as _;
+use std::path::Path;
 use std::sync::Arc;
 
-use airlok_llm::Provider;
+use airlok_llm::{Message, Provider};
+use serde_json::json;
 
 use crate::agent::{fmt_tokens, redaction_lines, Agent};
 use crate::config::{ProviderConfig, ProviderName};
+use crate::context::INSTRUCTION_FILES;
 use crate::redact::{RedactionMap, Redactor};
 use crate::session::{Session, SessionStore};
+use crate::tools::{truncate_output, Bash, Tool};
 use crate::{CoreError, Interrupt, Output};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +42,12 @@ pub trait Backend: Send {
     /// placeholders and also knows the new provider's key. The error says
     /// what is missing, such as the environment variable for the key.
     fn switch(&mut self, name: ProviderName, seed: &RedactionMap) -> Result<Switch, String>;
+
+    /// The context block rebuilt from disk, after `#` changed AIRLOK.md.
+    /// `None` keeps the current block.
+    fn context(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// A provider ready to take over the session.
@@ -45,23 +57,78 @@ pub struct Switch {
     pub redactor: Box<dyn Redactor>,
 }
 
+/// Slash commands in menu order. A prefix runs the first command it
+/// matches, so the harmless ones come before those that change things.
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "list the commands"),
     ("/model", "show the model, or switch with /model <id>"),
     (
+        "/plan",
+        "plan mode: read-only tools, the reply is a plan; /plan again leaves",
+    ),
+    ("/go", "carry out the plan and leave plan mode"),
+    (
         "/provider",
         "show the provider, or switch with /provider anthropic|openai",
     ),
-    ("/clear", "start a new session; the current one stays saved"),
-    ("/compact", "summarise older turns to free context"),
     ("/cost", "tokens used so far"),
+    ("/compact", "summarise older turns to free context"),
+    ("/config", "the effective configuration"),
     (
         "/redactions",
         "what was redacted before leaving this machine",
     ),
-    ("/config", "the effective configuration"),
+    ("/clear", "start a new session; the current one stays saved"),
     ("/exit", "save and quit; Ctrl-D does the same"),
 ];
+
+/// What the name typed after `/` resolves to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resolved {
+    /// A command name without the slash, such as `model`.
+    Command(&'static str),
+    /// Nothing matches. `closest` is the nearest command, with its slash.
+    Unknown { closest: &'static str },
+}
+
+/// An exact name, else the first command in [`COMMANDS`] order that starts
+/// with `name`. `quit` is an exact-only alias of `exit`.
+pub fn resolve_command(name: &str) -> Resolved {
+    if name == "quit" {
+        return Resolved::Command("exit");
+    }
+    let names = || COMMANDS.iter().map(|&(command, _)| &command[1..]);
+    if let Some(found) = names()
+        .find(|n| *n == name)
+        .or_else(|| names().find(|n| n.starts_with(name)))
+    {
+        return Resolved::Command(found);
+    }
+    let closest = COMMANDS
+        .iter()
+        .map(|&(command, _)| command)
+        .min_by_key(|command| edit_distance(name, &command[1..]))
+        .unwrap_or("/help");
+    Resolved::Unknown { closest }
+}
+
+/// Levenshtein distance, for suggesting the closest command.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (diagonal + usize::from(ca != *cb))
+                .min(row[j] + 1)
+                .min(above + 1);
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
 
 pub struct Repl<'a> {
     pub agent: &'a mut Agent,
@@ -93,19 +160,20 @@ impl Repl<'_> {
             let prompt = self.prompt_text();
             match lines.read_line(&prompt) {
                 Line::Eof => break,
-                Line::Interrupt => out.status("(use /exit or Ctrl-D to quit)"),
+                // Ctrl-C at the prompt does nothing; Ctrl-D or /exit quits.
+                Line::Interrupt => continue,
                 Line::Text(line) => {
                     let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    match line.strip_prefix('/') {
-                        Some(command) => {
-                            if self.command(command, &mut session, out).await == Flow::Exit {
-                                break;
-                            }
+                    if let Some(command) = line.strip_prefix('/') {
+                        if self.command(command, &mut session, out).await == Flow::Exit {
+                            break;
                         }
-                        None => self.turn(&mut session, line, out).await,
+                    } else if let Some(command) = line.strip_prefix('!') {
+                        self.run_local(command.trim(), &mut session, out).await;
+                    } else if let Some(note) = line.strip_prefix('#') {
+                        self.remember(note.trim(), out);
+                    } else if !line.is_empty() {
+                        self.turn(&mut session, line, out).await;
                     }
                 }
             }
@@ -114,7 +182,7 @@ impl Repl<'_> {
         session
     }
 
-    /// `<model> <cwd basename>> `
+    /// `<model> <cwd basename>> `, with `[plan]` before the `>` in plan mode.
     pub fn prompt_text(&self) -> String {
         let config = self.agent.config();
         let dir = config
@@ -122,10 +190,16 @@ impl Repl<'_> {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| config.cwd.display().to_string());
-        format!("{} {dir}> ", config.provider.model)
+        let plan = if self.agent.plan_mode() {
+            " [plan]"
+        } else {
+            ""
+        };
+        format!("{} {dir}{plan}> ", config.provider.model)
     }
 
     async fn turn(&mut self, session: &mut Session, line: &str, out: &mut dyn Output) {
+        out.begin_turn();
         match self
             .agent
             .turn_with(session, line, out, &self.interrupt)
@@ -141,7 +215,21 @@ impl Repl<'_> {
             }
         }
         out.end_turn();
+        out.status(&self.footer(session));
         self.save(session, out);
+    }
+
+    /// Shown after each turn: the model, how full the context is, and the
+    /// session id.
+    fn footer(&self, session: &Session) -> String {
+        let config = self.agent.config();
+        let percent = (session.usage.context_tokens * 100)
+            .checked_div(config.provider.context_window)
+            .unwrap_or(0);
+        format!(
+            "{} · context {percent}% · session {}",
+            config.provider.model, session.id
+        )
     }
 
     async fn command(
@@ -150,9 +238,18 @@ impl Repl<'_> {
         session: &mut Session,
         out: &mut dyn Output,
     ) -> Flow {
-        let (name, arg) = match command.trim().split_once(char::is_whitespace) {
+        let (typed, arg) = match command.trim().split_once(char::is_whitespace) {
             Some((name, arg)) => (name, arg.trim()),
             None => (command.trim(), ""),
+        };
+        let name = match resolve_command(typed) {
+            Resolved::Command(name) => name,
+            Resolved::Unknown { closest } => {
+                out.status(&format!(
+                    "unknown command /{typed}; did you mean {closest}? /help lists them"
+                ));
+                return Flow::Continue;
+            }
         };
         match name {
             "model" if arg.is_empty() => {
@@ -219,10 +316,91 @@ impl Repl<'_> {
                 Ok(text) => text.lines().for_each(|l| out.status(l)),
                 Err(e) => out.status(&format!("cannot render the config: {e}")),
             },
-            "exit" | "quit" => return Flow::Exit,
-            other => out.status(&format!("unknown command /{other}; /help lists them")),
+            "plan" => self.toggle_plan(out),
+            "go" => self.go(session, out).await,
+            "exit" => return Flow::Exit,
+            other => unreachable!("/{other} is in COMMANDS but not handled"),
         }
         Flow::Continue
+    }
+
+    fn toggle_plan(&mut self, out: &mut dyn Output) {
+        let on = !self.agent.plan_mode();
+        self.agent.set_plan_mode(on);
+        out.status(if on {
+            "plan mode: read-only tools, and the reply is a plan. /go carries it out; /plan leaves without running it"
+        } else {
+            "plan mode off"
+        });
+    }
+
+    /// Leaves plan mode and runs the last plan as the task.
+    async fn go(&mut self, session: &mut Session, out: &mut dyn Output) {
+        if !self.agent.plan_mode() {
+            out.status("not in plan mode; /plan starts it");
+            return;
+        }
+        let Some(plan) = self.agent.plan().map(str::to_string) else {
+            out.status("no plan yet: describe the task and wait for the plan");
+            return;
+        };
+        self.agent.set_plan_mode(false);
+        out.status("plan mode off; carrying out the plan");
+        self.turn(session, &format!("Carry out this plan:\n\n{plan}"), out)
+            .await;
+    }
+
+    /// Runs a `!` command in the working directory, shows what it printed,
+    /// and adds both to the session for the model's next turn.
+    async fn run_local(&mut self, command: &str, session: &mut Session, out: &mut dyn Output) {
+        if command.is_empty() {
+            out.status("usage: !<command> runs it here and adds its output to the conversation");
+            return;
+        }
+        let config = self.agent.config();
+        let bash = Bash::new(&config.cwd, config.agent.bash_timeout);
+        let output = bash
+            .execute(json!({ "command": command }))
+            .await
+            .unwrap_or_else(|e| format!("error: {e}"));
+        out.command_output(&output);
+        session.messages.push(Message::user_text(format!(
+            "I ran a command in the terminal. Its output is context for my next message, \
+             not a request.\n$ {command}\n{}",
+            truncate_output(output)
+        )));
+        session.touch();
+        self.save(session, out);
+    }
+
+    /// Appends a `#` note to ./AIRLOK.md as a list item, creating the file,
+    /// and rebuilds the context block so the note applies from the next
+    /// turn.
+    fn remember(&mut self, note: &str, out: &mut dyn Output) {
+        if note.is_empty() {
+            out.status("usage: #<note> adds a line to ./AIRLOK.md");
+            return;
+        }
+        let cwd = self.agent.config().cwd.clone();
+        let path = cwd.join(INSTRUCTION_FILES[0]);
+        let created = !path.exists();
+        if let Err(e) = append_note(&path, note) {
+            out.status(&format!("cannot write {}: {e}", path.display()));
+            return;
+        }
+        if let Some(context) = self.backend.context() {
+            self.agent.set_context(context);
+        }
+        // AIRLOK.md takes precedence, so a new one hides the fallbacks.
+        let hidden = INSTRUCTION_FILES[1..]
+            .iter()
+            .find(|name| created && cwd.join(name).exists());
+        out.status(&match hidden {
+            Some(name) => {
+                format!("added to ./AIRLOK.md (new file, read instead of {name} from now on)")
+            }
+            None => "added to ./AIRLOK.md".to_string(),
+        });
     }
 
     fn switch_provider(&mut self, arg: &str, session: &mut Session, out: &mut dyn Output) {
@@ -269,6 +447,24 @@ impl Repl<'_> {
     }
 }
 
+/// Appends `- note` on a line of its own, first ending a last line that
+/// has no newline. A note that is already a list item goes in as is.
+fn append_note(path: &Path, note: &str) -> std::io::Result<()> {
+    let unterminated = std::fs::read(path)
+        .map(|bytes| bytes.last().is_some_and(|b| *b != b'\n'))
+        .unwrap_or(false);
+    let item = if note.starts_with("- ") || note.starts_with("* ") {
+        note.to_string()
+    } else {
+        format!("- {note}")
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{}{item}", if unterminated { "\n" } else { "" })
+}
+
 /// What `/cost` prints.
 pub fn cost_lines(session: &Session, context_window: u64) -> Vec<String> {
     let usage = &session.usage;
@@ -297,4 +493,44 @@ pub fn cost_lines(session: &Session, context_window: u64) -> Vec<String> {
         lines.push(format!("compacted {} time(s)", session.compactions.len()));
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_listed_command_resolves_to_itself() {
+        for (command, _) in COMMANDS {
+            assert_eq!(
+                resolve_command(&command[1..]),
+                Resolved::Command(&command[1..])
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefix_runs_the_first_match_in_menu_order() {
+        assert_eq!(resolve_command(""), Resolved::Command("help"));
+        assert_eq!(resolve_command("c"), Resolved::Command("cost"));
+        assert_eq!(resolve_command("com"), Resolved::Command("compact"));
+        assert_eq!(resolve_command("p"), Resolved::Command("plan"));
+        assert_eq!(resolve_command("pr"), Resolved::Command("provider"));
+        assert_eq!(resolve_command("quit"), Resolved::Command("exit"));
+    }
+
+    #[test]
+    fn an_unknown_command_names_the_closest() {
+        assert_eq!(
+            resolve_command("modle"),
+            Resolved::Unknown { closest: "/model" }
+        );
+        assert_eq!(
+            resolve_command("comapct"),
+            Resolved::Unknown {
+                closest: "/compact"
+            }
+        );
+        assert_eq!(resolve_command("q"), Resolved::Unknown { closest: "/go" });
+    }
 }
