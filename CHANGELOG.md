@@ -2,6 +2,19 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.4.0] - 2026-09-11
+
+### Added
+
+- Interactive sessions: `airlok` with no task opens a REPL with a `<model> <dir>> ` prompt, `/help`, `/clear`, `/compact`, `/cost`, `/redactions`, `/config`, and `/exit`. Ctrl-C cancels the turn in progress and keeps the partial reply marked as interrupted; Ctrl-D saves and quits.
+- Sessions are saved after every turn under `$XDG_DATA_HOME/airlok/sessions/<dir hash>/` (`~/.local/share/airlok` by default), mode 0600 in a 0700 directory, with the config snapshot, provider and model, plaintext history, redaction map, token counts, and timestamps. The provider API key is stored blank. `--resume` continues the latest session for the directory (`--resume=<id>` a particular one), rebuilding the context block and adding a system note with the resume time. `airlok sessions` lists them, `sessions rm <id>` deletes one, `sessions clean --older-than 30d` prunes every directory.
+- Compaction: once the last request used more than `[agent] compact_at` (0.75) of `[provider] context_window` (200k), the next turn replaces everything but the last `[agent] keep_recent_turns` (4) turns with a model-written summary, requested through the redactor with no tools. Shown as a dim `compacted: X -> Y tokens` line and recorded in the session.
+- Token usage from both providers: Anthropic `message_start`/`message_delta` counts, OpenAI `stream_options.include_usage`. Where a provider reports none, requests are estimated at chars/4 and `/cost` says so.
+
+### Changed
+
+- A turn that fails or is aborted no longer leaves its prompt in the history.
+
 ## [0.3.1] - 2026-09-11
 
 ### Security
