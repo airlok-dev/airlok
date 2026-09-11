@@ -35,6 +35,24 @@ pub trait Output: Send {
     fn confirm(&mut self, request: &Confirmation<'_>) -> Decision;
 }
 
+impl CoreError {
+    /// How to fix this in the config, when a setting can. Today: a provider
+    /// that rejects its default `reasoning_effort` for `model`.
+    pub fn hint(&self, model: &str) -> Option<String> {
+        let CoreError::Llm(airlok_llm::LlmError::Api { status: 400, body }) = self else {
+            return None;
+        };
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        if value["error"]["param"].as_str()? != "reasoning_effort" {
+            return None;
+        }
+        Some(format!(
+            "hint: the provider rejected its reasoning effort for {model}. \
+             Set one in the config, for example:\n[models.\"{model}\"]\nreasoning_effort = \"none\""
+        ))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     #[error(transparent)]

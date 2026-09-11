@@ -7,6 +7,7 @@
 //! [`ConfigFile`] is the on-disk shape where everything is optional;
 //! [`Config`] is the resolved shape the agent runs with.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -75,6 +76,17 @@ pub struct ConfigFile {
     pub safety: SafetySection,
     pub context: ContextSection,
     pub redact: RedactSection,
+    /// `[models."<id>"]`: settings for one model id, the deployment name on
+    /// Azure. They apply whichever way the model was chosen, `/model` included.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, ModelSection>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,8 +210,26 @@ impl ConfigFile {
                     .show_secrets_in_output
                     .or(self.redact.show_secrets_in_output),
             },
+            models: layer_models(self.models, over.models),
         }
     }
+}
+
+/// Merges `[models]` per model and per key; `over` wins where both set one.
+fn layer_models(
+    mut base: BTreeMap<String, ModelSection>,
+    over: BTreeMap<String, ModelSection>,
+) -> BTreeMap<String, ModelSection> {
+    for (id, section) in over {
+        let merged = base.remove(&id).unwrap_or_default();
+        base.insert(
+            id,
+            ModelSection {
+                reasoning_effort: section.reasoning_effort.or(merged.reasoning_effort),
+            },
+        );
+    }
+    base
 }
 
 /// Values given on the command line. The highest layer.
@@ -218,8 +248,17 @@ pub struct Config {
     pub safety: SafetyConfig,
     pub context: ContextConfig,
     pub redact: RedactConfig,
+    /// Per-model settings by model id.
+    pub models: BTreeMap<String, ModelConfig>,
     /// Directory the agent works in. Tools resolve relative paths against it.
     pub cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelConfig {
+    /// Sent as `reasoning_effort` by the openai provider. Not validated: the
+    /// provider rejects values it does not accept.
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -401,6 +440,18 @@ impl Config {
             redact: RedactConfig {
                 show_secrets_in_output: file.redact.show_secrets_in_output.unwrap_or(false),
             },
+            models: file
+                .models
+                .into_iter()
+                .map(|(id, m)| {
+                    (
+                        id,
+                        ModelConfig {
+                            reasoning_effort: m.reasoning_effort,
+                        },
+                    )
+                })
+                .collect(),
             cwd,
         }
     }
@@ -435,6 +486,18 @@ impl Config {
             redact: RedactSection {
                 show_secrets_in_output: Some(self.redact.show_secrets_in_output),
             },
+            models: self
+                .models
+                .iter()
+                .map(|(id, m)| {
+                    (
+                        id.clone(),
+                        ModelSection {
+                            reasoning_effort: m.reasoning_effort.clone(),
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -560,6 +623,10 @@ pub const TEMPLATE: &str = r##"# airlok configuration. Precedence: CLI flags > .
 
 [redact]
 # show_secrets_in_output = false   # show secrets from files in full in the terminal instead of masked
+
+# Settings for one model id (the deployment name on Azure), applied however it is chosen, /model included.
+# [models."gpt-6-astra"]
+# reasoning_effort = "none"   # openai only, sent as reasoning_effort; Azure's gpt-6-astra needs "none" to use tools on Chat Completions
 "##;
 
 #[cfg(test)]
@@ -727,7 +794,7 @@ mod tests {
             .lines()
             .map(|line| {
                 line.strip_prefix("# ")
-                    .filter(|l| l.contains('='))
+                    .filter(|l| l.contains('=') || l.starts_with('['))
                     .unwrap_or(line)
             })
             .map(|line| format!("{line}\n"))
@@ -735,6 +802,12 @@ mod tests {
         let file = ConfigFile::parse(&uncommented, Path::new("template")).unwrap();
         let mut resolved = Config::resolve(file, PathBuf::from("."));
         let expected = Config::new(PathBuf::from("."));
+        // The template's [models] entry is an example; there are none by default.
+        assert_eq!(
+            resolved.models["gpt-6-astra"].reasoning_effort.as_deref(),
+            Some("none")
+        );
+        resolved.models.clear();
         // The template shows openai-only examples for these; the defaults leave them unset.
         assert_eq!(
             resolved.provider.base_url.as_deref(),
@@ -780,5 +853,28 @@ mod tests {
         config.provider.api_key_cmd = Some("true".into());
         let err = config.resolve_key().unwrap_err().to_string();
         assert!(err.contains("printed nothing"), "{err}");
+    }
+
+    #[test]
+    fn models_layer_per_model_and_per_key() {
+        let user = ConfigFile::parse(
+            "[models.\"a\"]\nreasoning_effort = \"low\"\n[models.\"b\"]\nreasoning_effort = \"high\"\n",
+            Path::new("user"),
+        )
+        .unwrap();
+        let project = ConfigFile::parse(
+            "[models.\"a\"]\nreasoning_effort = \"none\"\n",
+            Path::new("project"),
+        )
+        .unwrap();
+        let config = Config::resolve(user.layer(project), PathBuf::from("."));
+        assert_eq!(config.models["a"].reasoning_effort.as_deref(), Some("none"));
+        assert_eq!(config.models["b"].reasoning_effort.as_deref(), Some("high"));
+        let shown = toml::to_string(&config.to_file()).unwrap();
+        assert!(
+            shown.contains("[models.a]") || shown.contains("[models.\"a\"]"),
+            "{shown}"
+        );
+        assert!(ConfigFile::parse("[models.\"a\"]\nnope = 1\n", Path::new("x")).is_err());
     }
 }

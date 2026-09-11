@@ -167,6 +167,9 @@ fn wire_request(request: &Request) -> Value {
         "max_completion_tokens": request.max_tokens,
         "messages": messages,
     });
+    if let Some(effort) = &request.reasoning_effort {
+        body["reasoning_effort"] = Value::String(effort.clone());
+    }
     if !request.tools.is_empty() {
         let tools: Vec<Value> = request
             .tools
@@ -458,6 +461,7 @@ mod tests {
                 description: "reads".into(),
                 input_schema: json!({"type": "object"}),
             }],
+            reasoning_effort: None,
         };
 
         let body = wire_request(&request);
@@ -466,6 +470,10 @@ mod tests {
         assert_eq!(body["max_completion_tokens"], 100);
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "only sent when configured"
+        );
         assert_eq!(
             body["messages"],
             json!([
@@ -483,5 +491,18 @@ mod tests {
             body["tools"],
             json!([{"type": "function", "function": {"name": "read_file", "description": "reads", "parameters": {"type": "object"}}}])
         );
+    }
+
+    #[test]
+    fn reasoning_effort_is_sent_when_set() {
+        let request = Request {
+            model: "gpt-6-astra".into(),
+            max_tokens: 10,
+            system: String::new(),
+            messages: vec![Message::user_text("hi")],
+            tools: Vec::new(),
+            reasoning_effort: Some("none".into()),
+        };
+        assert_eq!(wire_request(&request)["reasoning_effort"], "none");
     }
 }

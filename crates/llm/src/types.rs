@@ -75,6 +75,9 @@ pub struct Request {
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
+    /// Sent as `reasoning_effort` by the openai provider, and only when set.
+    /// The Anthropic provider ignores it.
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

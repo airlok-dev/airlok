@@ -133,7 +133,12 @@ impl Repl<'_> {
         {
             Ok(_) => {}
             Err(CoreError::Aborted) => out.status("aborted"),
-            Err(e) => out.status(&format!("error: {e}")),
+            Err(e) => {
+                out.status(&format!("error: {e}"));
+                if let Some(hint) = e.hint(&self.agent.config().provider.model) {
+                    hint.lines().for_each(|l| out.status(l));
+                }
+            }
         }
         out.end_turn();
         self.save(session, out);
@@ -151,7 +156,18 @@ impl Repl<'_> {
         };
         match name {
             "model" if arg.is_empty() => {
-                out.status(&format!("model {} ({})", session.model, session.provider))
+                let effort = self
+                    .agent
+                    .config()
+                    .models
+                    .get(&session.model)
+                    .and_then(|m| m.reasoning_effort.as_deref())
+                    .map(|e| format!(", reasoning_effort {e}"))
+                    .unwrap_or_default();
+                out.status(&format!(
+                    "model {} ({}){effort}",
+                    session.model, session.provider
+                ))
             }
             "model" => {
                 self.agent.config_mut().provider.model = arg.to_string();

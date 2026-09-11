@@ -127,6 +127,9 @@ max_bytes = 32768        # cap on the context block; tree is cut first, then ins
 
 [redact]
 show_secrets_in_output = false   # show secrets from files in full in the terminal instead of masked
+
+[models."gpt-6-astra"]    # settings for one model id (the deployment name on Azure); none by default
+reasoning_effort = "none" # openai only, sent as reasoning_effort; not validated
 ```
 
 For openai, `base_url` falls back to the `OPENAI_BASE_URL` environment variable when the config does not set it.
@@ -148,6 +151,8 @@ model = "<deployment-name>"
 base_url = "https://<resource>.openai.azure.com/openai/v1"
 api_key_cmd = "az cognitiveservices account keys list -n <resource> -g <resource-group> --query key1 -o tsv"
 ```
+
+Azure's `gpt-6-astra` accepts tools on Chat Completions only with reasoning off, so it needs `[models."gpt-6-astra"]` with `reasoning_effort = "none"`. Without it, airlok shows the provider's error and names that setting. The entry applies however the model is chosen, `/model gpt-6-astra` included.
 
 With this in the user config, plain `airlok "..."` works. The key is sent in Azure's `api-key` header, chosen from the host. No shell wrapper or exported variable is needed.
 

@@ -179,3 +179,48 @@ async fn a_failed_turn_leaves_the_session_as_it_was() {
     assert_eq!(session.messages.len(), 2);
     assert_eq!(session.turns(), 1);
 }
+
+#[tokio::test]
+async fn reasoning_effort_is_sent_only_for_the_configured_model() {
+    let dir = TempDir::new("reasoning-effort");
+    let provider = MockProvider::scripted(vec![reply("a"), reply("b")]);
+    let mut out = RecordingOutput::default();
+    let mut agent = agent(provider.clone(), dir.path());
+    agent.config_mut().provider.model = "gpt-6-astra".into();
+    agent.config_mut().models.insert(
+        "gpt-6-astra".into(),
+        airlok_core::config::ModelConfig {
+            reasoning_effort: Some("none".into()),
+        },
+    );
+    let mut session = agent.new_session();
+
+    agent.turn(&mut session, "one", &mut out).await.unwrap();
+    agent.config_mut().provider.model = "gpt-5.6-luna".into();
+    agent.turn(&mut session, "two", &mut out).await.unwrap();
+
+    let requests = provider.requests();
+    assert_eq!(requests[0].reasoning_effort.as_deref(), Some("none"));
+    assert_eq!(requests[1].reasoning_effort, None);
+}
+
+#[test]
+fn a_rejected_reasoning_effort_gets_a_config_hint() {
+    use airlok_core::CoreError;
+    use airlok_llm::LlmError;
+    let rejected = CoreError::Llm(LlmError::Api {
+        status: 400,
+        body: r#"{"error":{"message":"Function tools with reasoning_effort are not supported","param":"reasoning_effort"}}"#.into(),
+    });
+    let hint = rejected.hint("gpt-6-astra").unwrap();
+    assert!(
+        hint.contains("[models.\"gpt-6-astra\"]\nreasoning_effort = \"none\""),
+        "{hint}"
+    );
+    let other = CoreError::Llm(LlmError::Api {
+        status: 400,
+        body: r#"{"error":{"message":"bad","param":"messages"}}"#.into(),
+    });
+    assert!(other.hint("gpt-6-astra").is_none());
+    assert!(CoreError::TurnLimit(3).hint("m").is_none());
+}
