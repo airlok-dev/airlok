@@ -26,6 +26,7 @@ fn run_detached(cwd: &PathBuf, args: &[&str]) -> std::process::Output {
         .args(args)
         .current_dir(cwd)
         .env("XDG_CONFIG_HOME", cwd)
+        .env("XDG_DATA_HOME", cwd)
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("AZURE_OPENAI_API_KEY");
@@ -68,4 +69,13 @@ fn yes_passes_the_terminal_check() {
     assert!(!stderr.contains("no terminal is available"), "{stderr}");
     assert!(stderr.contains("ANTHROPIC_API_KEY is not set"), "{stderr}");
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_session_needs_a_terminal_on_stdin() {
+    let cwd = scratch("repl-no-tty");
+    let output = run_detached(&cwd, &["--yes"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stdin is not a terminal"), "{stderr}");
 }

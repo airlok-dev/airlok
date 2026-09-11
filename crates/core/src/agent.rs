@@ -1,10 +1,11 @@
 //! The agent loop.
 //!
-//! Invariant: history is kept in plaintext. Every request body is redacted
-//! at send time, and every response is rehydrated before it is stored or
-//! acted on. The provider only ever sees placeholders.
+//! Invariant: history is kept in plaintext inside a [`Session`]. Every
+//! request body is redacted at send time, and every response is rehydrated
+//! before it is stored or acted on. The provider only ever sees
+//! placeholders.
 //!
-//! TODO(stage N): compaction when history grows, subagents.
+//! TODO(stage N): subagents.
 
 use std::sync::Arc;
 
@@ -16,10 +17,12 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::interrupt::{Interrupt, Watcher};
 use crate::redact::{
     for_display, redact_only_in, split_incomplete_placeholder, RedactionMap, Redactor,
 };
 use crate::safety::{CommandVerdict, Confirmation, Decision};
+use crate::session::{Compaction, Session};
 use crate::tools::{truncate_output, Plan, Tool, ToolError, ToolRegistry};
 use crate::{CoreError, Output};
 
@@ -45,18 +48,22 @@ impl RunReport {
     /// One line per redaction naming the kind, length, and class, never
     /// the value.
     pub fn redaction_lines(&self) -> Vec<String> {
-        self.redactions
-            .iter()
-            .map(|(placeholder, entry)| {
-                format!(
-                    "{placeholder}  {} ({} chars, {})",
-                    entry.kind,
-                    entry.value.chars().count(),
-                    entry.class.as_str()
-                )
-            })
-            .collect()
+        redaction_lines(&self.redactions)
     }
+}
+
+/// One line per placeholder: kind, length, and class. Never the value.
+pub fn redaction_lines(map: &RedactionMap) -> Vec<String> {
+    map.iter()
+        .map(|(placeholder, entry)| {
+            format!(
+                "{placeholder}  {} ({} chars, {})",
+                entry.kind,
+                entry.value.chars().count(),
+                entry.class.as_str()
+            )
+        })
+        .collect()
 }
 
 impl Agent {
@@ -85,22 +92,186 @@ impl Agent {
         &mut self.config
     }
 
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Swaps the redactor, for a fresh session that must not inherit the
+    /// old one's placeholders.
+    pub fn set_redactor(&mut self, redactor: Box<dyn Redactor>) {
+        self.redactor = redactor;
+    }
+
+    /// One task in a fresh session. Convenience over [`Agent::turn`].
     pub async fn run(
         &mut self,
         prompt: &str,
         out: &mut dyn Output,
     ) -> Result<RunReport, CoreError> {
-        let system = system_prompt(&self.config, &self.context);
+        let mut session = Session::new(&self.config.cwd.clone(), &self.config);
+        let turns = self.turn(&mut session, prompt, out).await?;
+        Ok(RunReport {
+            redactions: session.redactions,
+            turns,
+        })
+    }
+
+    /// The session this agent would start: same cwd and config snapshot.
+    pub fn new_session(&self) -> Session {
+        Session::new(&self.config.cwd, &self.config)
+    }
+
+    /// Adds the user's prompt to `session` and runs model round-trips until
+    /// the model stops calling tools. Returns the number of round-trips.
+    pub async fn turn(
+        &mut self,
+        session: &mut Session,
+        prompt: &str,
+        out: &mut dyn Output,
+    ) -> Result<usize, CoreError> {
+        self.turn_with(session, prompt, out, &Interrupt::new())
+            .await
+    }
+
+    /// [`Agent::turn`] that stops when `interrupt` fires. The text streamed
+    /// so far is kept in the session, marked interrupted; pending tool
+    /// calls are dropped.
+    pub async fn turn_with(
+        &mut self,
+        session: &mut Session,
+        prompt: &str,
+        out: &mut dyn Output,
+        interrupt: &Interrupt,
+    ) -> Result<usize, CoreError> {
+        let mut watcher = interrupt.watcher();
+        let threshold = self
+            .config
+            .agent
+            .compact_threshold(self.config.provider.context_window);
+        if session.usage.context_tokens >= threshold {
+            self.compact(session, out).await?;
+        }
+        let start = session.messages.len();
+        let result = self.rounds(session, prompt, out, &mut watcher).await;
+        if result.is_err() {
+            // A failed turn leaves no dangling user message for the next
+            // turn (or a resume) to trip over.
+            session.messages.truncate(start);
+        }
+        result
+    }
+
+    /// Replaces everything but the last `keep_recent_turns` turns with a
+    /// model-written summary. One request, no tools, through the redactor
+    /// like any other. Returns `None` when there is nothing to fold.
+    pub async fn compact(
+        &mut self,
+        session: &mut Session,
+        out: &mut dyn Output,
+    ) -> Result<Option<Compaction>, CoreError> {
+        let starts = session.turn_starts();
+        let keep = self.config.agent.keep_recent_turns;
+        if starts.len() <= keep {
+            return Ok(None);
+        }
+        let cut = starts[starts.len() - keep];
+        let mut to_summarise = session.messages[..cut].to_vec();
+        to_summarise.push(Message::user_text(SUMMARY_INSTRUCTION));
+        let (request, map) = self.build_request(SUMMARY_SYSTEM, &to_summarise, &[]);
+        let before = if session.usage.context_tokens > 0 {
+            session.usage.context_tokens
+        } else {
+            request.estimated_tokens()
+        };
+        let summary_estimate = request.estimated_tokens();
+        let mut silent = Silent;
+        let mut never = Interrupt::new().watcher();
+        let response = self
+            .stream_response(request, &map, &mut silent, &mut never)
+            .await?
+            .response;
+        let summary: String = response
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if summary.trim().is_empty() {
+            return Err(airlok_llm::LlmError::Protocol("empty compaction summary".into()).into());
+        }
+
+        let mut messages = vec![
+            Message::user_text(format!(
+                "Summary of the conversation so far, written when it was compacted:\n\n{summary}"
+            )),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "Understood. I will continue from that summary.".into(),
+            }]),
+        ];
+        messages.extend_from_slice(&session.messages[cut..]);
+        session.messages = messages;
+        let system = system_prompt(&self.config, &self.context, session);
+        let (next, _) = self.build_request(&system, &session.messages, &self.tools.specs());
+        let after = next.estimated_tokens();
+        // The summary request cost real tokens too. Its context figure is
+        // then replaced by the estimate for the compacted history, which
+        // the next request's usage report overwrites; that estimate is a
+        // status-line figure, so it does not mark the session estimated.
+        session
+            .usage
+            .record(response.usage, summary_estimate, &response.content);
+        session.usage.context_tokens = after;
+        session.redactions = map;
+        let record = Compaction {
+            at: crate::session::now_rfc3339(),
+            before_tokens: before,
+            after_tokens: after,
+            summary,
+        };
+        session.compactions.push(record.clone());
+        session.touch();
+        out.status(&format!(
+            "compacted: {} -> {} tokens",
+            fmt_tokens(before),
+            fmt_tokens(after)
+        ));
+        Ok(Some(record))
+    }
+
+    async fn rounds(
+        &mut self,
+        session: &mut Session,
+        prompt: &str,
+        out: &mut dyn Output,
+        watcher: &mut Watcher,
+    ) -> Result<usize, CoreError> {
+        let system = system_prompt(&self.config, &self.context, session);
         let specs = self.tools.specs();
-        let mut history = vec![Message::user_text(prompt)];
-        let mut report = RunReport::default();
+        session.messages.push(Message::user_text(prompt));
+        session.interrupted = false;
         let mut approved = Approved::default();
 
-        for turn in 1..=self.config.agent.max_turns {
-            report.turns = turn;
-            let (request, map) = self.build_request(&system, &history, &specs);
-            let response = self.stream_response(request, &map, out).await?;
-            debug!(turn, stop_reason = ?response.stop_reason, "turn complete");
+        for round in 1..=self.config.agent.max_turns {
+            let (request, map) = self.build_request(&system, &session.messages, &specs);
+            let estimate = request.estimated_tokens();
+            let streamed = self.stream_response(request, &map, out, watcher).await?;
+            let response = streamed.response;
+            debug!(round, stop_reason = ?response.stop_reason, usage = ?response.usage, interrupted = streamed.interrupted, "round complete");
+            session
+                .usage
+                .record(response.usage, estimate, &response.content);
+            if streamed.interrupted {
+                return Ok(Self::interrupted(
+                    session,
+                    map,
+                    response.content,
+                    out,
+                    round,
+                ));
+            }
 
             let tool_calls: Vec<&ContentBlock> = response
                 .content
@@ -109,17 +280,23 @@ impl Agent {
                 .collect();
             let wants_tools = response.stop_reason == StopReason::ToolUse && !tool_calls.is_empty();
             let results = if wants_tools {
-                self.execute_tools(&tool_calls, out, &mut approved, &map)
-                    .await?
+                tokio::select! {
+                    biased;
+                    _ = watcher.triggered() => {
+                        return Ok(Self::interrupted(session, map, response.content, out, round));
+                    }
+                    results = self.execute_tools(&tool_calls, out, &mut approved, &map) => results?,
+                }
             } else {
                 Vec::new()
             };
-            report.redactions = map;
-            history.push(Message::assistant(response.content));
+            session.redactions = map;
+            session.messages.push(Message::assistant(response.content));
+            session.touch();
             if !wants_tools {
-                return Ok(report);
+                return Ok(round);
             }
-            history.push(Message::tool_results(results));
+            session.messages.push(Message::tool_results(results));
         }
         Err(CoreError::TurnLimit(self.config.agent.max_turns))
     }
@@ -189,6 +366,23 @@ impl Agent {
         }
     }
 
+    /// Ends a turn the user cut short: keeps the text so far with a marker,
+    /// drops any tool calls, and tells the user.
+    fn interrupted(
+        session: &mut Session,
+        map: RedactionMap,
+        content: Vec<ContentBlock>,
+        out: &mut dyn Output,
+        round: usize,
+    ) -> usize {
+        session.redactions = map;
+        session.messages.push(interrupted_message(content));
+        session.interrupted = true;
+        session.touch();
+        out.status("interrupted");
+        round
+    }
+
     /// Consumes the provider stream, printing text as it arrives and
     /// returning the rehydrated assistant turn.
     async fn stream_response(
@@ -196,14 +390,30 @@ impl Agent {
         request: Request,
         map: &RedactionMap,
         out: &mut dyn Output,
-    ) -> Result<Response, CoreError> {
+        watcher: &mut Watcher,
+    ) -> Result<Streamed, CoreError> {
         let mut content = Vec::new();
         let mut text = String::new();
         let mut unshown = String::new();
+        let mut usage = None;
         let mut stream = self.provider.stream(request);
 
-        while let Some(event) = stream.next().await {
-            match event? {
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = watcher.triggered() => {
+                    self.flush_text(&mut text, &mut unshown, map, out, &mut content);
+                    return Ok(Streamed {
+                        response: Response { content, stop_reason: StopReason::EndTurn, usage },
+                        interrupted: true,
+                    });
+                }
+                event = stream.next() => match event {
+                    Some(event) => event?,
+                    None => break,
+                },
+            };
+            match event {
                 StreamEvent::TextDelta(delta) => {
                     text.push_str(&delta);
                     unshown.push_str(&delta);
@@ -219,11 +429,16 @@ impl Agent {
                     map_strings(&mut input, &mut |s| self.redactor.rehydrate(s, map));
                     content.push(ContentBlock::ToolUse { id, name, input });
                 }
+                StreamEvent::Usage(reported) => usage = Some(reported),
                 StreamEvent::MessageEnd { stop_reason } => {
                     self.flush_text(&mut text, &mut unshown, map, out, &mut content);
-                    return Ok(Response {
-                        content,
-                        stop_reason,
+                    return Ok(Streamed {
+                        response: Response {
+                            content,
+                            stop_reason,
+                            usage,
+                        },
+                        interrupted: false,
                     });
                 }
             }
@@ -418,7 +633,7 @@ enum Gate {
     Abort,
 }
 
-fn system_prompt(config: &Config, context: &str) -> String {
+fn system_prompt(config: &Config, context: &str, session: &Session) -> String {
     let mut prompt = format!(
         "You are airlok, a coding agent working in the directory {cwd}. \
          Complete the user's task using the available tools, then reply with a short summary of what you did. \
@@ -434,7 +649,68 @@ fn system_prompt(config: &Config, context: &str) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(context);
     }
+    if let Some(at) = session.resumed_at.last() {
+        prompt.push_str(&format!(
+            "\n\nThis session was resumed at {at}. The environment block above was rebuilt at that \
+             time; the conversation before this point happened earlier and files may have changed since."
+        ));
+    }
     prompt
+}
+
+const SUMMARY_SYSTEM: &str = "You are summarising a coding session so it can continue with less context. \
+    Write a compact summary under these headings: Task, Progress so far, Decisions, Files touched, Open items. \
+    Keep exact file paths, commands, error messages, and placeholder strings such as <<SECRET_1>> verbatim. \
+    Include nothing that is not in the conversation.";
+
+const SUMMARY_INSTRUCTION: &str =
+    "Summarise the conversation above for a continuation. Reply with the summary only.";
+
+/// One streamed reply, and whether the user cut it short.
+struct Streamed {
+    response: Response,
+    interrupted: bool,
+}
+
+pub const INTERRUPTED_MARKER: &str = "[interrupted by the user before the reply was complete]";
+
+/// The assistant message stored for a turn the user cut short: its text so
+/// far with a marker, and no tool calls, since nothing ran.
+fn interrupted_message(content: Vec<ContentBlock>) -> Message {
+    let mut text: String = content
+        .into_iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(INTERRUPTED_MARKER);
+    Message::assistant(vec![ContentBlock::Text { text }])
+}
+
+/// Swallows the summary stream; the user sees the status line instead.
+struct Silent;
+
+impl Output for Silent {
+    fn text(&mut self, _chunk: &str) {}
+    fn tool_call(&mut self, _name: &str, _summary: &str) {}
+    fn status(&mut self, _line: &str) {}
+    fn confirm(&mut self, _request: &Confirmation<'_>) -> Decision {
+        Decision::Reject
+    }
+}
+
+/// `180k` for anything past a thousand, else the number itself.
+pub fn fmt_tokens(n: u64) -> String {
+    if n >= 1000 {
+        format!("{}k", (n + 500) / 1000)
+    } else {
+        n.to_string()
+    }
 }
 
 /// Applies `f` to every string leaf of a JSON value, in place.

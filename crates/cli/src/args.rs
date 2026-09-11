@@ -35,6 +35,20 @@ pub struct Args {
     /// After the run, list every value that was redacted before leaving the machine
     #[arg(long)]
     pub show_redactions: bool,
+
+    /// Continue a saved session from this directory: the latest, or `--resume=<id>`
+    #[arg(long, value_name = "ID", require_equals = true, num_args = 0..=1, default_missing_value = "")]
+    pub resume: Option<String>,
+}
+
+impl Args {
+    /// `None` for a fresh session, `Some(None)` for the latest saved one,
+    /// `Some(Some(id))` for a particular one.
+    pub fn resume(&self) -> Option<Option<&str>> {
+        self.resume
+            .as_deref()
+            .map(|id| Some(id).filter(|id| !id.is_empty()))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -48,6 +62,22 @@ pub enum Command {
     Context,
     /// List the kinds of value the redactor detects and how each is treated
     Redactions,
+    /// List saved sessions for this directory, or delete some
+    Sessions {
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionsAction {
+    /// Delete one session by id (a unique prefix is enough)
+    Rm { id: String },
+    /// Delete sessions from every directory not updated within the given age, e.g. 30d, 12h, 90m
+    Clean {
+        #[arg(long, value_name = "AGE")]
+        older_than: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

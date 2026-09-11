@@ -3,8 +3,9 @@
 //! Wire reference: `POST /v1/chat/completions` with `"stream": true` returns
 //! server-sent events whose `data:` payloads are chat completion chunks.
 //! `choices[0].delta` carries `content` text and `tool_calls` fragments
-//! keyed by `index`; `finish_reason` arrives in a final chunk, then the
-//! sentinel `data: [DONE]`.
+//! keyed by `index`; `finish_reason` arrives in a final chunk, then (with
+//! `stream_options.include_usage`) a chunk with empty `choices` and
+//! `usage`, then the sentinel `data: [DONE]`.
 //!
 //! Azure OpenAI serves the same surface at `<resource>.openai.azure.com/openai/v1`
 //! and authenticates with an `api-key` header instead of a bearer token.
@@ -16,7 +17,7 @@ use serde_json::{json, Value};
 use tracing::{debug, trace};
 
 use crate::sse;
-use crate::types::{ContentBlock, Request, Role, StopReason, StreamEvent};
+use crate::types::{ContentBlock, Request, Role, StopReason, StreamEvent, Usage};
 use crate::{LlmError, Provider};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -162,6 +163,7 @@ fn wire_request(request: &Request) -> Value {
     let mut body = json!({
         "model": request.model,
         "stream": true,
+        "stream_options": {"include_usage": true},
         "max_completion_tokens": request.max_tokens,
         "messages": messages,
     });
@@ -189,6 +191,9 @@ fn wire_request(request: &Request) -> Value {
 #[derive(Default)]
 struct ChunkAssembler {
     calls: BTreeMap<u64, PartialCall>,
+    /// Set by the `finish_reason` chunk; the turn ends at `[DONE]` so the
+    /// usage chunk in between is not lost.
+    stop_reason: Option<StopReason>,
     ended: bool,
 }
 
@@ -200,8 +205,8 @@ struct PartialCall {
 }
 
 impl ChunkAssembler {
-    fn finish(&mut self, stop_reason: StopReason) -> Result<Vec<StreamEvent>, LlmError> {
-        self.ended = true;
+    /// Tool calls are complete once `finish_reason` arrives.
+    fn drain_calls(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
         let mut out = Vec::new();
         for (_, call) in std::mem::take(&mut self.calls) {
             out.push(StreamEvent::ToolUse {
@@ -210,7 +215,15 @@ impl ChunkAssembler {
                 input: crate::parse_arguments(&call.arguments)?,
             });
         }
-        out.push(StreamEvent::MessageEnd { stop_reason });
+        Ok(out)
+    }
+
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
+        self.ended = true;
+        let mut out = self.drain_calls()?;
+        out.push(StreamEvent::MessageEnd {
+            stop_reason: self.stop_reason.take().unwrap_or(StopReason::EndTurn),
+        });
         Ok(out)
     }
 }
@@ -225,7 +238,7 @@ impl sse::Assembler for ChunkAssembler {
             return if self.ended {
                 Ok(Vec::new())
             } else {
-                self.finish(StopReason::EndTurn)
+                self.finish()
             };
         }
         let value: Value = serde_json::from_str(payload)?;
@@ -234,6 +247,16 @@ impl sse::Assembler for ChunkAssembler {
             return Err(LlmError::Protocol(message.to_string()));
         }
         let Some(choice) = value["choices"].get(0) else {
+            let usage = &value["usage"];
+            if let (Some(input), Some(output)) = (
+                usage["prompt_tokens"].as_u64(),
+                usage["completion_tokens"].as_u64(),
+            ) {
+                return Ok(vec![StreamEvent::Usage(Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                })]);
+            }
             return Ok(Vec::new());
         };
         trace!(finish_reason = ?choice["finish_reason"], "chunk");
@@ -258,14 +281,14 @@ impl sse::Assembler for ChunkAssembler {
             }
         }
         if let Some(reason) = choice["finish_reason"].as_str() {
-            let stop_reason = match reason {
+            self.stop_reason = Some(match reason {
                 "tool_calls" | "function_call" => StopReason::ToolUse,
                 "stop" => StopReason::EndTurn,
                 "length" => StopReason::MaxTokens,
                 "content_filter" => StopReason::Refusal,
                 _ => StopReason::Other,
-            };
-            out.extend(self.finish(stop_reason)?);
+            });
+            out.extend(self.drain_calls()?);
         }
         Ok(out)
     }
@@ -348,7 +371,7 @@ mod tests {
             "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"comm\"}}]},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"and\\\":\\\"ls\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
-            "data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"total_tokens\":9}}\n\n",
+            "data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":9,\"total_tokens\":39}}\n\n",
             "data: [DONE]\n\n",
         );
 
@@ -365,6 +388,10 @@ mod tests {
                     name: "bash".into(),
                     input: json!({"command": "ls"}),
                 },
+                StreamEvent::Usage(Usage {
+                    input_tokens: 30,
+                    output_tokens: 9
+                }),
                 StreamEvent::MessageEnd {
                     stop_reason: StopReason::ToolUse
                 },
@@ -438,6 +465,7 @@ mod tests {
         assert_eq!(body["model"], "m");
         assert_eq!(body["max_completion_tokens"], 100);
         assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(
             body["messages"],
             json!([

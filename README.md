@@ -15,7 +15,13 @@ brew install airlok-dev/tap/airlok
 ## Usage
 
 ```sh
+airlok                                         # interactive session in the current directory
 airlok "create hello.txt containing hello"     # run one task in the current directory
+airlok --resume                                # continue the latest saved session here (REPL, or with a task)
+airlok --resume=<id> "summarise what we did"   # continue a particular one
+airlok sessions                                # list saved sessions for this directory
+airlok sessions rm <id>                        # delete one
+airlok sessions clean --older-than 30d         # delete old sessions from every directory
 airlok -v "..."                                # debug logs on stderr
 airlok -y "..."                                # no confirmations (prints a warning)
 airlok --provider openai --model gpt-5.5 "..." # override the provider and model for one run
@@ -29,6 +35,26 @@ airlok redactions                              # list what the redactor detects 
 Every `write_file` and `edit_file` call shows a unified diff and asks `Apply? [y]es / [n]o / [a]ll / [q]uit`. Every `bash` call that is not on the allow list shows the command and asks the same way. `y` applies this one, `n` sends a rejection back to the model so it can adapt, `a` approves the rest of that kind for the run, and `q` aborts the run with a non-zero exit. Prompts are read from the terminal, not stdin, so piped input still works; without a terminal, pass `--yes` or turn the confirmations off in the config.
 
 Model output is rendered as markdown (headings, emphasis, lists, tables, highlighted code) when stdout is a terminal; set `NO_COLOR` or redirect stdout for plain text. Runs of read-only tool calls collapse to one `reading N files...` line; `-v` shows every call.
+
+### Sessions
+
+`airlok` with no task opens a session. The prompt shows the model and the directory (`gpt-5.5 airlok> `), each line you type is one turn, and the conversation carries across turns. Ctrl-C during a turn cancels it: the text streamed so far stays in the history marked as interrupted, tool calls that had not run are dropped, and you get the prompt back. Ctrl-D or `/exit` saves and quits.
+
+| Command | What it does |
+|---|---|
+| `/help` | list the commands |
+| `/clear` | start a new session; the current one stays saved |
+| `/compact` | summarise older turns to free context |
+| `/cost` | tokens used so far, and whether they are estimates |
+| `/redactions` | what was redacted before leaving this machine (kind and length only) |
+| `/config` | the effective configuration |
+| `/exit` | save and quit |
+
+Every turn, one-shot or interactive, is saved under `$XDG_DATA_HOME/airlok/sessions/<hash of the directory>/` (`~/.local/share/airlok` by default). `airlok --resume` picks up the latest session for the directory; it rebuilds the context block, so the model sees the current tree and git state, and adds a note with the resume time. `airlok sessions` lists what is there.
+
+A session file holds the plaintext conversation and the real value behind every placeholder, because that is what rehydration on resume needs. That is why the file is written with mode 0600 in a 0700 directory, and why the provider API key is the one thing left out: it is stored blank and re-read from your config on every start.
+
+Long sessions are compacted. Once the last request used more than `compact_at` (default 0.75) of `context_window` (default 200k tokens; set it for your model), the next turn first asks the model for a summary of everything except the last `keep_recent_turns` turns and replaces those older turns with it. The summary request goes through the redactor like every other request. You see a dim `compacted: 180k -> 22k tokens` line; `/compact` does it on demand. Token counts come from the provider; when a provider reports none, airlok estimates at chars/4 and `/cost` says so.
 
 ## Tools
 
@@ -73,11 +99,14 @@ model = "claude-sonnet-4-6"   # per provider: anthropic "claude-sonnet-4-6", ope
 # base_url = "https://api.openai.com/v1"   # openai only; Azure: "https://<resource>.openai.azure.com/openai/v1"
 # api_key_env = "ANTHROPIC_API_KEY"        # env var holding the key
 # api_key_cmd = "..."                      # shell command whose stdout is the key
+context_window = 200000       # input tokens the model accepts; used to decide when to compact
 
 [agent]
 max_turns = 50           # model round-trips per run
 max_tokens = 8192        # output tokens per model reply
 bash_timeout_secs = 120  # kill a bash tool command after this long
+compact_at = 0.75        # summarise the session once a request uses this fraction of context_window
+keep_recent_turns = 4    # turns kept verbatim after the summary
 
 [safety]
 confirm_writes = true    # show a diff and ask before write_file / edit_file

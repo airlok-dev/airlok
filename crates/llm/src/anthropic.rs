@@ -11,7 +11,7 @@ use serde_json::Value;
 use tracing::{debug, trace};
 
 use crate::sse;
-use crate::types::{Message, Request, StopReason, StreamEvent, ToolSpec};
+use crate::types::{Message, Request, StopReason, StreamEvent, ToolSpec, Usage};
 use crate::{LlmError, Provider};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -90,6 +90,7 @@ impl Provider for Anthropic {
 struct BlockAssembler {
     current: Option<PartialBlock>,
     stop_reason: Option<StopReason>,
+    usage: Option<Usage>,
     ended: bool,
 }
 
@@ -114,6 +115,25 @@ impl sse::Assembler for BlockAssembler {
         trace!(kind, "sse event");
         let mut out = Vec::new();
         match kind {
+            "message_start" => {
+                // Input tokens are only reported here. Cached prefixes are
+                // counted separately but the model still reads them.
+                let usage = &value["message"]["usage"];
+                let input = [
+                    "input_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                ]
+                .iter()
+                .filter_map(|k| usage[k].as_u64())
+                .sum();
+                if !usage.is_null() {
+                    self.usage = Some(Usage {
+                        input_tokens: input,
+                        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+                    });
+                }
+            }
             "content_block_start" => {
                 let block = &value["content_block"];
                 self.current = Some(match block["type"].as_str() {
@@ -157,9 +177,16 @@ impl sse::Assembler for BlockAssembler {
                     self.stop_reason =
                         serde_json::from_value(Value::String(reason.to_string())).ok();
                 }
+                // Cumulative output count; the last delta wins.
+                if let Some(output) = value["usage"]["output_tokens"].as_u64() {
+                    self.usage.get_or_insert_with(Usage::default).output_tokens = output;
+                }
             }
             "message_stop" => {
                 self.ended = true;
+                if let Some(usage) = self.usage.take() {
+                    out.push(StreamEvent::Usage(usage));
+                }
                 out.push(StreamEvent::MessageEnd {
                     stop_reason: self.stop_reason.unwrap_or(StopReason::EndTurn),
                 });
@@ -192,7 +219,7 @@ mod tests {
     fn assembles_text_and_tool_use_from_sse() {
         let raw = concat!(
             "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":20,\"cache_read_input_tokens\":5,\"output_tokens\":1}}}\n\n",
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\n",
@@ -230,6 +257,10 @@ mod tests {
                     name: "bash".into(),
                     input: serde_json::json!({"command": "ls"}),
                 },
+                StreamEvent::Usage(Usage {
+                    input_tokens: 25,
+                    output_tokens: 9
+                }),
                 StreamEvent::MessageEnd {
                     stop_reason: StopReason::ToolUse
                 },

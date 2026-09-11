@@ -90,6 +90,8 @@ pub struct ProviderSection {
     pub api_key_env: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_cmd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,6 +103,10 @@ pub struct AgentSection {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bash_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_at: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_recent_turns: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -159,6 +165,10 @@ impl ConfigFile {
                 base_url: over.provider.base_url.or(self.provider.base_url),
                 api_key_env: over.provider.api_key_env.or(self.provider.api_key_env),
                 api_key_cmd: over.provider.api_key_cmd.or(self.provider.api_key_cmd),
+                context_window: over
+                    .provider
+                    .context_window
+                    .or(self.provider.context_window),
             },
             agent: AgentSection {
                 max_turns: over.agent.max_turns.or(self.agent.max_turns),
@@ -167,6 +177,11 @@ impl ConfigFile {
                     .agent
                     .bash_timeout_secs
                     .or(self.agent.bash_timeout_secs),
+                compact_at: over.agent.compact_at.or(self.agent.compact_at),
+                keep_recent_turns: over
+                    .agent
+                    .keep_recent_turns
+                    .or(self.agent.keep_recent_turns),
             },
             safety: SafetySection {
                 confirm_writes: over.safety.confirm_writes.or(self.safety.confirm_writes),
@@ -214,6 +229,9 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub api_key_cmd: Option<String>,
+    /// Tokens the model can take as input. Not looked up per model; set it
+    /// when the default is wrong for yours.
+    pub context_window: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -223,6 +241,17 @@ pub struct AgentConfig {
     pub max_turns: usize,
     pub max_tokens: u32,
     pub bash_timeout: Duration,
+    /// Compact once the last request used this fraction of the window.
+    pub compact_at: f64,
+    /// Turns kept verbatim after the summary.
+    pub keep_recent_turns: usize,
+}
+
+impl AgentConfig {
+    /// Input tokens at which a session is compacted.
+    pub fn compact_threshold(&self, context_window: u64) -> u64 {
+        (context_window as f64 * self.compact_at.clamp(0.0, 1.0)) as u64
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -247,6 +276,8 @@ pub struct ContextConfig {
     pub max_bytes: usize,
 }
 
+/// Anthropic and OpenAI frontier models both accept at least this much.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 pub const DEFAULT_CONTEXT_MAX_BYTES: usize = 32 * 1024;
 
 pub const DEFAULT_BASH_ALLOWLIST: &[&str] = &[
@@ -340,11 +371,17 @@ impl Config {
                 base_url: file.provider.base_url,
                 api_key_env: file.provider.api_key_env,
                 api_key_cmd: file.provider.api_key_cmd,
+                context_window: file
+                    .provider
+                    .context_window
+                    .unwrap_or(DEFAULT_CONTEXT_WINDOW),
             },
             agent: AgentConfig {
                 max_turns: file.agent.max_turns.unwrap_or(50),
                 max_tokens: file.agent.max_tokens.unwrap_or(8192),
                 bash_timeout: Duration::from_secs(file.agent.bash_timeout_secs.unwrap_or(120)),
+                compact_at: file.agent.compact_at.unwrap_or(0.75),
+                keep_recent_turns: file.agent.keep_recent_turns.unwrap_or(4),
             },
             safety: SafetyConfig {
                 confirm_writes: file.safety.confirm_writes.unwrap_or(true),
@@ -377,11 +414,14 @@ impl Config {
                 base_url: self.provider.base_url.clone(),
                 api_key_env: self.provider.api_key_env.clone(),
                 api_key_cmd: self.provider.api_key_cmd.clone(),
+                context_window: Some(self.provider.context_window),
             },
             agent: AgentSection {
                 max_turns: Some(self.agent.max_turns),
                 max_tokens: Some(self.agent.max_tokens),
                 bash_timeout_secs: Some(self.agent.bash_timeout.as_secs()),
+                compact_at: Some(self.agent.compact_at),
+                keep_recent_turns: Some(self.agent.keep_recent_turns),
             },
             safety: SafetySection {
                 confirm_writes: Some(self.safety.confirm_writes),
@@ -500,11 +540,14 @@ pub const TEMPLATE: &str = r##"# airlok configuration. Precedence: CLI flags > .
 # base_url = "https://api.openai.com/v1"   # openai only; Azure: "https://<resource>.openai.azure.com/openai/v1"
 # api_key_env = "ANTHROPIC_API_KEY"        # env var holding the key; openai default tries AZURE_OPENAI_API_KEY then OPENAI_API_KEY
 # api_key_cmd = "az cognitiveservices account keys list -n <resource> -g <group> --query key1 -o tsv"   # shell command whose stdout is the key; run once per process
+# context_window = 200000   # input tokens the model accepts; used to decide when to compact
 
 [agent]
 # max_turns = 50           # model round-trips per run
 # max_tokens = 8192        # output tokens per model reply
 # bash_timeout_secs = 120  # kill a bash tool command after this long
+# compact_at = 0.75        # summarise the session once a request uses this fraction of context_window
+# keep_recent_turns = 4    # turns kept verbatim after the summary
 
 [safety]
 # confirm_writes = true    # show a diff and ask before write_file / edit_file

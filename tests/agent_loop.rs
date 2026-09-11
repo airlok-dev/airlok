@@ -1,5 +1,7 @@
 use airlok_llm::{ContentBlock, Role};
-use airlok_tests::{agent, reply, tool_call, MockProvider, RecordingOutput, Shown, TempDir};
+use airlok_tests::{
+    agent, reply, tool_call, with_usage, MockProvider, RecordingOutput, Shown, TempDir,
+};
 use serde_json::json;
 
 #[tokio::test]
@@ -93,4 +95,87 @@ async fn unknown_tool_and_tool_failure_go_back_as_errors() {
     let (content, is_error) = result_of(2);
     assert!(is_error);
     assert!(content.starts_with("error: "), "{content}");
+}
+
+#[tokio::test]
+async fn a_session_carries_history_across_turns() {
+    let dir = TempDir::new("session-turns");
+    let provider = MockProvider::scripted(vec![reply("first answer"), reply("second answer")]);
+    let mut out = RecordingOutput::default();
+    let mut agent = agent(provider.clone(), dir.path());
+    let mut session = agent.new_session();
+
+    agent.turn(&mut session, "first", &mut out).await.unwrap();
+    agent.turn(&mut session, "second", &mut out).await.unwrap();
+
+    let roles: Vec<Role> = session.messages.iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        vec![Role::User, Role::Assistant, Role::User, Role::Assistant]
+    );
+    assert_eq!(session.turns(), 2);
+    assert_eq!(session.first_prompt(), Some("first"));
+    // The second request carries the whole conversation so far.
+    let second = &provider.requests()[1];
+    assert_eq!(second.messages.len(), 3);
+}
+
+#[tokio::test]
+async fn usage_is_summed_from_provider_reports() {
+    let dir = TempDir::new("usage");
+    let provider = MockProvider::scripted(vec![
+        with_usage(1000, 50, reply("one")),
+        with_usage(1200, 60, reply("two")),
+    ]);
+    let mut out = RecordingOutput::default();
+    let mut agent = agent(provider, dir.path());
+    let mut session = agent.new_session();
+
+    agent.turn(&mut session, "a", &mut out).await.unwrap();
+    agent.turn(&mut session, "b", &mut out).await.unwrap();
+
+    assert_eq!(session.usage.input_tokens, 2200);
+    assert_eq!(session.usage.output_tokens, 110);
+    assert_eq!(session.usage.context_tokens, 1200);
+    assert!(!session.usage.estimated);
+}
+
+#[tokio::test]
+async fn missing_usage_falls_back_to_a_flagged_estimate() {
+    let dir = TempDir::new("usage-estimate");
+    let provider = MockProvider::scripted(vec![reply("a reply of some length")]);
+    let mut out = RecordingOutput::default();
+    let mut agent = agent(provider, dir.path());
+    let mut session = agent.new_session();
+
+    agent.turn(&mut session, "hello", &mut out).await.unwrap();
+
+    assert!(session.usage.estimated);
+    // The system prompt plus tool specs alone are well over 4 chars.
+    assert!(session.usage.input_tokens > 100);
+    assert_eq!(
+        session.usage.output_tokens,
+        ("a reply of some length".len() / 4) as u64
+    );
+    assert_eq!(session.usage.context_tokens, session.usage.input_tokens);
+}
+
+#[tokio::test]
+async fn a_failed_turn_leaves_the_session_as_it_was() {
+    let dir = TempDir::new("failed-turn");
+    let provider = MockProvider::scripted(vec![
+        reply("ok"),
+        tool_call("toolu_1", "bash", json!({"command": "echo hi"})),
+    ]);
+    let mut out = RecordingOutput::default();
+    out.decisions.push_back(airlok_core::Decision::Quit);
+    let mut agent = agent(provider, dir.path());
+    let mut session = agent.new_session();
+
+    agent.turn(&mut session, "one", &mut out).await.unwrap();
+    let err = agent.turn(&mut session, "two", &mut out).await.unwrap_err();
+
+    assert!(matches!(err, airlok_core::CoreError::Aborted));
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.turns(), 1);
 }

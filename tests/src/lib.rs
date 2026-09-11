@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use airlok_core::redact::SecretRedactor;
+use airlok_core::repl::{Line, LineSource};
 use airlok_core::tools::ToolRegistry;
 use airlok_core::{Agent, Config, Confirmation, Decision, Output};
 use airlok_llm::{LlmError, Provider, Request, StopReason, StreamEvent};
@@ -13,6 +14,8 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::Value;
 
 /// Replays one scripted event list per request and records every request.
+/// A turn that does not end with `MessageEnd` hangs after its last event,
+/// which is how tests stand in for a model still streaming.
 #[derive(Default)]
 pub struct MockProvider {
     scripts: Mutex<VecDeque<Vec<StreamEvent>>>,
@@ -41,7 +44,13 @@ impl Provider for MockProvider {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| reply("(script exhausted)"));
-        stream::iter(events.into_iter().map(Ok)).boxed()
+        let hangs = !matches!(events.last(), Some(StreamEvent::MessageEnd { .. }));
+        let scripted = stream::iter(events.into_iter().map(Ok));
+        if hangs {
+            scripted.chain(stream::pending()).boxed()
+        } else {
+            scripted.boxed()
+        }
     }
 }
 
@@ -56,6 +65,53 @@ pub fn reply(text: &str) -> Vec<StreamEvent> {
 }
 
 /// A turn that calls one tool.
+/// Text that never finishes: the stream hangs after it, until interrupted.
+pub fn partial(text: &str) -> Vec<StreamEvent> {
+    vec![StreamEvent::TextDelta(text.to_string())]
+}
+
+/// Feeds the REPL a fixed script. Runs out as `Eof`.
+pub struct ScriptedLines {
+    pub lines: VecDeque<Line>,
+    pub prompts: Vec<String>,
+}
+
+impl ScriptedLines {
+    pub fn new(lines: Vec<Line>) -> Self {
+        Self {
+            lines: lines.into(),
+            prompts: Vec::new(),
+        }
+    }
+
+    pub fn typed(lines: &[&str]) -> Self {
+        Self::new(lines.iter().map(|l| Line::Text(l.to_string())).collect())
+    }
+}
+
+impl LineSource for ScriptedLines {
+    fn read_line(&mut self, prompt: &str) -> Line {
+        self.prompts.push(prompt.to_string());
+        self.lines.pop_front().unwrap_or(Line::Eof)
+    }
+}
+
+/// Prepends a provider usage report to a scripted turn.
+pub fn with_usage(
+    input_tokens: u64,
+    output_tokens: u64,
+    mut turn: Vec<StreamEvent>,
+) -> Vec<StreamEvent> {
+    turn.insert(
+        0,
+        StreamEvent::Usage(airlok_llm::Usage {
+            input_tokens,
+            output_tokens,
+        }),
+    );
+    turn
+}
+
 pub fn tool_call(id: &str, name: &str, input: Value) -> Vec<StreamEvent> {
     vec![
         StreamEvent::ToolUse {
@@ -75,6 +131,8 @@ pub enum Shown {
     ToolCall { name: String, summary: String },
     ConfirmWrite { path: PathBuf, diff: String },
     ConfirmCommand { command: String },
+    Status(String),
+    EndTurn,
 }
 
 /// Records everything shown and answers confirmations from a script.
@@ -91,6 +149,17 @@ impl RecordingOutput {
             events: Vec::new(),
             decisions: decisions.into(),
         }
+    }
+
+    /// Every status line, in order.
+    pub fn statuses(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .filter_map(|e| match e {
+                Shown::Status(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// All streamed text joined, as the user would read it.
@@ -115,6 +184,14 @@ impl Output for RecordingOutput {
             name: name.to_string(),
             summary: summary.to_string(),
         });
+    }
+
+    fn status(&mut self, line: &str) {
+        self.events.push(Shown::Status(line.to_string()));
+    }
+
+    fn end_turn(&mut self) {
+        self.events.push(Shown::EndTurn);
     }
 
     fn confirm(&mut self, request: &Confirmation<'_>) -> Decision {
@@ -188,7 +265,12 @@ impl Drop for TempDir {
 
 /// An agent with the default tools and the real secret redactor.
 pub fn agent(provider: Arc<MockProvider>, cwd: &Path) -> Agent {
+    agent_with(provider, cwd, SecretRedactor::new())
+}
+
+/// An agent with the default tools and the given redactor.
+pub fn agent_with(provider: Arc<MockProvider>, cwd: &Path, redactor: SecretRedactor) -> Agent {
     let config = Config::new(cwd.to_path_buf());
     let tools = ToolRegistry::defaults(cwd, config.agent.bash_timeout);
-    Agent::new(provider, tools, Box::new(SecretRedactor::new()), config)
+    Agent::new(provider, tools, Box::new(redactor), config)
 }

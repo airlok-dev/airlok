@@ -1,24 +1,29 @@
 mod args;
 mod render;
+mod repl;
 mod terminal;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::sync::Arc;
 
 use airlok_core::config::{self, KeySource, Overrides, ProviderName, Sources};
 use airlok_core::context::{self, ContextInput};
 use airlok_core::redact::{Class, Redactor, SecretRedactor};
+use airlok_core::repl::Repl;
+use airlok_core::session::Summary;
 use airlok_core::tools::{ToolRegistry, READ_ONLY_TOOLS};
 use airlok_core::CoreError;
-use airlok_core::{Agent, Config, Confirmation, Decision, Output, RunReport};
+use airlok_core::{
+    Agent, Config, Confirmation, Decision, Interrupt, Output, RunReport, SessionStore,
+};
 use airlok_llm::openai::Auth;
 use airlok_llm::{Anthropic, OpenAi, Provider};
 use anyhow::{anyhow, bail, Context};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use args::{Args, Command, ConfigAction};
+use args::{Args, Command, ConfigAction, SessionsAction};
 use render::Renderer;
 use terminal::Terminal;
 
@@ -39,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
     let project_path = config::project_config_path(&cwd);
     let overrides = Overrides {
         provider: args.provider.map(Into::into),
-        model: args.model,
+        model: args.model.clone(),
         yes: args.yes,
     };
     let (config, sources) = Config::load(
@@ -88,11 +93,16 @@ async fn main() -> anyhow::Result<()> {
             print!("{redacted}");
             return Ok(());
         }
+        Some(Command::Sessions { action }) => return sessions_command(action, &store()?, &cwd),
         None => {}
     }
-    let Some(prompt) = args.prompt else {
-        bail!("missing prompt. Usage: airlok \"<task>\" (see airlok --help)");
-    };
+    let prompt = args.prompt.clone();
+    if prompt.is_none() && !std::io::stdin().is_terminal() {
+        bail!(
+            "no prompt given and stdin is not a terminal. \
+             Usage: airlok \"<task>\" for one task, or airlok in a terminal for a session"
+        );
+    }
 
     let prompting = config.safety.confirm_writes || config.safety.confirm_bash;
     let terminal = if prompting {
@@ -108,22 +118,53 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let store = store()?;
+    let resumed = match args.resume() {
+        Some(id) => Some(store.load(&cwd, id)?.ok_or_else(|| match id {
+            Some(id) => anyhow!("no saved session {id} for this directory (see airlok sessions)"),
+            None => anyhow!("no saved sessions for this directory"),
+        })?),
+        None => None,
+    };
+
     // The key is read once, after every check that could abort the run.
     let key = config
         .resolve_key()
         .with_context(|| format!("cannot read the API key from {}", config.key_source()))?;
     let provider = build_provider(&config, key.clone());
-    let redactor =
-        SecretRedactor::new().with_known("the provider API key", &key, Class::RedactOnly);
+    let mut redactor = SecretRedactor::new();
+    if let Some(session) = &resumed {
+        redactor = redactor.with_map(&session.redactions);
+    }
+    let redactor = redactor.with_known("the provider API key", &key, Class::RedactOnly);
     let tools = ToolRegistry::defaults(&cwd, config.agent.bash_timeout);
 
     let mut agent =
         Agent::new(provider, tools, Box::new(redactor), config).with_context(context.text);
+    let mut session = match resumed {
+        Some(mut session) => {
+            session.resume();
+            eprintln!(
+                "resumed session {} ({} turns, last updated {})",
+                session.id,
+                session.turns(),
+                session.updated_at
+            );
+            session
+        }
+        None => agent.new_session(),
+    };
     let mut out = Stdout::new(terminal, args.verbose);
-    let result = agent.run(&prompt, &mut out).await;
+    let Some(prompt) = prompt else {
+        return run_repl(agent, session, &store, key, &mut out).await;
+    };
+    let result = agent.turn(&mut session, &prompt, &mut out).await;
     out.finish();
-    let report = match result {
-        Ok(report) => report,
+    if let Err(e) = store.save(&session) {
+        eprintln!("warning: could not save the session: {e}");
+    }
+    let turns = match result {
+        Ok(turns) => turns,
         Err(CoreError::Aborted) => {
             eprintln!("aborted");
             std::process::exit(1);
@@ -132,9 +173,138 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if args.show_redactions {
-        print_redactions(&report);
+        print_redactions(&RunReport {
+            redactions: session.redactions.clone(),
+            turns,
+        });
     }
     Ok(())
+}
+
+/// The interactive session. Ctrl-C during a turn cancels it; at the
+/// prompt, rustyline reports it and the loop stays up.
+async fn run_repl(
+    mut agent: Agent,
+    session: airlok_core::Session,
+    store: &SessionStore,
+    key: String,
+    out: &mut Stdout,
+) -> anyhow::Result<()> {
+    let interrupt = Interrupt::new();
+    {
+        let interrupt = interrupt.clone();
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .context("cannot listen for Ctrl-C")?;
+        tokio::spawn(async move {
+            while sigint.recv().await.is_some() {
+                interrupt.trigger();
+            }
+        });
+    }
+    let mut lines = repl::Readline::new().context("cannot start line editing")?;
+    out.status(&format!(
+        "airlok {} · {} · /help for commands, Ctrl-D to quit",
+        env!("CARGO_PKG_VERSION"),
+        agent.config().provider.model
+    ));
+    let mut repl = Repl {
+        agent: &mut agent,
+        store: Some(store),
+        interrupt,
+        new_redactor: Box::new(move || {
+            Box::new(SecretRedactor::new().with_known(
+                "the provider API key",
+                &key,
+                Class::RedactOnly,
+            ))
+        }),
+    };
+    let session = repl.run(session, &mut lines, out).await;
+    out.finish();
+    out.status(&format!(
+        "session {} saved ({} turns); airlok --resume continues it",
+        session.id,
+        session.turns()
+    ));
+    Ok(())
+}
+
+fn store() -> anyhow::Result<SessionStore> {
+    SessionStore::default_root()
+        .map(SessionStore::new)
+        .ok_or_else(|| anyhow!("cannot locate the data directory: set XDG_DATA_HOME or HOME"))
+}
+
+fn sessions_command(
+    action: Option<SessionsAction>,
+    store: &SessionStore,
+    cwd: &Path,
+) -> anyhow::Result<()> {
+    match action {
+        None => {
+            let sessions = store.list(cwd)?;
+            if sessions.is_empty() {
+                println!("no saved sessions for {}", cwd.display());
+                return Ok(());
+            }
+            println!(
+                "{:<10} {:<20} {:>5}  {:<16} first prompt",
+                "id", "updated", "turns", "model"
+            );
+            for s in sessions {
+                println!("{}", summary_line(&s));
+            }
+        }
+        Some(SessionsAction::Rm { id }) => {
+            if store.remove(cwd, &id)? {
+                println!("deleted session {id}");
+            } else {
+                bail!("no saved session {id} for this directory");
+            }
+        }
+        Some(SessionsAction::Clean { older_than }) => {
+            let age = parse_age(&older_than)?;
+            let removed = store.clean(age)?;
+            println!(
+                "deleted {} session(s) older than {older_than}",
+                removed.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn summary_line(s: &Summary) -> String {
+    let mut prompt = s.first_prompt.clone().unwrap_or_default();
+    prompt = prompt.lines().next().unwrap_or_default().to_string();
+    if prompt.chars().count() > 50 {
+        prompt = prompt.chars().take(47).collect::<String>() + "...";
+    }
+    let model: String = s.model.chars().take(16).collect();
+    format!(
+        "{:<10} {:<20} {:>5}  {:<16} {prompt}",
+        s.id,
+        s.updated_at.replace('T', " "),
+        s.turns,
+        model
+    )
+}
+
+/// `30d`, `12h`, `90m`, or `45s`.
+fn parse_age(text: &str) -> anyhow::Result<std::time::Duration> {
+    let text = text.trim();
+    let (number, unit) = text.split_at(text.len().saturating_sub(1));
+    let count: u64 = number.parse().map_err(|_| {
+        anyhow!("cannot parse age {text:?}: expected a number followed by d, h, m, or s")
+    })?;
+    let seconds = match unit {
+        "d" => count * 86_400,
+        "h" => count * 3_600,
+        "m" => count * 60,
+        "s" => count,
+        _ => bail!("cannot parse age {text:?}: expected a number followed by d, h, m, or s"),
+    };
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 fn build_provider(config: &Config, key: String) -> Arc<dyn Provider> {
@@ -256,6 +426,22 @@ impl Stdout {
 }
 
 impl Output for Stdout {
+    fn status(&mut self, line: &str) {
+        let rest = self.renderer.finish();
+        self.write(&rest);
+        self.end_line();
+        let text = if self.renderer.is_rich() {
+            format!("\x1b[2m{line}\x1b[0m\n")
+        } else {
+            format!("{line}\n")
+        };
+        self.write(&text);
+    }
+
+    fn end_turn(&mut self) {
+        self.finish();
+    }
+
     fn text(&mut self, chunk: &str) {
         if self.collapsed > 0 {
             self.end_line();
@@ -316,7 +502,17 @@ fn print_redactions(report: &RunReport) {
 
 #[cfg(test)]
 mod tests {
-    use super::openai_base_url;
+    use super::{openai_base_url, parse_age};
+
+    #[test]
+    fn ages_parse_in_days_hours_minutes_seconds() {
+        assert_eq!(parse_age("30d").unwrap().as_secs(), 30 * 86_400);
+        assert_eq!(parse_age("12h").unwrap().as_secs(), 12 * 3_600);
+        assert_eq!(parse_age("90m").unwrap().as_secs(), 90 * 60);
+        assert_eq!(parse_age("5s").unwrap().as_secs(), 5);
+        assert!(parse_age("30").is_err());
+        assert!(parse_age("d").is_err());
+    }
 
     #[test]
     fn base_url_prefers_config_then_env_then_default() {
