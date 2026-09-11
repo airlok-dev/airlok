@@ -1,12 +1,12 @@
 use std::time::Duration;
 
 use airlok_core::agent::INTERRUPTED_MARKER;
-use airlok_core::redact::SecretRedactor;
 use airlok_core::repl::{Line, Repl};
 use airlok_core::{Interrupt, SessionStore};
 use airlok_llm::ContentBlock;
 use airlok_tests::{
     agent, partial, reply, MockProvider, RecordingOutput, ScriptedLines, Shown, TempDir,
+    TestBackend,
 };
 
 const TOKEN_A: &str = concat!("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789");
@@ -29,7 +29,7 @@ async fn a_scripted_session_runs_turns_commands_clear_and_exit() {
         agent: &mut agent,
         store: Some(&store),
         interrupt: Interrupt::new(),
-        new_redactor: Box::new(|| Box::new(SecretRedactor::new())),
+        backend: Box::new(TestBackend::default()),
     };
     let first = repl.agent.new_session();
     let mut lines = ScriptedLines::typed(&[
@@ -119,7 +119,7 @@ async fn ctrl_c_keeps_the_partial_reply_marked_interrupted() {
         agent: &mut agent,
         store: Some(&store),
         interrupt,
-        new_redactor: Box::new(|| Box::new(SecretRedactor::new())),
+        backend: Box::new(TestBackend::default()),
     };
     let session = repl.agent.new_session();
     let mut lines = ScriptedLines::new(vec![
@@ -152,4 +152,117 @@ async fn ctrl_c_keeps_the_partial_reply_marked_interrupted() {
     // Ctrl-D saved it.
     let saved = store.load(dir.path(), None).unwrap().unwrap();
     assert_eq!(saved.messages, session.messages);
+}
+
+#[tokio::test]
+async fn model_and_provider_switch_for_the_rest_of_the_session() {
+    let dir = TempDir::new("repl-switch");
+    let store = SessionStore::new(dir.path().join("data"));
+    let first = MockProvider::scripted(vec![reply("one"), reply("two")]);
+    let second = MockProvider::scripted(vec![reply("three")]);
+    let mut agent = agent(first.clone(), dir.path());
+    let mut backend = TestBackend::default();
+    backend.switches.insert("openai", Ok(second.clone()));
+    let mut repl = Repl {
+        agent: &mut agent,
+        store: Some(&store),
+        interrupt: Interrupt::new(),
+        backend: Box::new(backend),
+    };
+    let session = repl.agent.new_session();
+    let mut lines = ScriptedLines::typed(&[
+        &format!("remember {TOKEN_A}"),
+        "/model",
+        "/model my-new-model",
+        "second",
+        "/provider anthropic",
+        "/provider nonsense",
+        "/provider openai",
+        "third",
+        "/exit",
+    ]);
+    let mut out = RecordingOutput::default();
+
+    let session = repl.run(session, &mut lines, &mut out).await;
+
+    let default_model = airlok_llm::anthropic::DEFAULT_MODEL;
+    let before = first.requests();
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[0].model, default_model);
+    assert_eq!(
+        before[1].model, "my-new-model",
+        "/model applies to the next turn"
+    );
+    let after = second.requests();
+    assert_eq!(
+        after.len(),
+        1,
+        "the turn after /provider went to the new provider"
+    );
+    assert_eq!(after[0].model, airlok_llm::openai::DEFAULT_MODEL);
+    let carried = format!("{:?}", after[0].messages[0]);
+    assert!(
+        carried.contains("<<SECRET_1>>"),
+        "same placeholder: {carried}"
+    );
+    assert!(
+        !carried.contains(TOKEN_A),
+        "the secret stays redacted after the switch"
+    );
+
+    let statuses = out.statuses();
+    assert!(
+        statuses.contains(&format!("model {default_model} (anthropic)")),
+        "{statuses:?}"
+    );
+    assert!(statuses.contains(&"model my-new-model for the rest of this session".to_string()));
+    assert!(statuses.contains(&"cannot switch to anthropic: no key configured".to_string()));
+    assert!(statuses.contains(&"unknown provider nonsense: anthropic or openai".to_string()));
+    let dir_name = dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert!(lines
+        .prompts
+        .contains(&format!("my-new-model {dir_name}> ")));
+    assert!(lines.prompts.contains(&format!(
+        "{} {dir_name}> ",
+        airlok_llm::openai::DEFAULT_MODEL
+    )));
+
+    assert_eq!(session.provider, "openai");
+    assert_eq!(session.model, airlok_llm::openai::DEFAULT_MODEL);
+    let saved = store.load(dir.path(), None).unwrap().unwrap();
+    assert_eq!(saved.provider, "openai");
+    assert_eq!(saved.model, airlok_llm::openai::DEFAULT_MODEL);
+    assert_eq!(
+        saved.config.provider.model.as_deref(),
+        Some(airlok_llm::openai::DEFAULT_MODEL)
+    );
+}
+
+#[tokio::test]
+async fn a_model_switch_is_saved_before_the_next_turn() {
+    let dir = TempDir::new("repl-model-save");
+    let store = SessionStore::new(dir.path().join("data"));
+    let provider = MockProvider::scripted(vec![reply("one")]);
+    let mut agent = agent(provider, dir.path());
+    let mut repl = Repl {
+        agent: &mut agent,
+        store: Some(&store),
+        interrupt: Interrupt::new(),
+        backend: Box::new(TestBackend::default()),
+    };
+    let session = repl.agent.new_session();
+    // Ctrl-C at the prompt ends nothing; the switch must already be on disk.
+    let mut lines = ScriptedLines::new(vec![
+        Line::Text("hello".into()),
+        Line::Text("/model other-model".into()),
+    ]);
+    let mut out = RecordingOutput::default();
+    let session = repl.run(session, &mut lines, &mut out).await;
+    let saved = store.load(dir.path(), Some(&session.id)).unwrap().unwrap();
+    assert_eq!(saved.model, "other-model");
 }

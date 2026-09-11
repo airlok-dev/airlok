@@ -96,6 +96,11 @@ impl Agent {
         &self.config
     }
 
+    /// Swaps the model API, for `/provider`.
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
+    }
+
     /// Swaps the redactor, for a fresh session that must not inherit the
     /// old one's placeholders.
     pub fn set_redactor(&mut self, redactor: Box<dyn Redactor>) {

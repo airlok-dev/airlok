@@ -2,6 +2,17 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.4.1] - 2026-09-11
+
+### Added
+
+- `/model [<id>]` shows the model or switches it for the rest of the session, without validating the id. `/provider [anthropic|openai]` switches provider when a key is available for it and otherwise names the missing key. Both are recorded in the session file, and `--resume` continues on the session's last model when it used the configured provider and no `--model` is given.
+
+### Fixed
+
+- Markdown lines slightly wider than the terminal no longer leave a bullet, a bold label, or a styled first word such as `airlok` alone on a line. termimad's wrap cut between style runs; airlok now wraps word by word. Paragraphs and list items are rendered per block (when a blank line or the next block marker arrives, or the reply ends), so a paragraph split across source lines reflows as one. A paragraph now appears when it completes, not line by line.
+- The REPL prompt always starts on its own line: rustyline checks the cursor column before each prompt.
+
 ## [0.4.0] - 2026-09-11
 
 ### Added

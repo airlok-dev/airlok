@@ -7,10 +7,10 @@ use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use airlok_core::config::{self, KeySource, Overrides, ProviderName, Sources};
+use airlok_core::config::{self, KeySource, Overrides, ProviderConfig, ProviderName, Sources};
 use airlok_core::context::{self, ContextInput};
-use airlok_core::redact::{Class, Redactor, SecretRedactor};
-use airlok_core::repl::Repl;
+use airlok_core::redact::{Class, RedactionMap, Redactor, SecretRedactor};
+use airlok_core::repl::{Backend, Repl, Switch};
 use airlok_core::session::Summary;
 use airlok_core::tools::{ToolRegistry, READ_ONLY_TOOLS};
 use airlok_core::CoreError;
@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
         model: args.model.clone(),
         yes: args.yes,
     };
-    let (config, sources) = Config::load(
+    let (mut config, sources) = Config::load(
         user_path.as_deref(),
         Some(&project_path),
         &overrides,
@@ -126,6 +126,9 @@ async fn main() -> anyhow::Result<()> {
         })?),
         None => None,
     };
+    if let Some(session) = &resumed {
+        restore_session_model(&mut config, session, args.model.is_some());
+    }
 
     // The key is read once, after every check that could abort the run.
     let key = config
@@ -136,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(session) = &resumed {
         redactor = redactor.with_map(&session.redactions);
     }
-    let redactor = redactor.with_known("the provider API key", &key, Class::RedactOnly);
+    let redactor = redactor.with_known(KEY_LABEL, &key, Class::RedactOnly);
     let tools = ToolRegistry::defaults(&cwd, config.agent.bash_timeout);
 
     let mut agent =
@@ -207,17 +210,16 @@ async fn run_repl(
         env!("CARGO_PKG_VERSION"),
         agent.config().provider.model
     ));
+    let backend = CliBackend {
+        startup: agent.config().provider.clone(),
+        config: agent.config().clone(),
+        key,
+    };
     let mut repl = Repl {
         agent: &mut agent,
         store: Some(store),
         interrupt,
-        new_redactor: Box::new(move || {
-            Box::new(SecretRedactor::new().with_known(
-                "the provider API key",
-                &key,
-                Class::RedactOnly,
-            ))
-        }),
+        backend: Box::new(backend),
     };
     let session = repl.run(session, &mut lines, out).await;
     out.finish();
@@ -227,6 +229,74 @@ async fn run_repl(
         session.turns()
     ));
     Ok(())
+}
+
+const KEY_LABEL: &str = "the provider API key";
+
+/// Continues a resumed session on the model it last used, when it used
+/// the configured provider and `--model` was not given.
+fn restore_session_model(config: &mut Config, session: &airlok_core::Session, model_flag: bool) {
+    if session.provider != config.provider.name.as_str() {
+        eprintln!(
+            "note: the session last used {} ({}); continuing with {} ({}). /provider switches.",
+            session.provider,
+            session.model,
+            config.provider.name.as_str(),
+            config.provider.model
+        );
+    } else if !model_flag && session.model != config.provider.model {
+        eprintln!(
+            "continuing on {}, the model this session last used",
+            session.model
+        );
+        config.provider.model = session.model.clone();
+    }
+}
+
+/// Builds providers and redactors for the REPL. `[provider]` keys and
+/// `base_url` belong to the configured provider; another provider uses its
+/// default model and key environment variables, and switching back
+/// restores what the session started with.
+struct CliBackend {
+    startup: ProviderConfig,
+    config: Config,
+    key: String,
+}
+
+impl Backend for CliBackend {
+    fn fresh_redactor(&mut self) -> Box<dyn Redactor> {
+        Box::new(SecretRedactor::new().with_known(KEY_LABEL, &self.key, Class::RedactOnly))
+    }
+
+    fn switch(&mut self, name: ProviderName, seed: &RedactionMap) -> Result<Switch, String> {
+        let mut config = self.config.clone();
+        config.provider = if name == self.startup.name {
+            self.startup.clone()
+        } else {
+            ProviderConfig {
+                name,
+                model: name.default_model().to_string(),
+                base_url: None,
+                api_key_env: None,
+                api_key_cmd: None,
+                context_window: self.config.provider.context_window,
+            }
+        };
+        // Errors name the variable or command; they never carry its output.
+        let key = config.resolve_key().map_err(|e| e.to_string())?;
+        let provider = build_provider(&config, key.clone());
+        let redactor =
+            SecretRedactor::new()
+                .with_map(seed)
+                .with_known(KEY_LABEL, &key, Class::RedactOnly);
+        self.config = config;
+        self.key = key;
+        Ok(Switch {
+            config: self.config.provider.clone(),
+            provider,
+            redactor: Box::new(redactor),
+        })
+    }
 }
 
 fn store() -> anyhow::Result<SessionStore> {

@@ -1,0 +1,20 @@
+[1mairlok[0m keeps secrets on your machine and redacts all of the
+rest.
+
+[48;5;237m[38;5;252mairlok[49m[39m is the airlock between your code and each model's own
+API.
+
+[38;5;240m•[39m [1mCore[0m[1m [0m[1mruntime:[0m agent loop, sessions, context, tools, and
+  more.
+[38;5;240m•[39m [1mSafety:[0m redaction, confirmations, and deny lists by
+  default.
+[38;5;240m•[39m short item that continues on a second source line
+
+1[38;5;244m.[39m first step
+2[38;5;244m.[39m second step
+
+A paragraph the model split across two source lines.
+
+  [38;2;180;142;173mlet[38;2;192;197;206m x [38;2;192;197;206m=[38;2;192;197;206m [38;2;208;135;112m1[38;2;192;197;206m;[38;2;192;197;206m
+[0m
+[38;5;253m[4mDone[0m
