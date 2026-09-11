@@ -159,3 +159,23 @@ async fn missing_usage_falls_back_to_a_flagged_estimate() {
     );
     assert_eq!(session.usage.context_tokens, session.usage.input_tokens);
 }
+
+#[tokio::test]
+async fn a_failed_turn_leaves_the_session_as_it_was() {
+    let dir = TempDir::new("failed-turn");
+    let provider = MockProvider::scripted(vec![
+        reply("ok"),
+        tool_call("toolu_1", "bash", json!({"command": "echo hi"})),
+    ]);
+    let mut out = RecordingOutput::default();
+    out.decisions.push_back(airlok_core::Decision::Quit);
+    let mut agent = agent(provider, dir.path());
+    let mut session = agent.new_session();
+
+    agent.turn(&mut session, "one", &mut out).await.unwrap();
+    let err = agent.turn(&mut session, "two", &mut out).await.unwrap_err();
+
+    assert!(matches!(err, airlok_core::CoreError::Aborted));
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.turns(), 1);
+}

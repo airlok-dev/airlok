@@ -26,6 +26,7 @@ fn run_detached(cwd: &PathBuf, args: &[&str]) -> std::process::Output {
         .args(args)
         .current_dir(cwd)
         .env("XDG_CONFIG_HOME", cwd)
+        .env("XDG_DATA_HOME", cwd)
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("AZURE_OPENAI_API_KEY");

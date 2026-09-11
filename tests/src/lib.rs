@@ -204,7 +204,12 @@ impl Drop for TempDir {
 
 /// An agent with the default tools and the real secret redactor.
 pub fn agent(provider: Arc<MockProvider>, cwd: &Path) -> Agent {
+    agent_with(provider, cwd, SecretRedactor::new())
+}
+
+/// An agent with the default tools and the given redactor.
+pub fn agent_with(provider: Arc<MockProvider>, cwd: &Path, redactor: SecretRedactor) -> Agent {
     let config = Config::new(cwd.to_path_buf());
     let tools = ToolRegistry::defaults(cwd, config.agent.bash_timeout);
-    Agent::new(provider, tools, Box::new(SecretRedactor::new()), config)
+    Agent::new(provider, tools, Box::new(redactor), config)
 }

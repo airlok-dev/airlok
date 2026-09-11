@@ -114,7 +114,23 @@ impl Agent {
         prompt: &str,
         out: &mut dyn Output,
     ) -> Result<usize, CoreError> {
-        let system = system_prompt(&self.config, &self.context);
+        let start = session.messages.len();
+        let result = self.rounds(session, prompt, out).await;
+        if result.is_err() {
+            // A failed turn leaves no dangling user message for the next
+            // turn (or a resume) to trip over.
+            session.messages.truncate(start);
+        }
+        result
+    }
+
+    async fn rounds(
+        &mut self,
+        session: &mut Session,
+        prompt: &str,
+        out: &mut dyn Output,
+    ) -> Result<usize, CoreError> {
+        let system = system_prompt(&self.config, &self.context, session);
         let specs = self.tools.specs();
         session.messages.push(Message::user_text(prompt));
         session.interrupted = false;
@@ -449,7 +465,7 @@ enum Gate {
     Abort,
 }
 
-fn system_prompt(config: &Config, context: &str) -> String {
+fn system_prompt(config: &Config, context: &str, session: &Session) -> String {
     let mut prompt = format!(
         "You are airlok, a coding agent working in the directory {cwd}. \
          Complete the user's task using the available tools, then reply with a short summary of what you did. \
@@ -464,6 +480,12 @@ fn system_prompt(config: &Config, context: &str) -> String {
     if !context.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(context);
+    }
+    if let Some(at) = session.resumed_at.last() {
+        prompt.push_str(&format!(
+            "\n\nThis session was resumed at {at}. The environment block above was rebuilt at that \
+             time; the conversation before this point happened earlier and files may have changed since."
+        ));
     }
     prompt
 }

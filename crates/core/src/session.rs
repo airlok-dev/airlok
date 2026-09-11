@@ -10,7 +10,9 @@ use airlok_llm::{ContentBlock, Message};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, ConfigFile};
-use crate::redact::RedactionMap;
+use crate::redact::{Class, RedactionMap};
+
+pub use store::{SessionStore, Summary};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
@@ -141,6 +143,28 @@ impl Session {
 
     pub fn touch(&mut self) {
         self.updated_at = now_rfc3339();
+    }
+
+    /// Records a resume. The agent adds a system note for the latest one.
+    pub fn resume(&mut self) -> &str {
+        self.resumed_at.push(now_rfc3339());
+        self.resumed_at
+            .last()
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+
+    /// What goes on disk: the same session with redact-only values (the
+    /// provider key) blanked. The placeholder and its class survive, so
+    /// history that mentions it still displays as redacted after a resume.
+    pub fn for_disk(&self) -> Session {
+        let mut copy = self.clone();
+        for entry in copy.redactions.values_mut() {
+            if entry.class == Class::RedactOnly {
+                entry.value.clear();
+            }
+        }
+        copy
     }
 }
 

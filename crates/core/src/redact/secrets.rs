@@ -72,6 +72,21 @@ impl SecretRedactor {
         self
     }
 
+    /// Re-issues the placeholders of a saved session so history that
+    /// mentions them keeps meaning the same thing. Entries stored without a
+    /// value (redact-only ones) keep their placeholder but never match
+    /// input; new placeholders are numbered after the saved ones.
+    pub fn with_map(mut self, saved: &RedactionMap) -> Self {
+        for (placeholder, entry) in saved {
+            self.map.insert(placeholder.clone(), entry.clone());
+            if !entry.value.is_empty() {
+                self.placeholder_for
+                    .insert(entry.value.clone(), placeholder.clone());
+            }
+        }
+        self
+    }
+
     /// Every kind this redactor can produce, with its class: the built-in
     /// detectors, then anything registered through `with_known`.
     pub fn catalog(&self) -> Vec<(String, Class)> {
