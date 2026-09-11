@@ -1,14 +1,25 @@
 //! Markdown rendering for the terminal, fed one streamed chunk at a time.
 //!
-//! Buffering is per block: prose lines are rendered as soon as each line
-//! is complete, fenced code blocks and tables are held until they close.
-//! In plain mode (no TTY, or NO_COLOR set) chunks pass through untouched.
+//! Buffering is per block. A paragraph or list item is rendered when a
+//! blank line or the next block marker arrives, or the message ends, so
+//! markdown sees the whole block however the stream was cut. Headings and
+//! rules render at the end of their line; fenced code blocks and tables
+//! are held until they close. In plain mode (no TTY, or NO_COLOR set)
+//! chunks pass through untouched.
+//!
+//! Wrapping is done here, word by word, instead of by termimad: its wrap
+//! cuts a line with two style runs (`**Label:** text`) between the runs
+//! whenever each fits alone, leaving the label or the bullet on a line of
+//! its own.
 
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
-use termimad::{FmtText, MadSkin};
+use termimad::minimad::Compound;
+use termimad::wrap::composite_kind_widths;
+use termimad::{CompositeKind, FmtComposite, FmtLine, FmtText, MadSkin};
+use unicode_width::UnicodeWidthStr;
 
 pub enum Renderer {
     Plain,
@@ -26,9 +37,16 @@ pub struct Rich {
 }
 
 enum Block {
-    Prose,
-    Code { lang: String, lines: Vec<String> },
-    Table { lines: Vec<String> },
+    /// Source lines of the paragraph or list item being collected; empty
+    /// between blocks.
+    Prose(Vec<String>),
+    Code {
+        lang: String,
+        lines: Vec<String>,
+    },
+    Table {
+        lines: Vec<String>,
+    },
 }
 
 impl Renderer {
@@ -53,7 +71,7 @@ impl Renderer {
             syntaxes: SyntaxSet::load_defaults_newlines(),
             theme: ThemeSet::load_defaults().themes["base16-ocean.dark"].clone(),
             pending: String::new(),
-            block: Block::Prose,
+            block: Block::Prose(Vec::new()),
         }))
     }
 
@@ -95,10 +113,10 @@ impl Rich {
             let line = std::mem::take(&mut self.pending);
             out.push_str(&self.line(&line));
         }
-        match std::mem::replace(&mut self.block, Block::Prose) {
-            Block::Prose => {}
+        match std::mem::replace(&mut self.block, Block::Prose(Vec::new())) {
+            Block::Prose(lines) => out.push_str(&self.prose(&lines)),
             Block::Code { lang, lines } => out.push_str(&self.code(&lang, &lines)),
-            Block::Table { lines } => out.push_str(&self.markdown(&lines.join("\n"))),
+            Block::Table { lines } => out.push_str(&self.table(&lines)),
         }
         out
     }
@@ -109,7 +127,7 @@ impl Rich {
             Block::Code { lang, lines } => {
                 if line.trim_start().starts_with("```") {
                     let (lang, lines) = (std::mem::take(lang), std::mem::take(lines));
-                    self.block = Block::Prose;
+                    self.block = Block::Prose(Vec::new());
                     self.code(&lang, &lines)
                 } else {
                     lines.push(line.to_string());
@@ -122,34 +140,75 @@ impl Rich {
                     return String::new();
                 }
                 let table = std::mem::take(lines);
-                self.block = Block::Prose;
-                let mut out = self.markdown(&table.join("\n"));
+                self.block = Block::Prose(Vec::new());
+                let mut out = self.table(&table);
                 out.push_str(&self.line(line));
                 out
             }
-            Block::Prose => {
-                if let Some(rest) = line.trim_start().strip_prefix("```") {
+            Block::Prose(lines) => {
+                let trimmed = line.trim_start();
+                if !lines.is_empty() && !line.trim().is_empty() && !starts_block(trimmed) {
+                    // A continuation of the paragraph or list item.
+                    lines.push(line.to_string());
+                    return String::new();
+                }
+                let done = std::mem::take(lines);
+                let mut out = self.prose(&done);
+                if let Some(rest) = trimmed.strip_prefix("```") {
                     self.block = Block::Code {
                         lang: rest.trim().to_string(),
                         lines: Vec::new(),
                     };
-                    String::new()
-                } else if line.trim_start().starts_with('|') {
+                } else if trimmed.starts_with('|') {
                     self.block = Block::Table {
                         lines: vec![line.to_string()],
                     };
-                    String::new()
                 } else if line.trim().is_empty() {
-                    "\n".to_string()
+                    out.push('\n');
+                } else if is_single_line_block(trimmed) {
+                    out.push_str(&self.markdown(line));
                 } else {
-                    self.markdown(line)
+                    self.block = Block::Prose(vec![line.to_string()]);
                 }
+                out
             }
         }
     }
 
+    /// Renders collected paragraph or list-item lines as one block. Soft
+    /// line breaks become spaces so the text reflows; a line ending in two
+    /// spaces or a backslash keeps its break.
+    fn prose(&self, lines: &[String]) -> String {
+        if lines.is_empty() {
+            return String::new();
+        }
+        let mut src = lines[0].trim_end().to_string();
+        for (previous, line) in lines.iter().zip(&lines[1..]) {
+            let hard_break = previous.ends_with("  ") || previous.trim_end().ends_with('\\');
+            src.push(if hard_break { '\n' } else { ' ' });
+            src.push_str(line.trim());
+        }
+        self.markdown(&src)
+    }
+
     fn markdown(&self, src: &str) -> String {
-        FmtText::from(&self.skin, src, Some(self.width)).to_string()
+        let mut text = FmtText::from(&self.skin, src, None);
+        text.lines = std::mem::take(&mut text.lines)
+            .into_iter()
+            .flat_map(|line| match line {
+                FmtLine::Normal(fc) => wrap(fc, self.width, &self.skin)
+                    .into_iter()
+                    .map(FmtLine::Normal)
+                    .collect(),
+                other => vec![other],
+            })
+            .collect();
+        text.width = Some(self.width);
+        text.to_string()
+    }
+
+    fn table(&self, lines: &[String]) -> String {
+        FmtText::from(&self.skin, &lines.join("\n"), Some(self.width)).to_string()
     }
 
     fn code(&self, lang: &str, lines: &[String]) -> String {
@@ -169,6 +228,125 @@ impl Rich {
             out.push_str("\x1b[0m");
         }
         out
+    }
+}
+
+/// A line that begins a new block instead of continuing the current one.
+fn starts_block(trimmed: &str) -> bool {
+    is_list_marker(trimmed)
+        || is_single_line_block(trimmed)
+        || trimmed.starts_with("```")
+        || trimmed.starts_with('|')
+        || trimmed.starts_with('>')
+}
+
+fn is_list_marker(trimmed: &str) -> bool {
+    if ["- ", "* ", "+ "].iter().any(|m| trimmed.starts_with(m)) {
+        return true;
+    }
+    let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && (trimmed[digits..].starts_with(". ") || trimmed[digits..].starts_with(") "))
+}
+
+/// Headings and rules are complete at the end of their line.
+fn is_single_line_block(trimmed: &str) -> bool {
+    if trimmed.starts_with('#') {
+        return true;
+    }
+    let rule: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    rule.len() >= 3
+        && (rule.chars().all(|c| c == '-')
+            || rule.chars().all(|c| c == '*')
+            || rule.chars().all(|c| c == '_'))
+}
+
+/// Word-wraps one rendered line to `width` columns: greedy, breaking only
+/// at whitespace, continuation lines indented like termimad's own. A word
+/// wider than the line gets a line to itself.
+fn wrap<'s>(fc: FmtComposite<'s>, width: usize, skin: &MadSkin) -> Vec<FmtComposite<'s>> {
+    let (left, right) = skin.line_style(fc.kind).margins_in(Some(width));
+    let width = width.saturating_sub(left + right);
+    let (first_width, _) = composite_kind_widths(fc.kind, skin);
+    if fc.visible_length + first_width <= width || width < 3 {
+        return vec![fc];
+    }
+    let mut lines = Vec::new();
+    let mut current = FmtComposite {
+        kind: fc.kind,
+        compounds: Vec::new(),
+        visible_length: first_width,
+        spacing: fc.spacing,
+    };
+    for compound in &fc.compounds {
+        for (token, blank) in words(compound) {
+            let token_width = token.src.width();
+            let fresh = current.compounds.is_empty();
+            if blank && fresh && !lines.is_empty() {
+                continue;
+            }
+            if current.visible_length + token_width > width && !fresh {
+                let next = follow_up(&current, skin);
+                lines.push(trim_end(std::mem::replace(&mut current, next)));
+                if blank {
+                    continue;
+                }
+            }
+            current.add_compound(token);
+        }
+    }
+    lines.push(current);
+    lines
+}
+
+/// Drops trailing whitespace runs from a finished line.
+fn trim_end(mut fc: FmtComposite<'_>) -> FmtComposite<'_> {
+    while fc
+        .compounds
+        .last()
+        .is_some_and(|c| c.src.chars().all(char::is_whitespace))
+    {
+        let blank = fc.compounds.pop().expect("checked above");
+        fc.visible_length -= blank.src.width();
+    }
+    fc
+}
+
+/// The compound cut into alternating runs of whitespace and non-whitespace,
+/// each keeping the compound's style. `true` marks a whitespace run.
+fn words<'s>(compound: &Compound<'s>) -> Vec<(Compound<'s>, bool)> {
+    let src = compound.src;
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut blank = None;
+    for (i, c) in src.char_indices() {
+        let is_blank = c.is_whitespace();
+        if blank.is_some_and(|b| b != is_blank) {
+            out.push((compound.sub(start, i), blank.unwrap_or(false)));
+            start = i;
+        }
+        blank = Some(is_blank);
+    }
+    if start < src.len() {
+        out.push((compound.sub(start, src.len()), blank.unwrap_or(false)));
+    }
+    out
+}
+
+/// An empty continuation line for `fc`: list items continue as follow-ups
+/// so they are indented under the text, not given a new bullet.
+fn follow_up<'s>(fc: &FmtComposite<'s>, skin: &MadSkin) -> FmtComposite<'s> {
+    let kind = match fc.kind {
+        CompositeKind::ListItem(depth) => CompositeKind::ListItemFollowUp(depth),
+        CompositeKind::OrderedListItem { level, index } => {
+            CompositeKind::OrderedListItemFollowUp { level, index }
+        }
+        kind => kind,
+    };
+    FmtComposite {
+        kind,
+        compounds: Vec::new(),
+        visible_length: composite_kind_widths(kind, skin).0,
+        spacing: fc.spacing,
     }
 }
 
@@ -243,13 +421,16 @@ mod tests {
         assert_eq!(first, "", "nothing printed until the fence closes");
         let second = renderer.push("VALUE\";\n");
         assert_eq!(second, "");
-        let third = renderer.push("```\nafter\n");
-        let text = strip_ansi(&third);
+        let third = strip_ansi(&renderer.push("```\nafter\n"));
         assert!(
-            text.contains("let key = \"sk-ant-api03-REALVALUE\";"),
-            "{text:?}"
+            third.contains("let key = \"sk-ant-api03-REALVALUE\";"),
+            "{third:?}"
         );
-        assert!(text.ends_with("after\n"), "{text:?}");
+        assert!(
+            !third.contains("after"),
+            "the paragraph after is still open"
+        );
+        assert_eq!(strip_ansi(&renderer.finish()), "after\n");
     }
 
     #[test]
@@ -258,32 +439,91 @@ mod tests {
         assert_eq!(renderer.push("| a | b |\n|---|---|\n"), "");
         assert_eq!(renderer.push("| 1 | 2 |\n"), "");
         let out = strip_ansi(&renderer.push("text\n"));
-        let a = out.find('a').unwrap();
-        let t = out.find("text").unwrap();
-        assert!(a < t, "table rendered before the following text: {out:?}");
-        assert!(out.contains('1') && out.contains('2'));
+        assert!(
+            out.contains('a') && out.contains('1') && out.contains('2'),
+            "{out:?}"
+        );
+        assert!(!out.contains("text"), "{out:?}");
+        assert_eq!(strip_ansi(&renderer.finish()), "text\n");
     }
 
     #[test]
-    fn prose_streams_line_by_line() {
+    fn a_paragraph_is_held_until_the_block_ends() {
         let mut renderer = Renderer::rich(60);
+        assert_eq!(renderer.push("airlok"), "", "held while the line is open");
         assert_eq!(
-            renderer.push("partial"),
+            renderer.push(" keeps secrets\non this machine.\n"),
             "",
-            "held until the line completes"
+            "held while the paragraph may continue"
         );
-        let out = strip_ansi(&renderer.push(" line\nnext"));
-        assert_eq!(out, "partial line\n");
-        assert_eq!(strip_ansi(&renderer.finish()), "next\n");
+        let out = strip_ansi(&renderer.push("\n"));
+        assert_eq!(out, "airlok keeps secrets on this machine.\n\n");
     }
 
-    /// Rewrites the golden file. Run with
+    #[test]
+    fn a_list_item_renders_when_the_next_one_starts() {
+        let mut renderer = Renderer::rich(60);
+        assert_eq!(renderer.push("- one\n"), "");
+        assert_eq!(strip_ansi(&renderer.push("- two\n")), "\u{2022} one\n");
+        assert_eq!(strip_ansi(&renderer.finish()), "\u{2022} two\n");
+    }
+
+    #[test]
+    fn a_reply_without_a_newline_is_rendered_at_the_end() {
+        let mut renderer = Renderer::rich(60);
+        assert_eq!(renderer.push("Hi!"), "");
+        assert_eq!(strip_ansi(&renderer.finish()), "Hi!\n");
+    }
+
+    /// Lines a few columns wider than the width, with a styled first run:
+    /// the shapes termimad's own wrap cut after the first run.
+    const STREAM: &str = "**airlok** keeps secrets on your machine and redacts all of the rest.\n\n`airlok` is the airlock between your code and each model's own API.\n\n- **Core runtime:** agent loop, sessions, context, tools, and more.\n- **Safety:** redaction, confirmations, and deny lists by default.\n- short item\n  that continues on a second source line\n\n1. first step\n2. second step\n\nA paragraph the model split\nacross two source lines.\n\n```rust\nlet x = 1;\n```\n\n## Done\n";
+
+    #[test]
+    fn streamed_golden_is_independent_of_chunk_boundaries() {
+        let whole = render_all(&[STREAM]);
+        assert_eq!(whole, include_str!("../tests/golden/stream.ansi"));
+        let chars: Vec<&str> = STREAM
+            .char_indices()
+            .map(|(i, c)| &STREAM[i..i + c.len_utf8()])
+            .collect();
+        assert_eq!(render_all(&chars), whole, "split at every character");
+        for cut in 1..STREAM.len() {
+            if STREAM.is_char_boundary(cut) {
+                let (a, b) = STREAM.split_at(cut);
+                assert_eq!(render_all(&[a, b]), whole, "split at byte {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_styled_first_run_is_not_left_alone_on_its_line() {
+        let text = strip_ansi(&render_all(&[STREAM]));
+        let lines: Vec<&str> = text.lines().collect();
+        for line in &lines {
+            assert!(line.chars().count() <= 60, "{line:?} is wider than 60");
+        }
+        let first = |needle: &str| *lines.iter().find(|l| l.contains(needle)).unwrap();
+        assert!(first("Core runtime:").contains("agent loop"), "{lines:?}");
+        assert!(first("Safety:").contains("redaction"), "{lines:?}");
+        assert!(first("airlok keeps").contains("machine"), "{lines:?}");
+        assert!(first("airlok is").contains("between"), "{lines:?}");
+        assert!(
+            lines.iter().all(|l| l.trim() != "\u{2022}"),
+            "bare bullet: {lines:?}"
+        );
+        assert!(text.contains("A paragraph the model split across two source lines."));
+        assert!(text.contains("\u{2022} short item that continues on a second source line"));
+    }
+
+    /// Rewrites the golden files. Run with
     /// `cargo test -p airlok --bin airlok -- --ignored dump_golden` after
     /// checking the new render by eye.
     #[test]
     #[ignore]
     fn dump_golden() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/sample.ansi");
-        std::fs::write(path, render_all(&[SAMPLE])).unwrap();
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
+        std::fs::write(format!("{dir}/sample.ansi"), render_all(&[SAMPLE])).unwrap();
+        std::fs::write(format!("{dir}/stream.ansi"), render_all(&[STREAM])).unwrap();
     }
 }
