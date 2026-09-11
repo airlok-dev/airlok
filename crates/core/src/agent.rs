@@ -122,8 +122,12 @@ impl Agent {
 
         for round in 1..=self.config.agent.max_turns {
             let (request, map) = self.build_request(&system, &session.messages, &specs);
+            let estimate = request.estimated_tokens();
             let response = self.stream_response(request, &map, out).await?;
-            debug!(round, stop_reason = ?response.stop_reason, "round complete");
+            debug!(round, stop_reason = ?response.stop_reason, usage = ?response.usage, "round complete");
+            session
+                .usage
+                .record(response.usage, estimate, &response.content);
 
             let tool_calls: Vec<&ContentBlock> = response
                 .content
@@ -224,6 +228,7 @@ impl Agent {
         let mut content = Vec::new();
         let mut text = String::new();
         let mut unshown = String::new();
+        let mut usage = None;
         let mut stream = self.provider.stream(request);
 
         while let Some(event) = stream.next().await {
@@ -243,11 +248,13 @@ impl Agent {
                     map_strings(&mut input, &mut |s| self.redactor.rehydrate(s, map));
                     content.push(ContentBlock::ToolUse { id, name, input });
                 }
+                StreamEvent::Usage(reported) => usage = Some(reported),
                 StreamEvent::MessageEnd { stop_reason } => {
                     self.flush_text(&mut text, &mut unshown, map, out, &mut content);
                     return Ok(Response {
                         content,
                         stop_reason,
+                        usage,
                     });
                 }
             }

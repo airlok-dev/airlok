@@ -56,6 +56,22 @@ pub fn reply(text: &str) -> Vec<StreamEvent> {
 }
 
 /// A turn that calls one tool.
+/// Prepends a provider usage report to a scripted turn.
+pub fn with_usage(
+    input_tokens: u64,
+    output_tokens: u64,
+    mut turn: Vec<StreamEvent>,
+) -> Vec<StreamEvent> {
+    turn.insert(
+        0,
+        StreamEvent::Usage(airlok_llm::Usage {
+            input_tokens,
+            output_tokens,
+        }),
+    );
+    turn
+}
+
 pub fn tool_call(id: &str, name: &str, input: Value) -> Vec<StreamEvent> {
     vec![
         StreamEvent::ToolUse {

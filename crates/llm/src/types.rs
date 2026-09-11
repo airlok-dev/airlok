@@ -89,11 +89,44 @@ pub enum StopReason {
     Other,
 }
 
+/// Token counts reported by the provider for one request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    /// Everything the model read, including any cached prefix.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// A complete assistant turn, assembled from the stream.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Response {
     pub content: Vec<ContentBlock>,
     pub stop_reason: StopReason,
+    /// `None` when the provider reported no usage; callers estimate.
+    pub usage: Option<Usage>,
+}
+
+impl Request {
+    /// Rough size of the request, chars/4, for when the provider reports no
+    /// usage. Counts what the wire body carries, not its JSON framing.
+    pub fn estimated_tokens(&self) -> u64 {
+        let mut chars = self.system.len();
+        for message in &self.messages {
+            for block in &message.content {
+                chars += match block {
+                    ContentBlock::Text { text } => text.len(),
+                    ContentBlock::ToolUse { name, input, .. } => {
+                        name.len() + input.to_string().len()
+                    }
+                    ContentBlock::ToolResult { content, .. } => content.len(),
+                };
+            }
+        }
+        for tool in &self.tools {
+            chars += tool.name.len() + tool.description.len() + tool.input_schema.to_string().len();
+        }
+        (chars / 4) as u64
+    }
 }
 
 /// One step of a streamed reply.
@@ -107,6 +140,9 @@ pub enum StreamEvent {
         name: String,
         input: Value,
     },
+    /// Token counts, when the provider reports them. At most once per turn,
+    /// before `MessageEnd`.
+    Usage(Usage),
     /// The turn is over. Always the final event.
     MessageEnd { stop_reason: StopReason },
 }

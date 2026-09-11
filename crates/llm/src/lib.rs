@@ -15,7 +15,7 @@ use futures::stream::BoxStream;
 pub use anthropic::Anthropic;
 pub use openai::{Auth, OpenAi};
 pub use types::{
-    ContentBlock, Message, Request, Response, Role, StopReason, StreamEvent, ToolSpec,
+    ContentBlock, Message, Request, Response, Role, StopReason, StreamEvent, ToolSpec, Usage,
 };
 
 /// Errors produced while talking to a model.

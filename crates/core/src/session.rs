@@ -6,7 +6,7 @@ pub mod store;
 
 use std::path::{Path, PathBuf};
 
-use airlok_llm::Message;
+use airlok_llm::{ContentBlock, Message};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, ConfigFile};
@@ -47,6 +47,42 @@ pub struct Usage {
     /// True when `context_tokens` came from a chars/4 estimate because the
     /// provider reported no usage.
     pub estimated: bool,
+}
+
+impl Usage {
+    /// Adds one request's usage. Without a provider report, the input side
+    /// is `estimate` (chars/4 of the request) and the output side chars/4 of
+    /// the reply, and the whole session is marked estimated.
+    pub fn record(
+        &mut self,
+        reported: Option<airlok_llm::Usage>,
+        estimate: u64,
+        reply: &[ContentBlock],
+    ) {
+        match reported {
+            Some(usage) => {
+                self.input_tokens += usage.input_tokens;
+                self.output_tokens += usage.output_tokens;
+                self.context_tokens = usage.input_tokens;
+            }
+            None => {
+                let output: usize = reply
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text { text } => text.len(),
+                        ContentBlock::ToolUse { name, input, .. } => {
+                            name.len() + input.to_string().len()
+                        }
+                        ContentBlock::ToolResult { content, .. } => content.len(),
+                    })
+                    .sum();
+                self.input_tokens += estimate;
+                self.output_tokens += (output / 4) as u64;
+                self.context_tokens = estimate;
+                self.estimated = true;
+            }
+        }
+    }
 }
 
 /// One compaction, kept so a resumed session shows the summary rather than
