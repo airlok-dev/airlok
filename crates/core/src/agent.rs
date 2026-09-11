@@ -1,10 +1,11 @@
 //! The agent loop.
 //!
-//! Invariant: history is kept in plaintext. Every request body is redacted
-//! at send time, and every response is rehydrated before it is stored or
-//! acted on. The provider only ever sees placeholders.
+//! Invariant: history is kept in plaintext inside a [`Session`]. Every
+//! request body is redacted at send time, and every response is rehydrated
+//! before it is stored or acted on. The provider only ever sees
+//! placeholders.
 //!
-//! TODO(stage N): compaction when history grows, subagents.
+//! TODO(stage N): subagents.
 
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use crate::redact::{
     for_display, redact_only_in, split_incomplete_placeholder, RedactionMap, Redactor,
 };
 use crate::safety::{CommandVerdict, Confirmation, Decision};
+use crate::session::Session;
 use crate::tools::{truncate_output, Plan, Tool, ToolError, ToolRegistry};
 use crate::{CoreError, Output};
 
@@ -85,22 +87,43 @@ impl Agent {
         &mut self.config
     }
 
+    /// One task in a fresh session. Convenience over [`Agent::turn`].
     pub async fn run(
         &mut self,
         prompt: &str,
         out: &mut dyn Output,
     ) -> Result<RunReport, CoreError> {
+        let mut session = Session::new(&self.config.cwd.clone(), &self.config);
+        let turns = self.turn(&mut session, prompt, out).await?;
+        Ok(RunReport {
+            redactions: session.redactions,
+            turns,
+        })
+    }
+
+    /// The session this agent would start: same cwd and config snapshot.
+    pub fn new_session(&self) -> Session {
+        Session::new(&self.config.cwd, &self.config)
+    }
+
+    /// Adds the user's prompt to `session` and runs model round-trips until
+    /// the model stops calling tools. Returns the number of round-trips.
+    pub async fn turn(
+        &mut self,
+        session: &mut Session,
+        prompt: &str,
+        out: &mut dyn Output,
+    ) -> Result<usize, CoreError> {
         let system = system_prompt(&self.config, &self.context);
         let specs = self.tools.specs();
-        let mut history = vec![Message::user_text(prompt)];
-        let mut report = RunReport::default();
+        session.messages.push(Message::user_text(prompt));
+        session.interrupted = false;
         let mut approved = Approved::default();
 
-        for turn in 1..=self.config.agent.max_turns {
-            report.turns = turn;
-            let (request, map) = self.build_request(&system, &history, &specs);
+        for round in 1..=self.config.agent.max_turns {
+            let (request, map) = self.build_request(&system, &session.messages, &specs);
             let response = self.stream_response(request, &map, out).await?;
-            debug!(turn, stop_reason = ?response.stop_reason, "turn complete");
+            debug!(round, stop_reason = ?response.stop_reason, "round complete");
 
             let tool_calls: Vec<&ContentBlock> = response
                 .content
@@ -114,12 +137,13 @@ impl Agent {
             } else {
                 Vec::new()
             };
-            report.redactions = map;
-            history.push(Message::assistant(response.content));
+            session.redactions = map;
+            session.messages.push(Message::assistant(response.content));
+            session.touch();
             if !wants_tools {
-                return Ok(report);
+                return Ok(round);
             }
-            history.push(Message::tool_results(results));
+            session.messages.push(Message::tool_results(results));
         }
         Err(CoreError::TurnLimit(self.config.agent.max_turns))
     }

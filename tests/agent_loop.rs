@@ -94,3 +94,26 @@ async fn unknown_tool_and_tool_failure_go_back_as_errors() {
     assert!(is_error);
     assert!(content.starts_with("error: "), "{content}");
 }
+
+#[tokio::test]
+async fn a_session_carries_history_across_turns() {
+    let dir = TempDir::new("session-turns");
+    let provider = MockProvider::scripted(vec![reply("first answer"), reply("second answer")]);
+    let mut out = RecordingOutput::default();
+    let mut agent = agent(provider.clone(), dir.path());
+    let mut session = agent.new_session();
+
+    agent.turn(&mut session, "first", &mut out).await.unwrap();
+    agent.turn(&mut session, "second", &mut out).await.unwrap();
+
+    let roles: Vec<Role> = session.messages.iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        vec![Role::User, Role::Assistant, Role::User, Role::Assistant]
+    );
+    assert_eq!(session.turns(), 2);
+    assert_eq!(session.first_prompt(), Some("first"));
+    // The second request carries the whole conversation so far.
+    let second = &provider.requests()[1];
+    assert_eq!(second.messages.len(), 3);
+}

@@ -15,9 +15,12 @@ pub mod secrets;
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 pub use secrets::SecretRedactor;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Class {
     /// Restored into files and commands; masked in the terminal by default.
     Rehydrate,
@@ -34,7 +37,7 @@ impl Class {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub value: String,
     /// What the value is, such as "anthropic api key", for display.

@@ -14,6 +14,7 @@ pub mod tools;
 pub use agent::{Agent, RunReport};
 pub use config::{Config, ConfigError};
 pub use safety::{Confirmation, Decision};
+pub use session::Session;
 
 /// Where user-facing output goes. Implemented by the CLI.
 pub trait Output: Send {

@@ -29,6 +29,7 @@ similar = "3.2.0"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 termimad = "0.35.4"
 thiserror = "2.0.12"
+time = { version = "0.3.55", features = ["formatting", "parsing"] }
 toml = "1.1.6"
 tokio = { version = "1.45.1", features = ["full"] }
 tracing = "0.1.41"
