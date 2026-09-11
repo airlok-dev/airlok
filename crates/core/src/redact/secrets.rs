@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use regex::Regex;
 
-use super::{RedactionMap, Redactor};
+use super::{Class, Entry, RedactionMap, Redactor};
 
 /// (kind, pattern). If the pattern has a capture group, only group 1 is
 /// redacted; otherwise the whole match is.
@@ -37,10 +37,8 @@ pub struct SecretRedactor {
     patterns: Vec<(&'static str, Regex)>,
     map: RedactionMap,
     placeholder_for: HashMap<String, String>,
-    /// Placeholder to the kind of value it replaced.
-    kinds: HashMap<String, String>,
-    /// Values registered through `with_known`, with their labels.
-    known: Vec<(String, String)>,
+    /// Labels and classes registered through `with_known`.
+    known: Vec<(String, Class)>,
 }
 
 impl Default for SecretRedactor {
@@ -58,32 +56,47 @@ impl SecretRedactor {
                 .collect(),
             map: RedactionMap::new(),
             placeholder_for: HashMap::new(),
-            kinds: HashMap::new(),
             known: Vec::new(),
         }
     }
 
     /// A value to redact wherever it appears, such as the provider key the
-    /// process is running with, labelled for display. Short values are
-    /// ignored so a weak test key cannot redact every occurrence of a
-    /// common word.
-    pub fn with_known(mut self, label: &str, secret: &str) -> Self {
+    /// process is running with, labelled for display and classed. Short
+    /// values are ignored so a weak test key cannot redact every
+    /// occurrence of a common word.
+    pub fn with_known(mut self, label: &str, secret: &str, class: Class) -> Self {
         if secret.len() >= MIN_KNOWN_SECRET_LEN {
-            self.known.push((label.to_string(), secret.to_string()));
-            self.placeholder(secret, label);
+            self.known.push((label.to_string(), class));
+            self.placeholder(secret, label, class);
         }
         self
     }
 
-    fn placeholder(&mut self, secret: &str, kind: &str) -> String {
+    /// Every kind this redactor can produce, with its class: the built-in
+    /// detectors, then anything registered through `with_known`.
+    pub fn catalog(&self) -> Vec<(String, Class)> {
+        PATTERNS
+            .iter()
+            .map(|(kind, _)| (kind.to_string(), Class::Rehydrate))
+            .chain(self.known.iter().cloned())
+            .collect()
+    }
+
+    fn placeholder(&mut self, secret: &str, kind: &str, class: Class) -> String {
         if let Some(existing) = self.placeholder_for.get(secret) {
             return existing.clone();
         }
         let placeholder = format!("<<SECRET_{}>>", self.map.len() + 1);
-        self.map.insert(placeholder.clone(), secret.to_string());
+        self.map.insert(
+            placeholder.clone(),
+            Entry {
+                value: secret.to_string(),
+                kind: kind.to_string(),
+                class,
+            },
+        );
         self.placeholder_for
             .insert(secret.to_string(), placeholder.clone());
-        self.kinds.insert(placeholder.clone(), kind.to_string());
         placeholder
     }
 
@@ -94,16 +107,20 @@ impl SecretRedactor {
     /// context-dependent detector (Bearer) would otherwise miss the same
     /// value when it reappears without its context.
     fn spans(&self, input: &str) -> Vec<Span> {
-        let known = self.placeholder_for.keys().flat_map(|secret| {
-            let kind = self.kinds[&self.placeholder_for[secret]].clone();
-            input
-                .match_indices(secret.as_str())
-                .map(move |(start, found)| Span {
-                    start,
-                    end: start + found.len(),
-                    kind: kind.clone(),
-                })
-        });
+        let known = self
+            .placeholder_for
+            .iter()
+            .flat_map(|(secret, placeholder)| {
+                let entry = &self.map[placeholder];
+                input
+                    .match_indices(secret.as_str())
+                    .map(move |(start, found)| Span {
+                        start,
+                        end: start + found.len(),
+                        kind: entry.kind.clone(),
+                        class: entry.class,
+                    })
+            });
         let detected = self.patterns.iter().flat_map(|(kind, re)| {
             re.captures_iter(input).map(|caps| {
                 let m = caps.get(1).unwrap_or_else(|| caps.get(0).unwrap());
@@ -111,6 +128,7 @@ impl SecretRedactor {
                     start: m.start(),
                     end: m.end(),
                     kind: kind.to_string(),
+                    class: Class::Rehydrate,
                 }
             })
         });
@@ -130,6 +148,7 @@ struct Span {
     start: usize,
     end: usize,
     kind: String,
+    class: Class,
 }
 
 impl Redactor for SecretRedactor {
@@ -138,25 +157,11 @@ impl Redactor for SecretRedactor {
         let mut cursor = 0;
         for span in self.spans(input) {
             out.push_str(&input[cursor..span.start]);
-            out.push_str(&self.placeholder(&input[span.start..span.end], &span.kind));
+            out.push_str(&self.placeholder(&input[span.start..span.end], &span.kind, span.class));
             cursor = span.end;
         }
         out.push_str(&input[cursor..]);
         (out, self.map.clone())
-    }
-
-    fn rehydrate(&self, input: &str, map: &RedactionMap) -> String {
-        let mut out = input.to_string();
-        for (placeholder, secret) in map {
-            if out.contains(placeholder) {
-                out = out.replace(placeholder, secret);
-            }
-        }
-        out
-    }
-
-    fn kind_of(&self, placeholder: &str) -> Option<&str> {
-        self.kinds.get(placeholder).map(String::as_str)
     }
 }
 
@@ -213,6 +218,7 @@ mod tests {
             let (twice, _) = redactor.redact(&once);
             assert_eq!(once, twice, "redact is not idempotent for {sample}");
             assert_eq!(redactor.rehydrate(&once, &map), text);
+            assert_eq!(map["<<SECRET_1>>"].class, Class::Rehydrate);
         }
     }
 
@@ -248,22 +254,35 @@ mod tests {
     #[test]
     fn known_secrets_are_redacted_without_a_pattern() {
         let mut redactor = SecretRedactor::new()
-            .with_known("provider api key", "0123456789abcdef0123456789abcdef")
-            .with_known("too short", "short");
+            .with_known(
+                "provider api key",
+                "0123456789abcdef0123456789abcdef",
+                Class::RedactOnly,
+            )
+            .with_known("too short", "short", Class::RedactOnly);
         let (out, map) = redactor.redact("key=0123456789abcdef0123456789abcdef short");
         assert_eq!(out, "key=<<SECRET_1>> short");
         assert_eq!(map.len(), 1);
-        assert_eq!(redactor.kind_of("<<SECRET_1>>"), Some("provider api key"));
+        assert_eq!(map["<<SECRET_1>>"].kind, "provider api key");
+        assert_eq!(map["<<SECRET_1>>"].class, Class::RedactOnly);
+        // Never restored, whatever the caller asks.
+        assert_eq!(redactor.rehydrate(&out, &map), out);
+        let catalog = redactor.catalog();
+        assert_eq!(catalog.len(), PATTERNS.len() + 1);
+        assert_eq!(
+            catalog.last().unwrap(),
+            &("provider api key".to_string(), Class::RedactOnly)
+        );
     }
 
     #[test]
     fn every_placeholder_has_a_kind() {
         let mut redactor = SecretRedactor::new();
         let (_, map) = redactor.redact(&format!("{} and {}", SAMPLES[0], SAMPLES[4]));
-        assert_eq!(redactor.kind_of("<<SECRET_1>>"), Some("anthropic api key"));
-        assert_eq!(redactor.kind_of("<<SECRET_2>>"), Some("aws access key id"));
+        assert_eq!(map["<<SECRET_1>>"].kind, "anthropic api key");
+        assert_eq!(map["<<SECRET_2>>"].kind, "aws access key id");
         assert_eq!(map.len(), 2);
-        assert_eq!(redactor.kind_of("<<SECRET_3>>"), None);
+        assert!(!map.contains_key("<<SECRET_3>>"));
     }
 
     #[test]

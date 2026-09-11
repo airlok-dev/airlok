@@ -74,6 +74,7 @@ pub struct ConfigFile {
     pub agent: AgentSection,
     pub safety: SafetySection,
     pub context: ContextSection,
+    pub redact: RedactSection,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,6 +114,13 @@ pub struct SafetySection {
     pub bash_allowlist: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bash_denylist: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RedactSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_secrets_in_output: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -169,6 +177,12 @@ impl ConfigFile {
             context: ContextSection {
                 max_bytes: over.context.max_bytes.or(self.context.max_bytes),
             },
+            redact: RedactSection {
+                show_secrets_in_output: over
+                    .redact
+                    .show_secrets_in_output
+                    .or(self.redact.show_secrets_in_output),
+            },
         }
     }
 }
@@ -188,6 +202,7 @@ pub struct Config {
     pub agent: AgentConfig,
     pub safety: SafetyConfig,
     pub context: ContextConfig,
+    pub redact: RedactConfig,
     /// Directory the agent works in. Tools resolve relative paths against it.
     pub cwd: PathBuf,
 }
@@ -216,6 +231,14 @@ pub struct SafetyConfig {
     pub confirm_bash: bool,
     pub bash_allowlist: Vec<String>,
     pub bash_denylist: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RedactConfig {
+    /// Show secrets found in files and tool output in full in the terminal.
+    /// Off by default: they are masked to the first four characters and a
+    /// length. Never applies to redact-only entries such as the provider key.
+    pub show_secrets_in_output: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -338,6 +361,9 @@ impl Config {
             context: ContextConfig {
                 max_bytes: file.context.max_bytes.unwrap_or(DEFAULT_CONTEXT_MAX_BYTES),
             },
+            redact: RedactConfig {
+                show_secrets_in_output: file.redact.show_secrets_in_output.unwrap_or(false),
+            },
             cwd,
         }
     }
@@ -365,6 +391,9 @@ impl Config {
             },
             context: ContextSection {
                 max_bytes: Some(self.context.max_bytes),
+            },
+            redact: RedactSection {
+                show_secrets_in_output: Some(self.redact.show_secrets_in_output),
             },
         }
     }
@@ -485,6 +514,9 @@ pub const TEMPLATE: &str = r##"# airlok configuration. Precedence: CLI flags > .
 
 [context]
 # max_bytes = 32768         # cap on the context block (tree is cut first, then instructions)
+
+[redact]
+# show_secrets_in_output = false   # show secrets from files in full in the terminal instead of masked
 "##;
 
 #[cfg(test)]

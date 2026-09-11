@@ -46,6 +46,8 @@ pub enum Command {
     },
     /// Print the context block that would be sent with the system prompt, after redaction
     Context,
+    /// List the kinds of value the redactor detects and how each is treated
+    Redactions,
 }
 
 #[derive(Debug, Subcommand)]

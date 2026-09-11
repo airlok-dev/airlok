@@ -6,7 +6,6 @@
 //!
 //! TODO(stage N): compaction when history grows, subagents.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use airlok_llm::{
@@ -17,7 +16,9 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::redact::{split_incomplete_placeholder, RedactionMap, Redactor};
+use crate::redact::{
+    for_display, redact_only_in, split_incomplete_placeholder, RedactionMap, Redactor,
+};
 use crate::safety::{CommandVerdict, Confirmation, Decision};
 use crate::tools::{truncate_output, Plan, Tool, ToolError, ToolRegistry};
 use crate::{CoreError, Output};
@@ -34,22 +35,25 @@ pub struct Agent {
 /// What happened during one run.
 #[derive(Debug, Clone, Default)]
 pub struct RunReport {
-    /// Every placeholder issued during the run and the value it stood for.
+    /// Every placeholder issued during the run and what it stood for.
     pub redactions: RedactionMap,
-    /// Placeholder to the kind of value it stood for, for display.
-    pub kinds: BTreeMap<String, String>,
     /// Model round-trips made.
     pub turns: usize,
 }
 
 impl RunReport {
-    /// One line per redaction naming the kind and length, never the value.
+    /// One line per redaction naming the kind, length, and class, never
+    /// the value.
     pub fn redaction_lines(&self) -> Vec<String> {
         self.redactions
             .iter()
-            .map(|(placeholder, secret)| {
-                let kind = self.kinds.get(placeholder).map_or("secret", String::as_str);
-                format!("{placeholder}  {kind} ({} chars)", secret.chars().count())
+            .map(|(placeholder, entry)| {
+                format!(
+                    "{placeholder}  {} ({} chars, {})",
+                    entry.kind,
+                    entry.value.chars().count(),
+                    entry.class.as_str()
+                )
             })
             .collect()
     }
@@ -96,11 +100,6 @@ impl Agent {
             report.turns = turn;
             let (request, map) = self.build_request(&system, &history, &specs);
             let response = self.stream_response(request, &map, out).await?;
-            report.kinds = map
-                .keys()
-                .filter_map(|p| self.redactor.kind_of(p).map(|k| (p.clone(), k.to_string())))
-                .collect();
-            report.redactions = map;
             debug!(turn, stop_reason = ?response.stop_reason, "turn complete");
 
             let tool_calls: Vec<&ContentBlock> = response
@@ -110,10 +109,12 @@ impl Agent {
                 .collect();
             let wants_tools = response.stop_reason == StopReason::ToolUse && !tool_calls.is_empty();
             let results = if wants_tools {
-                self.execute_tools(&tool_calls, out, &mut approved).await?
+                self.execute_tools(&tool_calls, out, &mut approved, &map)
+                    .await?
             } else {
                 Vec::new()
             };
+            report.redactions = map;
             history.push(Message::assistant(response.content));
             if !wants_tools {
                 return Ok(report);
@@ -208,7 +209,7 @@ impl Agent {
                     unshown.push_str(&delta);
                     let (emit, keep) = split_incomplete_placeholder(&unshown);
                     if !emit.is_empty() {
-                        out.text(&self.redactor.rehydrate(emit, map));
+                        out.text(&self.display(emit, map));
                     }
                     unshown = keep.to_string();
                 }
@@ -239,7 +240,7 @@ impl Agent {
         content: &mut Vec<ContentBlock>,
     ) {
         if !unshown.is_empty() {
-            out.text(&self.redactor.rehydrate(unshown, map));
+            out.text(&self.display(unshown, map));
             unshown.clear();
         }
         if !text.is_empty() {
@@ -250,11 +251,18 @@ impl Agent {
         }
     }
 
+    /// Terminal text: redact-only placeholders become markers, detected
+    /// secrets are masked unless configured to show.
+    fn display(&self, text: &str, map: &RedactionMap) -> String {
+        for_display(text, map, self.config.redact.show_secrets_in_output)
+    }
+
     async fn execute_tools(
         &self,
         calls: &[&ContentBlock],
         out: &mut dyn Output,
         approved: &mut Approved,
+        map: &RedactionMap,
     ) -> Result<Vec<ContentBlock>, CoreError> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
@@ -264,7 +272,13 @@ impl Agent {
             let (content, is_error) = match self.tools.get(name) {
                 Some(tool) => {
                     out.tool_call(name, &tool.summary(input));
-                    self.run_tool(name, tool, input, out, approved).await?
+                    let forbidden = redact_only_in(&input.to_string(), map);
+                    if forbidden.is_empty() {
+                        self.run_tool(name, tool, input, out, approved).await?
+                    } else {
+                        warn!(tool = %name, "refused: redact-only placeholder in arguments");
+                        (refusal(&forbidden), true)
+                    }
                 }
                 None => {
                     warn!(tool = %name, "unknown tool requested");
@@ -374,6 +388,19 @@ impl Agent {
         };
         Ok(gate)
     }
+}
+
+/// The result sent back when a call would write or run a redact-only value.
+fn refusal(forbidden: &[(&str, &crate::redact::Entry)]) -> String {
+    let list: Vec<String> = forbidden
+        .iter()
+        .map(|(placeholder, entry)| format!("{placeholder} ({})", entry.kind))
+        .collect();
+    format!(
+        "Refused: the arguments contain {}, which must never be written to a file, passed to a command, \
+         or reproduced. Do not use it; explain what you needed instead.",
+        list.join(", ")
+    )
 }
 
 /// "Yes to all" state for one run, per kind of prompt.

@@ -1,3 +1,4 @@
+use airlok_core::redact::{mask, Class};
 use airlok_llm::{StopReason, StreamEvent};
 use airlok_tests::{agent, reply, tool_call, MockProvider, RecordingOutput, TempDir};
 use serde_json::json;
@@ -39,10 +40,13 @@ async fn api_key_read_from_a_file_never_reaches_the_provider() {
     let wire = serde_json::to_string(&provider.requests()[1]).unwrap();
     assert!(wire.contains("ANTHROPIC_API_KEY=<<SECRET_1>>"), "{wire}");
 
-    // The user sees the real value again.
-    assert_eq!(out.text(), format!("The key in .env is {KEY}."));
+    // The terminal shows it masked by default; files and commands get the value.
+    assert_eq!(out.text(), format!("The key in .env is {}.", mask(KEY)));
     assert_eq!(
-        report.redactions.get("<<SECRET_1>>").map(String::as_str),
+        report
+            .redactions
+            .get("<<SECRET_1>>")
+            .map(|e| e.value.as_str()),
         Some(KEY)
     );
 }
@@ -70,7 +74,7 @@ async fn placeholder_split_across_stream_chunks_is_rehydrated() {
         .await
         .unwrap();
 
-    assert_eq!(out.text(), format!("token: {KEY} done"));
+    assert_eq!(out.text(), format!("token: {} done", mask(KEY)));
 }
 
 #[tokio::test]
@@ -158,8 +162,11 @@ async fn redaction_listing_shows_only_kind_and_length() {
     let mut out = RecordingOutput::default();
     let config = airlok_core::Config::new(dir.path().to_path_buf());
     let tools = airlok_core::tools::ToolRegistry::defaults(dir.path(), config.agent.bash_timeout);
-    let redactor =
-        airlok_core::redact::SecretRedactor::new().with_known("the provider API key", azure_key);
+    let redactor = airlok_core::redact::SecretRedactor::new().with_known(
+        "the provider API key",
+        azure_key,
+        Class::RedactOnly,
+    );
     let mut agent = airlok_core::Agent::new(provider, tools, Box::new(redactor), config);
 
     let report = agent.run("read .env", &mut out).await.unwrap();
@@ -169,16 +176,19 @@ async fn redaction_listing_shows_only_kind_and_length() {
         lines,
         vec![
             format!(
-                "<<SECRET_1>>  the provider API key ({} chars)",
+                "<<SECRET_1>>  the provider API key ({} chars, redact-only)",
                 azure_key.len()
             ),
-            format!("<<SECRET_2>>  anthropic api key ({} chars)", KEY.len()),
-            "<<SECRET_3>>  aws access key id (20 chars)".to_string(),
+            format!(
+                "<<SECRET_2>>  anthropic api key ({} chars, rehydrate)",
+                KEY.len()
+            ),
+            "<<SECRET_3>>  aws access key id (20 chars, rehydrate)".to_string(),
         ]
     );
     for line in &lines {
-        for secret in report.redactions.values() {
-            for window in secret.as_bytes().windows(4) {
+        for entry in report.redactions.values() {
+            for window in entry.value.as_bytes().windows(4) {
                 let fragment = std::str::from_utf8(window).unwrap();
                 assert!(!line.contains(fragment), "{line:?} leaks {fragment:?}");
             }
@@ -270,5 +280,25 @@ async fn placeholder_split_across_chunks_inside_a_code_block_is_rehydrated() {
         .await
         .unwrap();
 
-    assert_eq!(out.text(), format!("Here it is:\n```env\nKEY={KEY}\n```\n"));
+    assert_eq!(
+        out.text(),
+        format!("Here it is:\n```env\nKEY={}\n```\n", mask(KEY))
+    );
+}
+
+#[tokio::test]
+async fn show_secrets_in_output_opts_into_full_display() {
+    let dir = TempDir::new("show");
+    std::fs::write(dir.path().join(".env"), format!("KEY={KEY}\n")).unwrap();
+    let provider = MockProvider::scripted(vec![
+        tool_call("toolu_1", "read_file", json!({"path": ".env"})),
+        reply("The key is <<SECRET_1>>."),
+    ]);
+    let mut out = RecordingOutput::default();
+    let mut agent = agent(provider, dir.path());
+    agent.config_mut().redact.show_secrets_in_output = true;
+
+    agent.run("show", &mut out).await.unwrap();
+
+    assert_eq!(out.text(), format!("The key is {KEY}."));
 }
