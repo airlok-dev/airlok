@@ -1,4 +1,5 @@
 mod args;
+mod keys;
 mod output;
 mod render;
 mod repl;
@@ -7,7 +8,7 @@ mod terminal;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use airlok_core::config::{self, KeySource, Overrides, ProviderConfig, ProviderName, Sources};
 use airlok_core::context::{self, ContextInput};
@@ -24,6 +25,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use args::{Args, Command, ConfigAction, SessionsAction};
+use keys::Keys;
 use output::Stdout;
 use terminal::Terminal;
 
@@ -249,7 +251,23 @@ async fn run_repl(
             }
         });
     }
-    let mut lines = repl::Readline::new().context("cannot start line editing")?;
+    // SIGTERM mid-turn would otherwise leave the terminal in cbreak mode.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("cannot listen for SIGTERM")?;
+    tokio::spawn(async move {
+        if sigterm.recv().await.is_some() {
+            keys::restore();
+            std::process::exit(143);
+        }
+    });
+    // Esc interrupts a turn; what else is typed during one starts the
+    // next prompt.
+    let typed = Arc::new(Mutex::new(Vec::new()));
+    match std::fs::File::open("/dev/tty") {
+        Ok(tty) => out.watch_keys(Keys::new(tty, interrupt.clone(), typed.clone())),
+        Err(e) => tracing::debug!(error = %e, "no terminal to watch for Esc"),
+    }
+    let mut lines = repl::Readline::new(typed).context("cannot start line editing")?;
     out.status(&startup_line(agent.config(), &notes));
     let backend = CliBackend {
         startup: agent.config().provider.clone(),

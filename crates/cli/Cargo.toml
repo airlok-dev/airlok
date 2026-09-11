@@ -17,6 +17,7 @@ airlok-core.workspace = true
 airlok-llm.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+libc.workspace = true
 rustyline.workspace = true
 syntect.workspace = true
 termimad.workspace = true
@@ -27,4 +28,4 @@ tracing-subscriber.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
-libc.workspace = true
+airlok-tests = { path = "../../tests" }

@@ -11,6 +11,7 @@ use std::time::Duration;
 use airlok_core::tools::READ_ONLY_TOOLS;
 use airlok_core::{Confirmation, Decision, Output};
 
+use crate::keys::{Cbreak, Keys};
 use crate::render::Renderer;
 use crate::status::{self, Screen};
 use crate::terminal::Terminal;
@@ -33,6 +34,9 @@ pub struct Stdout {
     collapsed: usize,
     screen: Arc<Mutex<Screen>>,
     ticker: Option<Ticker>,
+    /// Watches for Esc during turns; the REPL sets it. Lent to the ticker
+    /// thread while a turn runs.
+    keys: Option<Keys>,
 }
 
 impl Stdout {
@@ -67,7 +71,13 @@ impl Stdout {
             collapsed: 0,
             screen: Arc::new(Mutex::new(Screen::new(out, status_line, width))),
             ticker: None,
+            keys: None,
         }
+    }
+
+    /// Watch the terminal for Esc during turns.
+    pub fn watch_keys(&mut self, keys: Keys) {
+        self.keys = Some(keys);
     }
 
     fn screen(&self) -> MutexGuard<'_, Screen> {
@@ -106,14 +116,21 @@ impl Stdout {
     }
 
     fn start_ticker(&mut self) {
-        if self.ticker.is_none() && self.screen().enabled() {
-            self.ticker = Some(Ticker::start(self.screen.clone()));
+        if self.ticker.is_none() && (self.screen().enabled() || self.keys.is_some()) {
+            self.ticker = Some(Ticker::start(self.screen.clone(), self.keys.take()));
         }
     }
 
-    /// Stops redrawing; returns whether it was running.
+    /// Stops the ticker and takes the keys back; returns whether it was
+    /// running.
     fn stop_ticker(&mut self) -> bool {
-        self.ticker.take().map(Ticker::stop).is_some()
+        let Some(ticker) = self.ticker.take() else {
+            return false;
+        };
+        if let Some(keys) = ticker.stop() {
+            self.keys = Some(keys);
+        }
+        true
     }
 }
 
@@ -200,32 +217,41 @@ impl Output for Stdout {
     }
 }
 
-/// Redraws the status line on its own thread until stopped.
+/// The thread that runs during a turn. It redraws the status line and,
+/// in the REPL, reads keys with the terminal in cbreak mode.
 struct Ticker {
     stop: Arc<AtomicBool>,
-    thread: JoinHandle<()>,
+    thread: JoinHandle<Option<Keys>>,
 }
 
 impl Ticker {
-    fn start(screen: Arc<Mutex<Screen>>) -> Self {
+    fn start(screen: Arc<Mutex<Screen>>, keys: Option<Keys>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let stop = stop.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(TICK);
-                if stop.load(Ordering::Relaxed) {
-                    break;
+            std::thread::spawn(move || {
+                let mut keys = keys;
+                // Dropped as the thread returns, so `stop` finds the
+                // terminal back in its own mode.
+                let _cbreak = keys.as_ref().and_then(|k| Cbreak::enter(k.fd()).ok());
+                while !stop.load(Ordering::Relaxed) {
+                    match keys.as_mut() {
+                        Some(keys) => keys.poll(TICK),
+                        None => std::thread::sleep(TICK),
+                    }
+                    lock(&screen).tick();
                 }
-                lock(&screen).tick();
+                keys
             })
         };
         Self { stop, thread }
     }
 
-    /// Returns once the thread has finished, so nothing draws after it.
-    fn stop(self) {
+    /// Returns the keys once the thread has finished, so nothing reads
+    /// the terminal or draws after this.
+    fn stop(self) -> Option<Keys> {
         self.stop.store(true, Ordering::Relaxed);
-        let _ = self.thread.join();
+        self.thread.join().unwrap_or(None)
     }
 }
 
@@ -288,5 +314,65 @@ mod tests {
         assert!(quiet.contains("\x1b[2mread 2 files\x1b[0m\n"), "{quiet:?}");
         assert!(quiet.contains("\x1b[2m> bash: cargo test\x1b[0m\n"));
         assert!(quiet.contains("Then run the tests."));
+    }
+
+    #[test]
+    fn esc_cancels_a_streaming_turn_keeps_the_text_and_restores_the_terminal() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd;
+
+        use airlok_core::agent::INTERRUPTED_MARKER;
+        use airlok_core::Interrupt;
+        use airlok_llm::ContentBlock;
+        use airlok_tests::{agent, partial, MockProvider, TempDir};
+
+        use crate::keys::tests::{local_flags, mode, pty, serial};
+
+        let _serial = serial();
+        let (mut controller, terminal) = pty();
+        let fd = terminal.as_raw_fd();
+        let before = mode(fd);
+        let interrupt = Interrupt::new();
+        let sink = Sink::default();
+        let mut out = Stdout::with(Renderer::Plain, None, false, Box::new(sink.clone()), 80);
+        out.watch_keys(Keys::new(terminal, interrupt.clone(), Arc::default()));
+        let dir = TempDir::new("esc");
+        let provider = MockProvider::scripted(vec![partial("The answer is")]);
+        let mut agent = agent(provider, dir.path());
+        let mut session = agent.new_session();
+        let presser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            controller.write_all(b"\x1b").unwrap();
+            controller
+        });
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                out.begin_turn();
+                agent
+                    .turn_with(&mut session, "go", &mut out, &interrupt)
+                    .await
+                    .unwrap();
+                out.end_turn();
+            });
+        let _controller = presser.join().unwrap();
+
+        match &session.messages[1].content[0] {
+            ContentBlock::Text { text } => {
+                assert_eq!(text, &format!("The answer is\n{INTERRUPTED_MARKER}"));
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        assert_eq!(sink.contents(), "The answer is\ninterrupted\n");
+        let after = mode(fd);
+        assert_eq!(
+            local_flags(&after),
+            local_flags(&before),
+            "the terminal is back in its mode"
+        );
+        assert_eq!(after.c_oflag, before.c_oflag);
     }
 }
