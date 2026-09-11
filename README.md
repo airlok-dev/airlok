@@ -5,12 +5,16 @@ airlok is a terminal coding agent with one differentiator: it is a privacy airlo
 ## Install
 
 ```sh
-cargo install airlok
-# or
-npm install -g airlok
+curl -fsSL https://airlok.dev/install.sh | sh
 # or
 brew install airlok-dev/tap/airlok
+# or
+npm install -g airlok
+# or, built from source
+cargo install --git https://github.com/airlok-dev/airlok airlok --locked
 ```
+
+`install.sh` installs the latest release for macOS or Linux. It checks the release's installer against the sha256 digest GitHub publishes for it, then runs it; set `AIRLOK_NO_MODIFY_PATH=1` to leave your shell profile alone.
 
 ## Usage
 
