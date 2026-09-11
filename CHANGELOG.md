@@ -2,6 +2,20 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.3.0] - 2026-09-11
+
+### Added
+
+- Context injection (#5). The system prompt carries a block with the working directory, OS, shell, git branch, status and last five commits, a gitignore-aware file tree, and project instructions from `AIRLOK.md` (or `CLAUDE.md` / `AGENTS.md`) plus `~/.config/airlok/AIRLOK.md`. `[context] max_bytes` caps it; `airlok context` prints it after redaction.
+- Tools `glob`, `grep`, and `list_dir`, read-only and never prompting; `read_file` paging with `offset` and `limit` and binary refusal; tool results over 50 KiB are cut with a paging hint (#5).
+- Markdown rendering in the terminal with highlighted code, buffered per block; plain output when stdout is not a terminal or `NO_COLOR` is set; dimmed, collapsing tool-call lines (#5).
+- Confirmation prompt `[y]es / [n]o / [a]ll / [q]uit` with a one-time hint; `q` aborts the run with a non-zero exit (#5).
+
+### Changed
+
+- `edit_file` takes `old` and `new` and reports the match count when it cannot apply (#5).
+- The system prompt tells the model to search with grep and glob before reading files and to prefer `edit_file` over `write_file` for existing files (#5).
+
 ## [0.2.2] - 2026-09-11
 
 ### Fixed
