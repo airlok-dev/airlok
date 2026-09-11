@@ -15,8 +15,9 @@ use rustyline::hint::{Hint, Hinter};
 use rustyline::validate::Validator;
 use rustyline::{Context, Helper};
 
-/// Rows of the menu under the line.
-const MENU_ROWS: usize = 8;
+/// Rows of the menu under the line: enough for every command, so a bare
+/// `/` lists them all.
+const MENU_ROWS: usize = 12;
 /// Paths offered for one `@`.
 const PATH_MATCHES: usize = 10;
 /// Entries read from the working directory for `@`, at most.
@@ -339,6 +340,12 @@ mod tests {
         let (start, pairs) = prompt.candidates("/co", 3);
         assert_eq!(start, 0);
         assert_eq!(replacements(&pairs), ["/cost", "/compact", "/config"]);
+        let all = prompt.menu("/", 1).unwrap();
+        assert_eq!(
+            all.display().lines().count(),
+            1 + COMMANDS.len(),
+            "a bare / lists every command"
+        );
         assert!(prompt.menu("/model gpt", 10).is_none(), "not past the name");
         assert!(prompt.menu("/co", 1).is_none(), "cursor not at the end");
     }
