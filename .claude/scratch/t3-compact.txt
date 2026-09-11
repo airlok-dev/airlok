@@ -1,33 +1,0 @@
-What does crates/core/src/session/store.rs do? One sentence.
-warning: confirmations are off; writes and commands will run without asking
-[2mairlok 0.4.0 · gpt-5.6-luna · /help for commands, Ctrl-D to quit[0m
-[?2004h[?2026h[Kgpt-5.6-luna airlok> [21C[?2026lWhat does crates/core/src/session/store.rs do? One sentenc[?2026h[Kgpt-5.6-luna airlok> What does crates/core/src/session/store.rs do? One sentence
-[?2026l.[?2004l
-[2K[2mreading 1 file...[0m[2K[2mreading 2 files...[0m[2K[2mreading 3 files...[0m
-[48;5;237m[38;5;252mcrates/core/src/session/store.rs[49m[39m 
-implements secure on-disk session 
-storage, including saving, listing, 
-loading, deleting, cleaning up, and 
-ordering sessions by recency.
-[?2004h[?2026h[Kgpt-5.6-luna airlok> [21C[?2026lWhat file permissions does it use, and why?[?2004l
-It uses [1m0700[0m for session directories and
-[1m0600[0m for session files, so only the 
-current user can access the stored 
-conversation history and placeholder 
-values, which may contain sensitive 
-data; provider keys are never persisted.
-[?2004h[?2026h[Kgpt-5.6-luna airlok> [21C[?2026l/compact[?2004l
-[2mcompacted: 4k -> 1k tokens[0m
-[?2004h[?2026h[Kgpt-5.6-luna airlok> [21C[?2026lGiven what we discussed, name the file and the permission [?2026h[Kgpt-5.6-luna airlok> Given what we discussed, name the file and the permission m
-[?2026lode in one line.[?2004l
-[48;5;237m[38;5;252mcrates/core/src/session/store.rs[49m[39m — [48;5;237m[38;5;252m0700[49m[39m 
-for session directories and [48;5;237m[38;5;252m0600[49m[39m for 
-session files.
-[?2004h[?2026h[Kgpt-5.6-luna airlok> [21C[?2026l/cost[?2004l
-[2minput 14k tokens, output 220 tokens over 3 turn(s)[0m
-[2mcontext 1k of 200k tokens (0%)[0m
-[2mestimated at chars/4: the provider reported no usage for at least one request[0m
-[2mcompacted 1 time(s)[0m
-[?2004h[?2026h[Kgpt-5.6-luna airlok> [21C[?2026l[?2004l
-[2msession 3b278846 saved (3 turns); airlok --resume continues it[0m
-exit=0
