@@ -70,3 +70,12 @@ fn yes_passes_the_terminal_check() {
     assert!(stderr.contains("ANTHROPIC_API_KEY is not set"), "{stderr}");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn a_session_needs_a_terminal_on_stdin() {
+    let cwd = scratch("repl-no-tty");
+    let output = run_detached(&cwd, &["--yes"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stdin is not a terminal"), "{stderr}");
+}

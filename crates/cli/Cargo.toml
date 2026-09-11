@@ -17,6 +17,7 @@ airlok-core.workspace = true
 airlok-llm.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+rustyline.workspace = true
 syntect.workspace = true
 termimad.workspace = true
 tokio.workspace = true

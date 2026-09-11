@@ -45,6 +45,10 @@ path = "sessions.rs"
 name = "compaction"
 path = "compaction.rs"
 
+[[test]]
+name = "repl"
+path = "repl.rs"
+
 [dependencies]
 airlok-core.workspace = true
 airlok-llm.workspace = true

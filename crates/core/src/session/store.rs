@@ -92,7 +92,14 @@ impl SessionStore {
                 }
             })
             .collect();
-        summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        // updated_at has one-second resolution; the file's mtime breaks ties
+        // between sessions saved in the same second.
+        let mtime = |s: &Summary| fs::metadata(&s.path).and_then(|m| m.modified()).ok();
+        summaries.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| mtime(b).cmp(&mtime(a)))
+        });
         Ok(summaries)
     }
 

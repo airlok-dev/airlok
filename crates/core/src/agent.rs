@@ -17,6 +17,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::interrupt::{Interrupt, Watcher};
 use crate::redact::{
     for_display, redact_only_in, split_incomplete_placeholder, RedactionMap, Redactor,
 };
@@ -47,18 +48,22 @@ impl RunReport {
     /// One line per redaction naming the kind, length, and class, never
     /// the value.
     pub fn redaction_lines(&self) -> Vec<String> {
-        self.redactions
-            .iter()
-            .map(|(placeholder, entry)| {
-                format!(
-                    "{placeholder}  {} ({} chars, {})",
-                    entry.kind,
-                    entry.value.chars().count(),
-                    entry.class.as_str()
-                )
-            })
-            .collect()
+        redaction_lines(&self.redactions)
     }
+}
+
+/// One line per placeholder: kind, length, and class. Never the value.
+pub fn redaction_lines(map: &RedactionMap) -> Vec<String> {
+    map.iter()
+        .map(|(placeholder, entry)| {
+            format!(
+                "{placeholder}  {} ({} chars, {})",
+                entry.kind,
+                entry.value.chars().count(),
+                entry.class.as_str()
+            )
+        })
+        .collect()
 }
 
 impl Agent {
@@ -85,6 +90,16 @@ impl Agent {
 
     pub fn config_mut(&mut self) -> &mut Config {
         &mut self.config
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Swaps the redactor, for a fresh session that must not inherit the
+    /// old one's placeholders.
+    pub fn set_redactor(&mut self, redactor: Box<dyn Redactor>) {
+        self.redactor = redactor;
     }
 
     /// One task in a fresh session. Convenience over [`Agent::turn`].
@@ -114,6 +129,21 @@ impl Agent {
         prompt: &str,
         out: &mut dyn Output,
     ) -> Result<usize, CoreError> {
+        self.turn_with(session, prompt, out, &Interrupt::new())
+            .await
+    }
+
+    /// [`Agent::turn`] that stops when `interrupt` fires. The text streamed
+    /// so far is kept in the session, marked interrupted; pending tool
+    /// calls are dropped.
+    pub async fn turn_with(
+        &mut self,
+        session: &mut Session,
+        prompt: &str,
+        out: &mut dyn Output,
+        interrupt: &Interrupt,
+    ) -> Result<usize, CoreError> {
+        let mut watcher = interrupt.watcher();
         let threshold = self
             .config
             .agent
@@ -122,7 +152,7 @@ impl Agent {
             self.compact(session, out).await?;
         }
         let start = session.messages.len();
-        let result = self.rounds(session, prompt, out).await;
+        let result = self.rounds(session, prompt, out, &mut watcher).await;
         if result.is_err() {
             // A failed turn leaves no dangling user message for the next
             // turn (or a resume) to trip over.
@@ -154,7 +184,11 @@ impl Agent {
             request.estimated_tokens()
         };
         let mut silent = Silent;
-        let response = self.stream_response(request, &map, &mut silent).await?;
+        let mut never = Interrupt::new().watcher();
+        let response = self
+            .stream_response(request, &map, &mut silent, &mut never)
+            .await?
+            .response;
         let summary: String = response
             .content
             .iter()
@@ -205,6 +239,7 @@ impl Agent {
         session: &mut Session,
         prompt: &str,
         out: &mut dyn Output,
+        watcher: &mut Watcher,
     ) -> Result<usize, CoreError> {
         let system = system_prompt(&self.config, &self.context, session);
         let specs = self.tools.specs();
@@ -215,11 +250,21 @@ impl Agent {
         for round in 1..=self.config.agent.max_turns {
             let (request, map) = self.build_request(&system, &session.messages, &specs);
             let estimate = request.estimated_tokens();
-            let response = self.stream_response(request, &map, out).await?;
-            debug!(round, stop_reason = ?response.stop_reason, usage = ?response.usage, "round complete");
+            let streamed = self.stream_response(request, &map, out, watcher).await?;
+            let response = streamed.response;
+            debug!(round, stop_reason = ?response.stop_reason, usage = ?response.usage, interrupted = streamed.interrupted, "round complete");
             session
                 .usage
                 .record(response.usage, estimate, &response.content);
+            if streamed.interrupted {
+                return Ok(Self::interrupted(
+                    session,
+                    map,
+                    response.content,
+                    out,
+                    round,
+                ));
+            }
 
             let tool_calls: Vec<&ContentBlock> = response
                 .content
@@ -228,8 +273,13 @@ impl Agent {
                 .collect();
             let wants_tools = response.stop_reason == StopReason::ToolUse && !tool_calls.is_empty();
             let results = if wants_tools {
-                self.execute_tools(&tool_calls, out, &mut approved, &map)
-                    .await?
+                tokio::select! {
+                    biased;
+                    _ = watcher.triggered() => {
+                        return Ok(Self::interrupted(session, map, response.content, out, round));
+                    }
+                    results = self.execute_tools(&tool_calls, out, &mut approved, &map) => results?,
+                }
             } else {
                 Vec::new()
             };
@@ -309,6 +359,23 @@ impl Agent {
         }
     }
 
+    /// Ends a turn the user cut short: keeps the text so far with a marker,
+    /// drops any tool calls, and tells the user.
+    fn interrupted(
+        session: &mut Session,
+        map: RedactionMap,
+        content: Vec<ContentBlock>,
+        out: &mut dyn Output,
+        round: usize,
+    ) -> usize {
+        session.redactions = map;
+        session.messages.push(interrupted_message(content));
+        session.interrupted = true;
+        session.touch();
+        out.status("interrupted");
+        round
+    }
+
     /// Consumes the provider stream, printing text as it arrives and
     /// returning the rehydrated assistant turn.
     async fn stream_response(
@@ -316,15 +383,30 @@ impl Agent {
         request: Request,
         map: &RedactionMap,
         out: &mut dyn Output,
-    ) -> Result<Response, CoreError> {
+        watcher: &mut Watcher,
+    ) -> Result<Streamed, CoreError> {
         let mut content = Vec::new();
         let mut text = String::new();
         let mut unshown = String::new();
         let mut usage = None;
         let mut stream = self.provider.stream(request);
 
-        while let Some(event) = stream.next().await {
-            match event? {
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = watcher.triggered() => {
+                    self.flush_text(&mut text, &mut unshown, map, out, &mut content);
+                    return Ok(Streamed {
+                        response: Response { content, stop_reason: StopReason::EndTurn, usage },
+                        interrupted: true,
+                    });
+                }
+                event = stream.next() => match event {
+                    Some(event) => event?,
+                    None => break,
+                },
+            };
+            match event {
                 StreamEvent::TextDelta(delta) => {
                     text.push_str(&delta);
                     unshown.push_str(&delta);
@@ -343,10 +425,13 @@ impl Agent {
                 StreamEvent::Usage(reported) => usage = Some(reported),
                 StreamEvent::MessageEnd { stop_reason } => {
                     self.flush_text(&mut text, &mut unshown, map, out, &mut content);
-                    return Ok(Response {
-                        content,
-                        stop_reason,
-                        usage,
+                    return Ok(Streamed {
+                        response: Response {
+                            content,
+                            stop_reason,
+                            usage,
+                        },
+                        interrupted: false,
                     });
                 }
             }
@@ -573,6 +658,32 @@ const SUMMARY_SYSTEM: &str = "You are summarising a coding session so it can con
 
 const SUMMARY_INSTRUCTION: &str =
     "Summarise the conversation above for a continuation. Reply with the summary only.";
+
+/// One streamed reply, and whether the user cut it short.
+struct Streamed {
+    response: Response,
+    interrupted: bool,
+}
+
+pub const INTERRUPTED_MARKER: &str = "[interrupted by the user before the reply was complete]";
+
+/// The assistant message stored for a turn the user cut short: its text so
+/// far with a marker, and no tool calls, since nothing ran.
+fn interrupted_message(content: Vec<ContentBlock>) -> Message {
+    let mut text: String = content
+        .into_iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(INTERRUPTED_MARKER);
+    Message::assistant(vec![ContentBlock::Text { text }])
+}
 
 /// Swallows the summary stream; the user sees the status line instead.
 struct Silent;

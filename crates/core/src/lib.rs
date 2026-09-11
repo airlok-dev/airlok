@@ -6,13 +6,16 @@
 pub mod agent;
 pub mod config;
 pub mod context;
+pub mod interrupt;
 pub mod redact;
+pub mod repl;
 pub mod safety;
 pub mod session;
 pub mod tools;
 
 pub use agent::{Agent, RunReport};
 pub use config::{Config, ConfigError};
+pub use interrupt::Interrupt;
 pub use safety::{Confirmation, Decision};
 pub use session::{Session, SessionStore};
 
@@ -25,6 +28,8 @@ pub trait Output: Send {
     /// A one-line note about the run itself, such as a compaction. Shown
     /// dim, never part of the model's text.
     fn status(&mut self, line: &str);
+    /// The turn's text is complete; flush anything held back.
+    fn end_turn(&mut self) {}
     /// Ask the user before a write or a command. Only called when the
     /// configuration says to confirm.
     fn confirm(&mut self, request: &Confirmation<'_>) -> Decision;

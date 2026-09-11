@@ -1,18 +1,22 @@
 mod args;
 mod render;
+mod repl;
 mod terminal;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::sync::Arc;
 
 use airlok_core::config::{self, KeySource, Overrides, ProviderName, Sources};
 use airlok_core::context::{self, ContextInput};
 use airlok_core::redact::{Class, Redactor, SecretRedactor};
+use airlok_core::repl::Repl;
 use airlok_core::session::Summary;
 use airlok_core::tools::{ToolRegistry, READ_ONLY_TOOLS};
 use airlok_core::CoreError;
-use airlok_core::{Agent, Config, Confirmation, Decision, Output, RunReport, SessionStore};
+use airlok_core::{
+    Agent, Config, Confirmation, Decision, Interrupt, Output, RunReport, SessionStore,
+};
 use airlok_llm::openai::Auth;
 use airlok_llm::{Anthropic, OpenAi, Provider};
 use anyhow::{anyhow, bail, Context};
@@ -92,9 +96,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Sessions { action }) => return sessions_command(action, &store()?, &cwd),
         None => {}
     }
-    let Some(prompt) = args.prompt.clone() else {
-        bail!("missing prompt. Usage: airlok \"<task>\" (see airlok --help)");
-    };
+    let prompt = args.prompt.clone();
+    if prompt.is_none() && !std::io::stdin().is_terminal() {
+        bail!(
+            "no prompt given and stdin is not a terminal. \
+             Usage: airlok \"<task>\" for one task, or airlok in a terminal for a session"
+        );
+    }
 
     let prompting = config.safety.confirm_writes || config.safety.confirm_bash;
     let terminal = if prompting {
@@ -147,6 +155,9 @@ async fn main() -> anyhow::Result<()> {
         None => agent.new_session(),
     };
     let mut out = Stdout::new(terminal, args.verbose);
+    let Some(prompt) = prompt else {
+        return run_repl(agent, session, &store, key, &mut out).await;
+    };
     let result = agent.turn(&mut session, &prompt, &mut out).await;
     out.finish();
     if let Err(e) = store.save(&session) {
@@ -167,6 +178,54 @@ async fn main() -> anyhow::Result<()> {
             turns,
         });
     }
+    Ok(())
+}
+
+/// The interactive session. Ctrl-C during a turn cancels it; at the
+/// prompt, rustyline reports it and the loop stays up.
+async fn run_repl(
+    mut agent: Agent,
+    session: airlok_core::Session,
+    store: &SessionStore,
+    key: String,
+    out: &mut Stdout,
+) -> anyhow::Result<()> {
+    let interrupt = Interrupt::new();
+    {
+        let interrupt = interrupt.clone();
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .context("cannot listen for Ctrl-C")?;
+        tokio::spawn(async move {
+            while sigint.recv().await.is_some() {
+                interrupt.trigger();
+            }
+        });
+    }
+    let mut lines = repl::Readline::new().context("cannot start line editing")?;
+    out.status(&format!(
+        "airlok {} · {} · /help for commands, Ctrl-D to quit",
+        env!("CARGO_PKG_VERSION"),
+        agent.config().provider.model
+    ));
+    let mut repl = Repl {
+        agent: &mut agent,
+        store: Some(store),
+        interrupt,
+        new_redactor: Box::new(move || {
+            Box::new(SecretRedactor::new().with_known(
+                "the provider API key",
+                &key,
+                Class::RedactOnly,
+            ))
+        }),
+    };
+    let session = repl.run(session, &mut lines, out).await;
+    out.finish();
+    out.status(&format!(
+        "session {} saved ({} turns); airlok --resume continues it",
+        session.id,
+        session.turns()
+    ));
     Ok(())
 }
 
@@ -377,6 +436,10 @@ impl Output for Stdout {
             format!("{line}\n")
         };
         self.write(&text);
+    }
+
+    fn end_turn(&mut self) {
+        self.finish();
     }
 
     fn text(&mut self, chunk: &str) {
