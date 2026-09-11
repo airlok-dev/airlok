@@ -333,6 +333,11 @@ impl Agent {
             system,
             messages,
             tools: specs.to_vec(),
+            reasoning_effort: self
+                .config
+                .models
+                .get(&self.config.provider.model)
+                .and_then(|m| m.reasoning_effort.clone()),
         };
         (request, map)
     }

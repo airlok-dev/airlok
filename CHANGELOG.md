@@ -2,6 +2,12 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [Unreleased]
+
+### Added
+
+- `[models."<id>"]` config sections with `reasoning_effort`, sent by the openai provider only for that model id. Azure's `gpt-6-astra` needs `reasoning_effort = "none"` to use tools on Chat Completions; when a provider rejects its reasoning effort, airlok names the setting to add. `/model` shows the configured effort.
+
 ## [0.4.1] - 2026-09-11
 
 ### Added

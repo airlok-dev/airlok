@@ -172,7 +172,13 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("aborted");
             std::process::exit(1);
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            if let Some(hint) = e.hint(&agent.config().provider.model) {
+                eprintln!("Error: {e}\n{hint}");
+                std::process::exit(1);
+            }
+            return Err(e.into());
+        }
     };
 
     if args.show_redactions {
