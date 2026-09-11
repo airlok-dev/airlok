@@ -27,7 +27,7 @@ async fn rejected_write_leaves_the_file_untouched_and_tells_the_model() {
         tool_call(
             "toolu_2",
             "edit_file",
-            json!({"path": "notes.md", "search": "original", "replace": "edited"}),
+            json!({"path": "notes.md", "old": "original", "new": "edited"}),
         ),
         reply("understood"),
     ]);
@@ -78,7 +78,7 @@ async fn approved_edit_is_applied() {
         tool_call(
             "toolu_1",
             "edit_file",
-            json!({"path": "a.txt", "search": "two", "replace": "2"}),
+            json!({"path": "a.txt", "old": "two", "new": "2"}),
         ),
         reply("done"),
     ]);
@@ -104,7 +104,7 @@ async fn ambiguous_edit_is_reported_before_any_prompt() {
         tool_call(
             "toolu_1",
             "edit_file",
-            json!({"path": "a.txt", "search": "x", "replace": "y"}),
+            json!({"path": "a.txt", "old": "x", "new": "y"}),
         ),
         reply("ok"),
     ]);
@@ -117,7 +117,7 @@ async fn ambiguous_edit_is_reported_before_any_prompt() {
 
     let (content, is_error) = result_after(&provider, 1);
     assert!(is_error);
-    assert!(content.contains("matches 2 times"), "{content}");
+    assert!(content.contains("found 2 matches"), "{content}");
     assert!(!out
         .events
         .iter()

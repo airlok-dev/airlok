@@ -22,25 +22,27 @@ impl EditFile {
         let old = tokio::fs::read_to_string(&path).await?;
         let new = apply_edit(
             &old,
-            required_str(input, "search")?,
-            required_str(input, "replace")?,
+            required_str(input, "old")?,
+            required_str(input, "new")?,
         )?;
         Ok((path, old, new))
     }
 }
 
-/// Replaces `search` with `replace` when it occurs exactly once.
-pub fn apply_edit(old: &str, search: &str, replace: &str) -> Result<String, ToolError> {
-    if search.is_empty() {
-        return Err(ToolError::InvalidInput("search text is empty".into()));
+/// Replaces `old` with `new` when `old` occurs exactly once.
+pub fn apply_edit(text: &str, old: &str, new: &str) -> Result<String, ToolError> {
+    if old.is_empty() {
+        return Err(ToolError::InvalidInput("`old` is empty".into()));
     }
-    match old.matches(search).count() {
-        0 => Err(ToolError::InvalidInput(
-            "search text not found in the file".into(),
-        )),
-        1 => Ok(old.replacen(search, replace, 1)),
+    match text.matches(old).count() {
+        1 => Ok(text.replacen(old, new, 1)),
         n => Err(ToolError::InvalidInput(format!(
-            "search text matches {n} times; include more surrounding context so it matches once"
+            "found {n} matches for `old`, need exactly 1{}",
+            if n == 0 {
+                "; check the exact text, including whitespace"
+            } else {
+                "; include more surrounding context so it is unique"
+            }
         ))),
     }
 }
@@ -52,8 +54,9 @@ impl Tool for EditFile {
     }
 
     fn description(&self) -> &str {
-        "Replace one exact occurrence of `search` with `replace` in a text file. \
-         `search` must match exactly once; include enough context to make it unique."
+        "Replace one exact occurrence of `old` with `new` in an existing text file. \
+         `old` must match exactly once; include enough surrounding context to make it unique. \
+         Prefer this over write_file for changes to existing files."
     }
 
     fn schema(&self) -> Value {
@@ -61,10 +64,10 @@ impl Tool for EditFile {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path of the file to edit" },
-                "search": { "type": "string", "description": "Exact text to find, occurring once" },
-                "replace": { "type": "string", "description": "Text to put in its place" }
+                "old": { "type": "string", "description": "Exact text to find, occurring once" },
+                "new": { "type": "string", "description": "Text to put in its place" }
             },
-            "required": ["path", "search", "replace"]
+            "required": ["path", "old", "new"]
         })
     }
 
@@ -93,9 +96,9 @@ mod tests {
     fn edit_must_match_exactly_once() {
         assert_eq!(apply_edit("a b a", "b", "c").unwrap(), "a c a");
         let err = apply_edit("a b a", "a", "c").unwrap_err().to_string();
-        assert!(err.contains("matches 2 times"), "{err}");
+        assert!(err.contains("found 2 matches"), "{err}");
         let err = apply_edit("a b a", "z", "c").unwrap_err().to_string();
-        assert!(err.contains("not found"), "{err}");
+        assert!(err.contains("found 0 matches"), "{err}");
         assert!(apply_edit("a", "", "c").is_err());
     }
 

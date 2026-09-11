@@ -1,9 +1,10 @@
 //! Tools the model may call.
-//!
-//! TODO(stage N): glob and grep tools.
 
 pub mod bash;
 pub mod edit;
+pub mod glob;
+pub mod grep;
+pub mod list_dir;
 pub mod read;
 pub mod write;
 
@@ -16,8 +17,34 @@ use serde_json::Value;
 
 pub use bash::Bash;
 pub use edit::EditFile;
+pub use glob::Glob;
+pub use grep::Grep;
+pub use list_dir::ListDir;
 pub use read::ReadFile;
 pub use write::WriteFile;
+
+/// Tools that never change anything and never ask for confirmation.
+pub const READ_ONLY_TOOLS: &[&str] = &["read_file", "glob", "grep", "list_dir"];
+
+/// Largest tool result passed to the model before it is cut.
+pub const MAX_TOOL_OUTPUT: usize = 50 * 1024;
+
+/// Cuts an oversized result and tells the model how to page instead.
+pub fn truncate_output(output: String) -> String {
+    if output.len() <= MAX_TOOL_OUTPUT {
+        return output;
+    }
+    let mut cut = MAX_TOOL_OUTPUT;
+    while !output.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}\n[output truncated: showing {cut} of {} bytes. For files, call read_file with `offset` and `limit` \
+         to page through the rest; for searches, narrow the pattern, path, or include.]\n",
+        &output[..cut],
+        output.len()
+    )
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -66,12 +93,15 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// The built-in tool set: read_file, write_file, edit_file, bash.
+    /// The built-in tool set.
     pub fn defaults(cwd: &Path, bash_timeout: Duration) -> Self {
         Self::new()
             .with(ReadFile::new(cwd))
             .with(WriteFile::new(cwd))
             .with(EditFile::new(cwd))
+            .with(Glob::new(cwd))
+            .with(Grep::new(cwd))
+            .with(ListDir::new(cwd))
             .with(Bash::new(cwd, bash_timeout))
     }
 
@@ -109,6 +139,30 @@ fn required_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolError> {
 /// Resolves a model-supplied path against the working directory.
 fn resolve(cwd: &Path, path: &str) -> PathBuf {
     cwd.join(path)
+}
+
+/// Files and directories under `root` as (relative path, is_dir), sorted,
+/// respecting .gitignore, including dotfiles but never `.git`.
+fn walk(root: &Path, max_depth: Option<usize>) -> Vec<(PathBuf, bool)> {
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .max_depth(max_depth)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(|e| e.file_name() != ".git")
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.depth() > 0)
+        .map(|e| {
+            let is_dir = e.file_type().is_some_and(|t| t.is_dir());
+            (
+                e.path()
+                    .strip_prefix(root)
+                    .unwrap_or(e.path())
+                    .to_path_buf(),
+                is_dir,
+            )
+        })
+        .collect()
 }
 
 /// Plain unified diff with `a/` and `b/` headers, three lines of context.

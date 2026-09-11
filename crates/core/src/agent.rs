@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::redact::{split_incomplete_placeholder, RedactionMap, Redactor};
 use crate::safety::{CommandVerdict, Confirmation, Decision};
-use crate::tools::{Plan, Tool, ToolError, ToolRegistry};
+use crate::tools::{truncate_output, Plan, Tool, ToolError, ToolRegistry};
 use crate::{CoreError, Output};
 
 pub struct Agent {
@@ -294,7 +294,7 @@ impl Agent {
             Ok(Gate::Proceed) => {
                 info!(tool = %name, "executing");
                 match tool.execute(input.clone()).await {
-                    Ok(output) => (output, false),
+                    Ok(output) => (truncate_output(output), false),
                     Err(e) => {
                         warn!(tool = %name, error = %e, "tool failed");
                         (format!("error: {e}"), true)
@@ -389,7 +389,10 @@ fn system_prompt(config: &Config, context: &str) -> String {
          Complete the user's task using the available tools, then reply with a short summary of what you did. \
          Some values in files and command output are replaced with placeholders that look like <<SECRET_1>>. \
          Treat them as opaque strings: reproduce them exactly as given whenever they must appear in a file, \
-         a command, or your reply, and never invent or alter them.",
+         a command, or your reply, and never invent or alter them. \
+         Find things with grep and glob before reading files; do not read files speculatively, and page \
+         large files with read_file's offset and limit. Change existing files with edit_file; use write_file \
+         only for new files or complete rewrites.",
         cwd = config.cwd.display()
     );
     if !context.is_empty() {

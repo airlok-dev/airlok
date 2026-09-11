@@ -61,7 +61,7 @@ async fn runs_tool_calls_until_the_model_stops() {
             is_error: false,
         }]
     );
-    assert_eq!(requests[0].tools.len(), 4);
+    assert_eq!(requests[0].tools.len(), 7);
 }
 
 #[tokio::test]

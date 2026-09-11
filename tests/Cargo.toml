@@ -29,6 +29,10 @@ path = "safety.rs"
 name = "context"
 path = "context.rs"
 
+[[test]]
+name = "tools"
+path = "tools.rs"
+
 [dependencies]
 airlok-core.workspace = true
 airlok-llm.workspace = true
