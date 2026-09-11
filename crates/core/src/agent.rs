@@ -4,8 +4,7 @@
 //! at send time, and every response is rehydrated before it is stored or
 //! acted on. The provider only ever sees placeholders.
 //!
-//! TODO(stage N): context injection (repo map, instructions file),
-//! compaction when history grows, subagents.
+//! TODO(stage N): compaction when history grows, subagents.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -20,7 +19,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::redact::{split_incomplete_placeholder, RedactionMap, Redactor};
 use crate::safety::{CommandVerdict, Confirmation, Decision};
-use crate::tools::{Plan, Tool, ToolError, ToolRegistry};
+use crate::tools::{truncate_output, Plan, Tool, ToolError, ToolRegistry};
 use crate::{CoreError, Output};
 
 pub struct Agent {
@@ -28,6 +27,8 @@ pub struct Agent {
     tools: ToolRegistry,
     redactor: Box<dyn Redactor>,
     config: Config,
+    /// Rendered `core::context` block, appended to the system prompt.
+    context: String,
 }
 
 /// What happened during one run.
@@ -66,7 +67,14 @@ impl Agent {
             tools,
             redactor,
             config,
+            context: String::new(),
         }
+    }
+
+    /// Sets the context block built by [`crate::context::build`].
+    pub fn with_context(mut self, context: String) -> Self {
+        self.context = context;
+        self
     }
 
     pub fn config_mut(&mut self) -> &mut Config {
@@ -78,7 +86,7 @@ impl Agent {
         prompt: &str,
         out: &mut dyn Output,
     ) -> Result<RunReport, CoreError> {
-        let system = system_prompt(&self.config);
+        let system = system_prompt(&self.config, &self.context);
         let specs = self.tools.specs();
         let mut history = vec![Message::user_text(prompt)];
         let mut report = RunReport::default();
@@ -102,7 +110,7 @@ impl Agent {
                 .collect();
             let wants_tools = response.stop_reason == StopReason::ToolUse && !tool_calls.is_empty();
             let results = if wants_tools {
-                self.execute_tools(&tool_calls, out, &mut approved).await
+                self.execute_tools(&tool_calls, out, &mut approved).await?
             } else {
                 Vec::new()
             };
@@ -247,7 +255,7 @@ impl Agent {
         calls: &[&ContentBlock],
         out: &mut dyn Output,
         approved: &mut Approved,
-    ) -> Vec<ContentBlock> {
+    ) -> Result<Vec<ContentBlock>, CoreError> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
             let ContentBlock::ToolUse { id, name, input } = call else {
@@ -256,7 +264,7 @@ impl Agent {
             let (content, is_error) = match self.tools.get(name) {
                 Some(tool) => {
                     out.tool_call(name, &tool.summary(input));
-                    self.run_tool(name, tool, input, out, approved).await
+                    self.run_tool(name, tool, input, out, approved).await?
                 }
                 None => {
                     warn!(tool = %name, "unknown tool requested");
@@ -270,7 +278,7 @@ impl Agent {
                 is_error,
             });
         }
-        results
+        Ok(results)
     }
 
     /// Plans, asks if the policy says so, then executes.
@@ -281,12 +289,12 @@ impl Agent {
         input: &Value,
         out: &mut dyn Output,
         approved: &mut Approved,
-    ) -> (String, bool) {
-        match self.gate(tool, input, out, approved).await {
+    ) -> Result<(String, bool), CoreError> {
+        Ok(match self.gate(tool, input, out, approved).await {
             Ok(Gate::Proceed) => {
                 info!(tool = %name, "executing");
                 match tool.execute(input.clone()).await {
-                    Ok(output) => (output, false),
+                    Ok(output) => (truncate_output(output), false),
                     Err(e) => {
                         warn!(tool = %name, error = %e, "tool failed");
                         (format!("error: {e}"), true)
@@ -297,11 +305,15 @@ impl Agent {
                 info!(tool = %name, "not executed");
                 (reason, true)
             }
+            Ok(Gate::Abort) => {
+                info!(tool = %name, "run aborted by the user");
+                return Err(CoreError::Aborted);
+            }
             Err(e) => {
                 warn!(tool = %name, error = %e, "tool could not be planned");
                 (format!("error: {e}"), true)
             }
-        }
+        })
     }
 
     async fn gate(
@@ -332,6 +344,7 @@ impl Agent {
                          explain what you intended or propose a different approach.",
                         path.display()
                     )),
+                    Decision::Quit => Gate::Abort,
                 }
             }
             Plan::Command { command } => match safety.classify(&command) {
@@ -354,6 +367,7 @@ impl Agent {
                             "The user declined to run `{command}`. Do not retry it unchanged; \
                              explain what you intended or propose a different approach."
                         )),
+                        Decision::Quit => Gate::Abort,
                     }
                 }
             },
@@ -373,17 +387,27 @@ enum Gate {
     Proceed,
     /// Not executed; the string goes back to the model as an error result.
     Stop(String),
+    /// The user quit; the run ends without another provider call.
+    Abort,
 }
 
-fn system_prompt(config: &Config) -> String {
-    format!(
+fn system_prompt(config: &Config, context: &str) -> String {
+    let mut prompt = format!(
         "You are airlok, a coding agent working in the directory {cwd}. \
          Complete the user's task using the available tools, then reply with a short summary of what you did. \
          Some values in files and command output are replaced with placeholders that look like <<SECRET_1>>. \
          Treat them as opaque strings: reproduce them exactly as given whenever they must appear in a file, \
-         a command, or your reply, and never invent or alter them.",
+         a command, or your reply, and never invent or alter them. \
+         Find things with grep and glob before reading files; do not read files speculatively, and page \
+         large files with read_file's offset and limit. Change existing files with edit_file; use write_file \
+         only for new files or complete rewrites.",
         cwd = config.cwd.display()
-    )
+    );
+    if !context.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(context);
+    }
+    prompt
 }
 
 /// Applies `f` to every string leaf of a JSON value, in place.

@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod context;
 pub mod redact;
 pub mod safety;
 pub mod session;
@@ -31,4 +32,6 @@ pub enum CoreError {
     Llm(#[from] airlok_llm::LlmError),
     #[error("agent stopped after {0} turns without finishing")]
     TurnLimit(usize),
+    #[error("run aborted by the user at a confirmation prompt")]
+    Aborted,
 }

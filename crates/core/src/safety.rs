@@ -28,6 +28,8 @@ pub enum Decision {
     Reject,
     /// Approve this and every later prompt of the same kind in this run.
     ApproveAll,
+    /// Stop the whole run now. Nothing further is sent to the provider.
+    Quit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

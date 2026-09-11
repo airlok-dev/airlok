@@ -11,6 +11,7 @@ use airlok_core::Decision;
 pub struct Terminal {
     reader: BufReader<File>,
     writer: File,
+    hinted: bool,
 }
 
 impl Terminal {
@@ -18,7 +19,11 @@ impl Terminal {
     pub fn open() -> std::io::Result<Self> {
         let writer = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
         let reader = BufReader::new(writer.try_clone()?);
-        Ok(Self { reader, writer })
+        Ok(Self {
+            reader,
+            writer,
+            hinted: false,
+        })
     }
 
     pub fn show_diff(&mut self, diff: &str) {
@@ -38,9 +43,17 @@ impl Terminal {
     }
 
     /// Prints `question` and reads one line: `y`/`yes` approves, `a`/`all`
-    /// approves everything of this kind, anything else rejects.
+    /// approves everything of this kind, `q`/`quit` ends the run, anything
+    /// else rejects. The first prompt of the run explains `a`.
     pub fn ask(&mut self, question: &str) -> Decision {
-        let _ = write!(self.writer, "{question} [y/N/a] ");
+        if !self.hinted {
+            self.hinted = true;
+            let _ = writeln!(
+                self.writer,
+                "\x1b[2m(a = approve everything for this run)\x1b[0m"
+            );
+        }
+        let _ = write!(self.writer, "{question} [y]es / [n]o / [a]ll / [q]uit ");
         let _ = self.writer.flush();
         let mut answer = String::new();
         if self.reader.read_line(&mut answer).is_err() {
@@ -49,6 +62,7 @@ impl Terminal {
         match answer.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" => Decision::Approve,
             "a" | "all" => Decision::ApproveAll,
+            "q" | "quit" => Decision::Quit,
             _ => Decision::Reject,
         }
     }

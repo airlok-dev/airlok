@@ -22,9 +22,42 @@ airlok --provider openai --model gpt-5.5 "..." # override the provider and model
 airlok --show-redactions "..."                 # list what was redacted (kind and length only)
 airlok config init                             # write a commented config to the user path
 airlok config show                             # print the effective config and the key source
+airlok context                                 # print the context block sent with the system prompt, after redaction
 ```
 
-Every `write_file` and `edit_file` call shows a unified diff and asks `Apply? [y/N/a]`. Every `bash` call that is not on the allow list shows the command and asks `Run? [y/N/a]`. `a` approves the rest of that kind for the run. A rejection is sent back to the model so it can adapt. Prompts are read from the terminal, not stdin, so piped input still works; without a terminal, pass `--yes` or turn the confirmations off in the config.
+Every `write_file` and `edit_file` call shows a unified diff and asks `Apply? [y]es / [n]o / [a]ll / [q]uit`. Every `bash` call that is not on the allow list shows the command and asks the same way. `y` applies this one, `n` sends a rejection back to the model so it can adapt, `a` approves the rest of that kind for the run, and `q` aborts the run with a non-zero exit. Prompts are read from the terminal, not stdin, so piped input still works; without a terminal, pass `--yes` or turn the confirmations off in the config.
+
+Model output is rendered as markdown (headings, emphasis, lists, tables, highlighted code) when stdout is a terminal; set `NO_COLOR` or redirect stdout for plain text. Runs of read-only tool calls collapse to one `reading N files...` line; `-v` shows every call.
+
+## Tools
+
+| Tool | Asks? | What it does |
+|---|---|---|
+| `read_file(path, offset?, limit?)` | no | Read a text file, optionally a window of lines. Binary files are refused. |
+| `glob(pattern, path?)` | no | List files matching a glob, gitignore-aware, at most 500. |
+| `grep(pattern, path?, include?)` | no | Regex search returning `file:line:text`, gitignore-aware, at most 200 lines. |
+| `list_dir(path)` | no | Entries with type and size. |
+| `edit_file(path, old, new)` | diff | Replace `old` with `new`; `old` must occur exactly once, otherwise the model is told how many matches there were. |
+| `write_file(path, content)` | diff | Create or overwrite a file. |
+| `bash(command)` | unless allow-listed | Run a shell command in the working directory. |
+
+Tool results over 50 KiB are cut with a marker telling the model to page with `read_file`'s `offset` and `limit`.
+
+## Context and AIRLOK.md
+
+Every run starts with a context block in the system prompt: the working directory, OS and shell, the git branch with `git status --short` and the last five commit subjects, a gitignore-aware file tree (four levels, at most 200 entries), and project instructions. Instructions come from `AIRLOK.md` in the repository root, or `CLAUDE.md` or `AGENTS.md` if there is no `AIRLOK.md`, followed by `~/.config/airlok/AIRLOK.md`. The block goes through the redactor like everything else, and `airlok context` prints exactly what would be sent.
+
+A short `AIRLOK.md`:
+
+```markdown
+# airlok instructions
+
+- Run `cargo test --workspace` before saying a change is done.
+- Never touch files under `vendor/`.
+- Commit messages: imperative subject, no trailing period.
+```
+
+`[context] max_bytes` (default 32768) caps the block; the tree is cut to top-level directories first, then the instructions are truncated.
 
 ## Configuration
 
@@ -50,6 +83,9 @@ confirm_writes = true    # show a diff and ask before write_file / edit_file
 confirm_bash = true      # ask before running a command that is not allow-listed
 bash_allowlist = ["git status", "git diff", "ls", "cat", "pwd", "find", "grep", "rg", "cargo check", "cargo test", "cargo build"]
 bash_denylist = ["rm -rf", "git push --force", "sudo"]
+
+[context]
+max_bytes = 32768        # cap on the context block; tree is cut first, then instructions
 ```
 
 For openai, `base_url` falls back to the `OPENAI_BASE_URL` environment variable when the config does not set it.

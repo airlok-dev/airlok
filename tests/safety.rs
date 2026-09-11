@@ -27,7 +27,7 @@ async fn rejected_write_leaves_the_file_untouched_and_tells_the_model() {
         tool_call(
             "toolu_2",
             "edit_file",
-            json!({"path": "notes.md", "search": "original", "replace": "edited"}),
+            json!({"path": "notes.md", "old": "original", "new": "edited"}),
         ),
         reply("understood"),
     ]);
@@ -78,7 +78,7 @@ async fn approved_edit_is_applied() {
         tool_call(
             "toolu_1",
             "edit_file",
-            json!({"path": "a.txt", "search": "two", "replace": "2"}),
+            json!({"path": "a.txt", "old": "two", "new": "2"}),
         ),
         reply("done"),
     ]);
@@ -104,7 +104,7 @@ async fn ambiguous_edit_is_reported_before_any_prompt() {
         tool_call(
             "toolu_1",
             "edit_file",
-            json!({"path": "a.txt", "search": "x", "replace": "y"}),
+            json!({"path": "a.txt", "old": "x", "new": "y"}),
         ),
         reply("ok"),
     ]);
@@ -117,7 +117,7 @@ async fn ambiguous_edit_is_reported_before_any_prompt() {
 
     let (content, is_error) = result_after(&provider, 1);
     assert!(is_error);
-    assert!(content.contains("matches 2 times"), "{content}");
+    assert!(content.contains("found 2 matches"), "{content}");
     assert!(!out
         .events
         .iter()
@@ -267,4 +267,31 @@ async fn confirmations_off_never_prompt() {
     assert!(dir.path().join("a.txt").exists());
     assert!(dir.path().join("c.txt").exists());
     assert_eq!(out.decisions.len(), 2);
+}
+
+#[tokio::test]
+async fn quit_aborts_the_run_before_anything_else_happens() {
+    let dir = TempDir::new("quit");
+    std::fs::write(dir.path().join("a.txt"), "keep\n").unwrap();
+    let provider = MockProvider::scripted(vec![
+        tool_call(
+            "toolu_1",
+            "write_file",
+            json!({"path": "a.txt", "content": "clobbered\n"}),
+        ),
+        reply("never reached"),
+    ]);
+    let mut out = RecordingOutput::answering(vec![Decision::Quit]);
+
+    let err = agent(provider.clone(), dir.path())
+        .run("go", &mut out)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, airlok_core::CoreError::Aborted), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "keep\n"
+    );
+    assert_eq!(provider.requests().len(), 1, "no request after the abort");
 }

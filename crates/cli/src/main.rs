@@ -1,4 +1,5 @@
 mod args;
+mod render;
 mod terminal;
 
 use std::io::Write;
@@ -6,8 +7,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use airlok_core::config::{self, KeySource, Overrides, ProviderName, Sources};
-use airlok_core::redact::SecretRedactor;
-use airlok_core::tools::ToolRegistry;
+use airlok_core::context::{self, ContextInput};
+use airlok_core::redact::{Redactor, SecretRedactor};
+use airlok_core::tools::{ToolRegistry, READ_ONLY_TOOLS};
+use airlok_core::CoreError;
 use airlok_core::{Agent, Config, Confirmation, Decision, Output, RunReport};
 use airlok_llm::openai::Auth;
 use airlok_llm::{Anthropic, OpenAi, Provider};
@@ -16,6 +19,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use args::{Args, Command, ConfigAction};
+use render::Renderer;
 use terminal::Terminal;
 
 #[tokio::main]
@@ -45,6 +49,16 @@ async fn main() -> anyhow::Result<()> {
         cwd.clone(),
     )?;
 
+    let user_instructions = user_path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|dir| dir.join("AIRLOK.md"));
+    let context = context::build(&ContextInput {
+        cwd: &cwd,
+        user_instructions: user_instructions.as_deref(),
+        max_bytes: config.context.max_bytes,
+    });
+
     match args.command {
         Some(Command::Config {
             action: ConfigAction::Init,
@@ -52,6 +66,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Config {
             action: ConfigAction::Show,
         }) => return config_show(&config, &sources),
+        Some(Command::Context) => {
+            // What leaves the machine: the block after redaction. The
+            // provider key is not resolved here, so it is not in the map.
+            let (redacted, _) = SecretRedactor::new().redact(&context.text);
+            print!("{redacted}");
+            return Ok(());
+        }
         None => {}
     }
     let Some(prompt) = args.prompt else {
@@ -80,13 +101,19 @@ async fn main() -> anyhow::Result<()> {
     let redactor = SecretRedactor::new().with_known("the provider API key", &key);
     let tools = ToolRegistry::defaults(&cwd, config.agent.bash_timeout);
 
-    let mut agent = Agent::new(provider, tools, Box::new(redactor), config);
-    let mut out = Stdout {
-        mid_line: false,
-        terminal,
+    let mut agent =
+        Agent::new(provider, tools, Box::new(redactor), config).with_context(context.text);
+    let mut out = Stdout::new(terminal, args.verbose);
+    let result = agent.run(&prompt, &mut out).await;
+    out.finish();
+    let report = match result {
+        Ok(report) => report,
+        Err(CoreError::Aborted) => {
+            eprintln!("aborted");
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
     };
-    let report = agent.run(&prompt, &mut out).await?;
-    out.end_line();
 
     if args.show_redactions {
         print_redactions(&report);
@@ -162,33 +189,85 @@ fn config_show(config: &Config, sources: &Sources) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Streams model text to stdout, prints each tool call on its own line,
-/// and asks for confirmations on the terminal.
+/// Streams model text to stdout as rendered markdown, shows tool calls
+/// dimmed (collapsing runs of read-only calls), and asks for
+/// confirmations on the terminal.
 struct Stdout {
-    mid_line: bool,
+    renderer: Renderer,
     terminal: Option<Terminal>,
+    verbose: bool,
+    /// Something is on the current line that needs a newline before
+    /// the next block of output.
+    mid_line: bool,
+    /// Consecutive read-only calls shown as one updating line.
+    collapsed: usize,
 }
 
 impl Stdout {
-    fn end_line(&mut self) {
-        if self.mid_line {
-            println!();
-            self.mid_line = false;
+    fn new(terminal: Option<Terminal>, verbose: bool) -> Self {
+        Self {
+            renderer: Renderer::for_stdout(),
+            terminal,
+            verbose,
+            mid_line: false,
+            collapsed: 0,
         }
+    }
+
+    fn write(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(text.as_bytes());
+        let _ = stdout.flush();
+        self.mid_line = !text.ends_with('\n');
+    }
+
+    fn end_line(&mut self) {
+        self.collapsed = 0;
+        if self.mid_line {
+            self.write("\n");
+        }
+    }
+
+    /// Flushes held markdown and closes the line at the end of the run.
+    fn finish(&mut self) {
+        let rest = self.renderer.finish();
+        self.write(&rest);
+        self.end_line();
     }
 }
 
 impl Output for Stdout {
     fn text(&mut self, chunk: &str) {
-        let mut stdout = std::io::stdout().lock();
-        let _ = stdout.write_all(chunk.as_bytes());
-        let _ = stdout.flush();
-        self.mid_line = !chunk.ends_with('\n');
+        if self.collapsed > 0 {
+            self.end_line();
+        }
+        let rendered = self.renderer.push(chunk);
+        self.write(&rendered);
     }
 
     fn tool_call(&mut self, name: &str, summary: &str) {
+        let rest = self.renderer.finish();
+        self.write(&rest);
+        let read_only = READ_ONLY_TOOLS.contains(&name);
+        if read_only && self.renderer.is_rich() && !self.verbose {
+            self.collapsed += 1;
+            let n = self.collapsed;
+            let line = format!(
+                "\r\x1b[2K\x1b[2mreading {n} file{}...\x1b[0m",
+                if n == 1 { "" } else { "s" }
+            );
+            self.write(&line);
+            return;
+        }
         self.end_line();
-        println!("> {name}: {summary}");
+        if self.renderer.is_rich() {
+            self.write(&format!("\x1b[2m> {name}: {summary}\x1b[0m\n"));
+        } else {
+            self.write(&format!("> {name}: {summary}\n"));
+        }
     }
 
     fn confirm(&mut self, request: &Confirmation<'_>) -> Decision {

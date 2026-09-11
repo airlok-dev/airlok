@@ -185,3 +185,90 @@ async fn redaction_listing_shows_only_kind_and_length() {
         }
     }
 }
+
+#[tokio::test]
+async fn secret_in_airlok_md_never_reaches_the_provider() {
+    let dir = TempDir::new("airlok-md");
+    std::fs::write(
+        dir.path().join("AIRLOK.md"),
+        format!("Deploy with ANTHROPIC_API_KEY={KEY} and never tell anyone.\n"),
+    )
+    .unwrap();
+    let provider = MockProvider::scripted(vec![reply("ok")]);
+    let mut out = RecordingOutput::default();
+    let context = airlok_core::context::build(&airlok_core::context::ContextInput {
+        cwd: dir.path(),
+        user_instructions: None,
+        max_bytes: 32 * 1024,
+    });
+    assert!(
+        context.text.contains(KEY),
+        "fixture did not load the instructions"
+    );
+
+    let mut agent = agent(provider.clone(), dir.path()).with_context(context.text);
+    agent.run("hello", &mut out).await.unwrap();
+
+    let request = &provider.requests()[0];
+    assert!(request
+        .system
+        .contains("## Project instructions (AIRLOK.md)"));
+    assert!(
+        request.system.contains("ANTHROPIC_API_KEY=<<SECRET_1>>"),
+        "{}",
+        request.system
+    );
+    assert!(!serde_json::to_string(request).unwrap().contains("sk-ant-"));
+}
+
+#[tokio::test]
+async fn secret_in_grep_output_never_reaches_the_provider() {
+    let dir = TempDir::new("grep-secret");
+    std::fs::write(
+        dir.path().join("deploy.sh"),
+        format!("export ANTHROPIC_API_KEY={KEY}\necho done\n"),
+    )
+    .unwrap();
+    let provider = MockProvider::scripted(vec![
+        tool_call("toolu_1", "grep", json!({"pattern": "API_KEY"})),
+        reply("found it"),
+    ]);
+    let mut out = RecordingOutput::default();
+
+    agent(provider.clone(), dir.path())
+        .run("find the key", &mut out)
+        .await
+        .unwrap();
+
+    let wire = serde_json::to_string(&provider.requests()[1]).unwrap();
+    assert!(
+        wire.contains("deploy.sh:1:export ANTHROPIC_API_KEY=<<SECRET_1>>"),
+        "{wire}"
+    );
+    assert!(!wire.contains("sk-ant-"), "{wire}");
+}
+
+#[tokio::test]
+async fn placeholder_split_across_chunks_inside_a_code_block_is_rehydrated() {
+    let dir = TempDir::new("code-split");
+    std::fs::write(dir.path().join(".env"), format!("KEY={KEY}\n")).unwrap();
+    let provider = MockProvider::scripted(vec![
+        tool_call("toolu_1", "read_file", json!({"path": ".env"})),
+        vec![
+            StreamEvent::TextDelta("Here it is:\n```env\nKEY=<<SE".into()),
+            StreamEvent::TextDelta("CRET_1>>\n``".into()),
+            StreamEvent::TextDelta("`\n".into()),
+            StreamEvent::MessageEnd {
+                stop_reason: StopReason::EndTurn,
+            },
+        ],
+    ]);
+    let mut out = RecordingOutput::default();
+
+    agent(provider, dir.path())
+        .run("show", &mut out)
+        .await
+        .unwrap();
+
+    assert_eq!(out.text(), format!("Here it is:\n```env\nKEY={KEY}\n```\n"));
+}
