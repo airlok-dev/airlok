@@ -57,17 +57,23 @@ struct WireRequest<'a> {
     tools: &'a [ToolSpec],
 }
 
+impl<'a> WireRequest<'a> {
+    fn new(request: &'a Request) -> Self {
+        Self {
+            model: &request.model,
+            max_tokens: request.max_tokens,
+            stream: true,
+            system: &request.system,
+            messages: &request.messages,
+            tools: &request.tools,
+        }
+    }
+}
+
 impl Provider for Anthropic {
     fn stream(&self, request: Request) -> BoxStream<'_, Result<StreamEvent, LlmError>> {
         let open = async move {
-            let body = WireRequest {
-                model: &request.model,
-                max_tokens: request.max_tokens,
-                stream: true,
-                system: &request.system,
-                messages: &request.messages,
-                tools: &request.tools,
-            };
+            let body = WireRequest::new(&request);
             debug!(model = %request.model, messages = request.messages.len(), "sending request");
             let response = self
                 .client
@@ -267,6 +273,27 @@ mod tests {
             ]
         );
         assert!(assembler.ended());
+    }
+
+    #[test]
+    fn an_empty_tool_list_is_left_out() {
+        let mut request = Request {
+            model: "m".into(),
+            max_tokens: 10,
+            system: String::new(),
+            messages: vec![Message::user_text("hi")],
+            tools: Vec::new(),
+            reasoning_effort: None,
+        };
+        let body = serde_json::to_value(WireRequest::new(&request)).unwrap();
+        assert!(body.get("tools").is_none(), "{body}");
+        request.tools.push(ToolSpec {
+            name: "read_file".into(),
+            description: "reads".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        });
+        let body = serde_json::to_value(WireRequest::new(&request)).unwrap();
+        assert_eq!(body["tools"][0]["name"], "read_file");
     }
 
     #[test]

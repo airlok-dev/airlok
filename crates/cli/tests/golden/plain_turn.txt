@@ -1,0 +1,5 @@
+Looking at the code.
+> read_file: src/main.rs
+> grep: fn main
+Found it.
+gpt-6-astra · context 3% · session abc123

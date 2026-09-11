@@ -224,3 +224,29 @@ fn a_rejected_reasoning_effort_gets_a_config_hint() {
     assert!(other.hint("gpt-6-astra").is_none());
     assert!(CoreError::TurnLimit(3).hint("m").is_none());
 }
+
+#[tokio::test]
+async fn tokens_are_reported_as_the_turn_runs() {
+    let dir = airlok_tests::TempDir::new("tokens");
+    let provider = airlok_tests::MockProvider::scripted(vec![
+        airlok_tests::with_usage(
+            1000,
+            20,
+            airlok_tests::tool_call("t1", "list_dir", serde_json::json!({"path": "."})),
+        ),
+        airlok_tests::with_usage(1200, 30, airlok_tests::reply("Nothing here.")),
+    ]);
+    let mut agent = airlok_tests::agent(provider, dir.path());
+    let mut session = agent.new_session();
+    let mut out = airlok_tests::RecordingOutput::default();
+
+    agent
+        .turn(&mut session, "what is here?", &mut out)
+        .await
+        .unwrap();
+
+    assert_eq!(out.thinking, 2, "one per request");
+    assert!(out.tokens[0] > 0, "starts from the request estimate");
+    assert!(out.tokens.contains(&1020), "{:?}", out.tokens);
+    assert_eq!(out.tokens.last(), Some(&2250));
+}

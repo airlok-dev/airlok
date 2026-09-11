@@ -2,11 +2,26 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
-## [Unreleased]
+## [0.5.0] - 2026-09-12
 
 ### Added
 
+- A status line during each turn: a spinner, what airlok is doing (`thinking`, `reading src/main.rs`, `running cargo test`), the seconds so far, and the tokens used this turn, redrawn in place below the output and cleared before anything else prints. It is off when stdout is not a terminal, with `NO_COLOR`, and with `-v`.
+- Esc cancels a running turn as Ctrl-C does: the partial reply is kept and marked interrupted. The terminal is in cbreak mode only while a turn runs, and is restored when the turn ends, before each confirmation, on a panic, and on SIGTERM. Keys typed during a turn start the next prompt.
+- Plan mode, with `/plan` or `--plan`. The model gets only `read_file`, `glob`, `grep`, and `list_dir`, the system prompt says the rest are unavailable, and it ends its reply with a plan. `/go` runs the plan as the task in normal mode; `/plan` again leaves without running it. Per-model settings are sent unchanged in both modes.
+- `!command` runs a command in the working directory and adds the command and its output to the conversation. `#note` appends a list item to `./AIRLOK.md`, creating it, and rebuilds the context block.
+- `@` completes paths from the working directory, fuzzy and gitignore-aware; Tab inserts the path as plain text. Typing `/` shows the matching commands with their descriptions. A prefix runs the first match, and an unknown command suggests the closest.
+- Alt+Enter inserts a newline, and so does Shift+Enter in terminals that send Esc then Enter for it.
+- Write confirmations show line numbers, syntax highlighting, and +/- gutters, and page at 40 lines; `v` shows the rest.
+- A dim footer after each turn: model, context %, session id.
 - `[models."<id>"]` config sections with `reasoning_effort`, sent by the openai provider only for that model id. Azure's `gpt-6-astra` needs `reasoning_effort = "none"` to use tools on Chat Completions; when a provider rejects its reasoning effort, airlok names the setting to add. `/model` shows the configured effort.
+
+### Changed
+
+- The REPL starts with one line: version, model, directory, notes such as a resumed session or confirmations being off, and `/help for commands`.
+- Ctrl-C at an empty prompt does nothing; it used to print a hint.
+- Runs of read-only tool calls show on the status line and end with one `read N files` line, in place of the updating `reading N files...` line.
+- Slash commands are listed harmless and frequent first, since a prefix now runs the first match.
 
 ## [0.4.1] - 2026-09-11
 

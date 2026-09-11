@@ -21,6 +21,7 @@ cargo install --git https://github.com/airlok-dev/airlok airlok --locked
 ```sh
 airlok                                         # interactive session in the current directory
 airlok "create hello.txt containing hello"     # run one task in the current directory
+airlok --plan                                  # start in plan mode: the model researches, then proposes a plan
 airlok --resume                                # continue the latest saved session here (REPL, or with a task)
 airlok --resume=<id> "summarise what we did"   # continue a particular one
 airlok sessions                                # list saved sessions for this directory
@@ -36,27 +37,59 @@ airlok context                                 # print the context block sent wi
 airlok redactions                              # list what the redactor detects and how each kind is treated
 ```
 
-Every `write_file` and `edit_file` call shows a unified diff and asks `Apply? [y]es / [n]o / [a]ll / [q]uit`. Every `bash` call that is not on the allow list shows the command and asks the same way. `y` applies this one, `n` sends a rejection back to the model so it can adapt, `a` approves the rest of that kind for the run, and `q` aborts the run with a non-zero exit. Prompts are read from the terminal, not stdin, so piped input still works; without a terminal, pass `--yes` or turn the confirmations off in the config.
+Every `write_file` and `edit_file` call shows a diff with line numbers, three lines of context, +/- gutters, and syntax highlighting, and asks `Apply? [y]es / [n]o / [a]ll / [q]uit`. A diff longer than 40 lines stops at `... N more lines, [v] to view all`; `v` prints the rest and asks again. Every `bash` call that is not on the allow list shows the command and asks the same way. `y` applies this one, `n` sends a rejection back to the model so it can adapt, `a` approves the rest of that kind for the run, and `q` aborts the run with a non-zero exit. Prompts are read from the terminal, not stdin, so piped input still works; without a terminal, pass `--yes` or turn the confirmations off in the config.
 
-Model output is rendered as markdown (headings, emphasis, lists, tables, highlighted code) when stdout is a terminal; set `NO_COLOR` or redirect stdout for plain text. Runs of read-only tool calls collapse to one `reading N files...` line; `-v` shows every call.
+Model output is rendered as markdown (headings, emphasis, lists, tables, highlighted code) when stdout is a terminal; set `NO_COLOR` or redirect stdout for plain text. Runs of read-only tool calls show on the status line and end with one `read N files` line; `-v` shows every call.
 
-### Sessions
+### Interactive sessions
 
-`airlok` with no task opens a session. The prompt shows the model and the directory (`gpt-5.5 airlok> `), each line you type is one turn, and the conversation carries across turns. Ctrl-C during a turn cancels it: the text streamed so far stays in the history marked as interrupted, tool calls that had not run are dropped, and you get the prompt back. Ctrl-D or `/exit` saves and quits.
+`airlok` with no task opens a session. It starts with one line (version, model, directory, `/help for commands`), the prompt shows the model and the directory (`gpt-5.5 airlok> `), each line you send is one turn, and the conversation carries across turns. After each turn a dim footer shows the model, how full the context is, and the session id.
+
+While a turn runs, a status line below the output shows a spinner, what airlok is doing (`thinking`, `reading src/main.rs`, `running cargo test`), the seconds so far, and the tokens used this turn. It is cleared before anything else prints. It is off when stdout is not a terminal, when `NO_COLOR` is set, and with `-v`, whose logs share the terminal.
+
+| Key | What it does |
+|---|---|
+| Enter | send the line |
+| Alt+Enter | start a new line in the same message. Shift+Enter does the same in terminals that send Esc then Enter for it; most send a plain Enter |
+| Tab | take the first `/` command or `@` path on offer; Tab again cycles through the rest |
+| Right arrow | take the rest of the `/` command shown after the cursor |
+| Esc or Ctrl-C | during a turn, cancel it |
+| Ctrl-C | at the prompt, clear the line; on an empty line it does nothing |
+| Ctrl-D | save and quit |
+| Ctrl-R | search this run's history; Up and Down step through it |
+
+A cancelled turn keeps the text streamed so far in the history, marked as interrupted; tool calls that had not run are dropped, and you get the prompt back. Keys typed while a turn runs are kept and start the next prompt.
+
+| Input | What it does |
+|---|---|
+| `/` at the start | a slash command. A menu of the matching commands and what they do shows as you type. A prefix runs the first match in the menu (`/co` is `/cost`); an unknown name gets the closest command suggested |
+| `@` anywhere | `@` and part of a path offers matching files and directories from the working directory, fuzzy and gitignore-aware. Tab inserts the path as plain text, without the `@` |
+| `!` at the start | runs the rest with `sh -c` in the working directory and prints the output. The command and its output go into the conversation for the model's next turn. `bash_timeout_secs` applies, and the command cannot read input |
+| `#` at the start | appends the rest to `./AIRLOK.md` as a list item, creating the file, and rebuilds the context block so it applies from the next turn. A new `AIRLOK.md` takes precedence over a `CLAUDE.md` or `AGENTS.md` beside it, and the confirmation says so. Instructions are read from the repository root, so from a subdirectory the note lands in a file the context block does not read |
 
 | Command | What it does |
 |---|---|
 | `/help` | list the commands |
 | `/model [<id>]` | show the model, or use `<id>` for the rest of the session; not validated, the provider rejects a bad id on the next turn |
+| `/plan` | turn plan mode on or off |
+| `/go` | carry out the plan from plan mode, back in normal mode |
 | `/provider [<name>]` | show the provider, or switch to `anthropic` or `openai` if a key is available for it; says which key is missing otherwise |
-| `/clear` | start a new session; the current one stays saved |
-| `/compact` | summarise older turns to free context |
 | `/cost` | tokens used so far, and whether they are estimates |
-| `/redactions` | what was redacted before leaving this machine (kind and length only) |
+| `/compact` | summarise older turns to free context |
 | `/config` | the effective configuration |
-| `/exit` | save and quit |
+| `/redactions` | what was redacted before leaving this machine (kind and length only) |
+| `/clear` | start a new session; the current one stays saved |
+| `/exit` | save and quit; `/quit` works too |
+
+#### Plan mode
+
+`/plan`, or `--plan` at startup, switches to plan mode, and the prompt shows `[plan]`. The model gets only the read-only tools (`read_file`, `glob`, `grep`, `list_dir`): `write_file`, `edit_file`, and `bash` are left out of the request, the system prompt says they are unavailable, and a call to one of them anyway is refused. The model researches the task and ends its reply with a plan. `/go` leaves plan mode and sends that plan back as the task, with every tool available again. `/plan` a second time leaves without running anything. Per-model settings such as `reasoning_effort` are sent the same way in both modes. Plan mode is not saved with the session, so `--resume` starts in normal mode unless `--plan` is given.
+
+#### Providers in a session
 
 `[provider]` settings (`api_key_cmd`, `api_key_env`, `base_url`) belong to the configured provider. After `/provider` switches to the other one, it runs on that provider's default model and its default key variables (`ANTHROPIC_API_KEY`; `AZURE_OPENAI_API_KEY` or `OPENAI_API_KEY`); switching back restores the configured one. Both changes are written to the session file, and `--resume` continues on the session's last model when it used the configured provider and `--model` is not given.
+
+### Sessions
 
 Every turn, one-shot or interactive, is saved under `$XDG_DATA_HOME/airlok/sessions/<hash of the directory>/` (`~/.local/share/airlok` by default). `airlok --resume` picks up the latest session for the directory; it rebuilds the context block, so the model sees the current tree and git state, and adds a note with the resume time. `airlok sessions` lists what is there.
 

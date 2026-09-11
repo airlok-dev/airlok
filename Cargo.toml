@@ -3,15 +3,15 @@ resolver = "2"
 members = ["crates/cli", "crates/core", "crates/llm", "tests"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/airlok-dev/airlok"
 homepage = "https://airlok.dev"
 
 [workspace.dependencies]
-airlok-core = { path = "crates/core", version = "0.4.1" }
-airlok-llm = { path = "crates/llm", version = "0.4.1" }
+airlok-core = { path = "crates/core", version = "0.5.0" }
+airlok-llm = { path = "crates/llm", version = "0.5.0" }
 
 anyhow = "1.0.98"
 async-trait = "0.1.88"
@@ -22,7 +22,7 @@ grep = "0.4.1"
 ignore = "0.4.33"
 libc = "0.2.172"
 regex = "1.11.1"
-rustyline = { version = "18.0.1", default-features = false }
+rustyline = { version = "18.0.1", default-features = false, features = ["custom-bindings"] }
 reqwest = { version = "0.12.20", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"

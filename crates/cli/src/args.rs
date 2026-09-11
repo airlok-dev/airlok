@@ -36,6 +36,10 @@ pub struct Args {
     #[arg(long)]
     pub show_redactions: bool,
 
+    /// Start in plan mode: read-only tools, and the model replies with a plan
+    #[arg(long)]
+    pub plan: bool,
+
     /// Continue a saved session from this directory: the latest, or `--resume=<id>`
     #[arg(long, value_name = "ID", require_equals = true, num_args = 0..=1, default_missing_value = "")]
     pub resume: Option<String>,

@@ -176,13 +176,18 @@ pub enum Shown {
 pub struct RecordingOutput {
     pub events: Vec<Shown>,
     pub decisions: VecDeque<Decision>,
+    /// Every `tokens` report, in order. Kept out of `events` so tests
+    /// that compare the whole transcript are not about progress reports.
+    pub tokens: Vec<u64>,
+    /// How many requests started streaming.
+    pub thinking: usize,
 }
 
 impl RecordingOutput {
     pub fn answering(decisions: Vec<Decision>) -> Self {
         Self {
-            events: Vec::new(),
             decisions: decisions.into(),
+            ..Self::default()
         }
     }
 
@@ -227,6 +232,14 @@ impl Output for RecordingOutput {
 
     fn end_turn(&mut self) {
         self.events.push(Shown::EndTurn);
+    }
+
+    fn thinking(&mut self) {
+        self.thinking += 1;
+    }
+
+    fn tokens(&mut self, used: u64) {
+        self.tokens.push(used);
     }
 
     fn confirm(&mut self, request: &Confirmation<'_>) -> Decision {
@@ -277,12 +290,16 @@ pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new(label: &str) -> Self {
+        // Clocks can tick in microseconds, so two threads may read the
+        // same time; the counter keeps their directories apart.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let path =
-            std::env::temp_dir().join(format!("airlok-{label}-{}-{nanos}", std::process::id()));
+            std::env::temp_dir().join(format!("airlok-{label}-{}-{nanos}-{n}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }

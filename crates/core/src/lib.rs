@@ -28,6 +28,19 @@ pub trait Output: Send {
     /// A one-line note about the run itself, such as a compaction. Shown
     /// dim, never part of the model's text.
     fn status(&mut self, line: &str);
+    /// A turn is about to run. Whoever runs it calls this first and
+    /// [`Output::end_turn`] after, so a terminal can show progress between.
+    fn begin_turn(&mut self) {}
+    /// A model request is about to stream.
+    fn thinking(&mut self) {}
+    /// Tokens used so far in this turn: each finished request's input and
+    /// output as reported (or estimated at chars/4), plus estimates for the
+    /// request streaming now.
+    fn tokens(&mut self, _used: u64) {}
+    /// What a command the user ran with `!` printed, shown as is.
+    fn command_output(&mut self, text: &str) {
+        text.lines().for_each(|line| self.status(line));
+    }
     /// The turn's text is complete; flush anything held back.
     fn end_turn(&mut self) {}
     /// Ask the user before a write or a command. Only called when the
