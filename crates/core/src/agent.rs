@@ -23,7 +23,7 @@ use crate::redact::{
 };
 use crate::safety::{CommandVerdict, Confirmation, Decision};
 use crate::session::{Compaction, Session};
-use crate::tools::{truncate_output, Plan, Tool, ToolError, ToolRegistry};
+use crate::tools::{truncate_output, Plan, Tool, ToolError, ToolRegistry, READ_ONLY_TOOLS};
 use crate::{CoreError, Output};
 
 pub struct Agent {
@@ -33,6 +33,11 @@ pub struct Agent {
     config: Config,
     /// Rendered `core::context` block, appended to the system prompt.
     context: String,
+    /// Plan mode: the model gets only the read-only tools and is asked to
+    /// end with a plan instead of carrying the task out.
+    plan_mode: bool,
+    /// The final reply of the last plan-mode turn, which `/go` carries out.
+    plan: Option<String>,
 }
 
 /// What happened during one run.
@@ -79,6 +84,8 @@ impl Agent {
             redactor,
             config,
             context: String::new(),
+            plan_mode: false,
+            plan: None,
         }
     }
 
@@ -86,6 +93,26 @@ impl Agent {
     pub fn with_context(mut self, context: String) -> Self {
         self.context = context;
         self
+    }
+
+    /// Replaces the context block, after something it reads changed.
+    pub fn set_context(&mut self, context: String) {
+        self.context = context;
+    }
+
+    /// Turns plan mode on or off. Either way the previous plan is dropped.
+    pub fn set_plan_mode(&mut self, on: bool) {
+        self.plan_mode = on;
+        self.plan = None;
+    }
+
+    pub fn plan_mode(&self) -> bool {
+        self.plan_mode
+    }
+
+    /// The final reply of the last plan-mode turn that completed.
+    pub fn plan(&self) -> Option<&str> {
+        self.plan.as_deref()
     }
 
     pub fn config_mut(&mut self) -> &mut Config {
@@ -192,7 +219,7 @@ impl Agent {
         let mut silent = Silent;
         let mut never = Interrupt::new().watcher();
         let response = self
-            .stream_response(request, &map, &mut silent, &mut never)
+            .stream_response(request, &map, &mut silent, &mut never, 0)
             .await?
             .response;
         let summary: String = response
@@ -218,8 +245,13 @@ impl Agent {
         ];
         messages.extend_from_slice(&session.messages[cut..]);
         session.messages = messages;
-        let system = system_prompt(&self.config, &self.context, session);
-        let (next, _) = self.build_request(&system, &session.messages, &self.tools.specs());
+        let system = system_prompt(
+            &self.config,
+            &self.context,
+            session,
+            self.plan_note().as_deref(),
+        );
+        let (next, _) = self.build_request(&system, &session.messages, &self.specs());
         let after = next.estimated_tokens();
         // The summary request cost real tokens too. Its context figure is
         // then replaced by the estimate for the compacted history, which
@@ -246,6 +278,47 @@ impl Agent {
         Ok(Some(record))
     }
 
+    /// The tools offered to the model: in plan mode, only the read-only
+    /// ones. An empty list is left out of the request by both providers.
+    fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs = self.tools.specs();
+        if self.plan_mode {
+            specs.retain(|s| READ_ONLY_TOOLS.contains(&s.name.as_str()));
+        }
+        specs
+    }
+
+    /// The system prompt paragraph for plan mode: what is offered, what is
+    /// withheld, and that the reply ends with a plan.
+    fn plan_note(&self) -> Option<String> {
+        if !self.plan_mode {
+            return None;
+        }
+        let (available, withheld): (Vec<String>, Vec<String>) = self
+            .tools
+            .specs()
+            .into_iter()
+            .map(|s| s.name)
+            .partition(|name| READ_ONLY_TOOLS.contains(&name.as_str()));
+        let mut note = format!(
+            "Plan mode is on. Only the read-only tools are available ({}).",
+            available.join(", ")
+        );
+        if !withheld.is_empty() {
+            note.push_str(&format!(
+                " {} are unavailable: do not change files or run commands, and do not ask to.",
+                withheld.join(", ")
+            ));
+        }
+        note.push_str(
+            " Research the task with the available tools, then end your reply with a plan: \
+             numbered steps naming each file to change, what to change in it, and how to check \
+             the result. Do not carry the plan out; the user approves it, and it then runs in \
+             normal mode with every tool.",
+        );
+        Some(note)
+    }
+
     async fn rounds(
         &mut self,
         session: &mut Session,
@@ -253,21 +326,33 @@ impl Agent {
         out: &mut dyn Output,
         watcher: &mut Watcher,
     ) -> Result<usize, CoreError> {
-        let system = system_prompt(&self.config, &self.context, session);
-        let specs = self.tools.specs();
+        let system = system_prompt(
+            &self.config,
+            &self.context,
+            session,
+            self.plan_note().as_deref(),
+        );
+        let specs = self.specs();
         session.messages.push(Message::user_text(prompt));
         session.interrupted = false;
         let mut approved = Approved::default();
+        let spent_before = session.usage.spent();
 
         for round in 1..=self.config.agent.max_turns {
             let (request, map) = self.build_request(&system, &session.messages, &specs);
             let estimate = request.estimated_tokens();
-            let streamed = self.stream_response(request, &map, out, watcher).await?;
+            let so_far = session.usage.spent().saturating_sub(spent_before) + estimate;
+            out.thinking();
+            out.tokens(so_far);
+            let streamed = self
+                .stream_response(request, &map, out, watcher, so_far)
+                .await?;
             let response = streamed.response;
             debug!(round, stop_reason = ?response.stop_reason, usage = ?response.usage, interrupted = streamed.interrupted, "round complete");
             session
                 .usage
                 .record(response.usage, estimate, &response.content);
+            out.tokens(session.usage.spent().saturating_sub(spent_before));
             if streamed.interrupted {
                 return Ok(Self::interrupted(
                     session,
@@ -299,6 +384,13 @@ impl Agent {
             session.messages.push(Message::assistant(response.content));
             session.touch();
             if !wants_tools {
+                if self.plan_mode {
+                    self.plan = session
+                        .messages
+                        .last()
+                        .map(text_of)
+                        .filter(|text| !text.trim().is_empty());
+                }
                 return Ok(round);
             }
             session.messages.push(Message::tool_results(results));
@@ -394,14 +486,17 @@ impl Agent {
     }
 
     /// Consumes the provider stream, printing text as it arrives and
-    /// returning the rehydrated assistant turn.
+    /// returning the rehydrated assistant turn. `tokens_before` is the
+    /// turn's count so far; it grows by chars/4 of what streams.
     async fn stream_response(
         &self,
         request: Request,
         map: &RedactionMap,
         out: &mut dyn Output,
         watcher: &mut Watcher,
+        tokens_before: u64,
     ) -> Result<Streamed, CoreError> {
+        let mut streamed = 0usize;
         let mut content = Vec::new();
         let mut text = String::new();
         let mut unshown = String::new();
@@ -425,6 +520,8 @@ impl Agent {
             };
             match event {
                 StreamEvent::TextDelta(delta) => {
+                    streamed += delta.len();
+                    out.tokens(tokens_before + (streamed / 4) as u64);
                     text.push_str(&delta);
                     unshown.push_str(&delta);
                     let (emit, keep) = split_incomplete_placeholder(&unshown);
@@ -434,6 +531,8 @@ impl Agent {
                     unshown = keep.to_string();
                 }
                 StreamEvent::ToolUse { id, name, input } => {
+                    streamed += name.len() + input.to_string().len();
+                    out.tokens(tokens_before + (streamed / 4) as u64);
                     self.flush_text(&mut text, &mut unshown, map, out, &mut content);
                     let mut input = input;
                     map_strings(&mut input, &mut |s| self.redactor.rehydrate(s, map));
@@ -495,6 +594,16 @@ impl Agent {
                 continue;
             };
             let (content, is_error) = match self.tools.get(name) {
+                Some(_) if self.plan_mode && !READ_ONLY_TOOLS.contains(&name.as_str()) => {
+                    warn!(tool = %name, "refused: plan mode");
+                    (
+                        format!(
+                            "error: `{name}` is not available in plan mode. Research with the \
+                             read-only tools, then reply with the plan."
+                        ),
+                        true,
+                    )
+                }
                 Some(tool) => {
                     out.tool_call(name, &tool.summary(input));
                     let forbidden = redact_only_in(&input.to_string(), map);
@@ -643,7 +752,12 @@ enum Gate {
     Abort,
 }
 
-fn system_prompt(config: &Config, context: &str, session: &Session) -> String {
+fn system_prompt(
+    config: &Config,
+    context: &str,
+    session: &Session,
+    plan_note: Option<&str>,
+) -> String {
     let mut prompt = format!(
         "You are airlok, a coding agent working in the directory {cwd}. \
          Complete the user's task using the available tools, then reply with a short summary of what you did. \
@@ -665,6 +779,10 @@ fn system_prompt(config: &Config, context: &str, session: &Session) -> String {
              time; the conversation before this point happened earlier and files may have changed since."
         ));
     }
+    if let Some(note) = plan_note {
+        prompt.push_str("\n\n");
+        prompt.push_str(note);
+    }
     prompt
 }
 
@@ -683,6 +801,19 @@ struct Streamed {
 }
 
 pub const INTERRUPTED_MARKER: &str = "[interrupted by the user before the reply was complete]";
+
+/// A message's text blocks, joined by newlines.
+fn text_of(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// The assistant message stored for a turn the user cut short: its text so
 /// far with a marker, and no tool calls, since nothing ran.

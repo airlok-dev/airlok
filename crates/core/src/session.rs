@@ -53,6 +53,11 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Input plus output tokens over every request so far.
+    pub fn spent(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+
     /// Adds one request's usage. Without a provider report, the input side
     /// is `estimate` (chars/4 of the request) and the output side chars/4 of
     /// the reply, and the whole session is marked estimated.

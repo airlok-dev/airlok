@@ -505,4 +505,17 @@ mod tests {
         };
         assert_eq!(wire_request(&request)["reasoning_effort"], "none");
     }
+
+    #[test]
+    fn an_empty_tool_list_is_left_out() {
+        let request = Request {
+            model: "m".into(),
+            max_tokens: 10,
+            system: String::new(),
+            messages: vec![Message::user_text("hi")],
+            tools: Vec::new(),
+            reasoning_effort: None,
+        };
+        assert!(wire_request(&request).get("tools").is_none());
+    }
 }

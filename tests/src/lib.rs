@@ -176,13 +176,18 @@ pub enum Shown {
 pub struct RecordingOutput {
     pub events: Vec<Shown>,
     pub decisions: VecDeque<Decision>,
+    /// Every `tokens` report, in order. Kept out of `events` so tests
+    /// that compare the whole transcript are not about progress reports.
+    pub tokens: Vec<u64>,
+    /// How many requests started streaming.
+    pub thinking: usize,
 }
 
 impl RecordingOutput {
     pub fn answering(decisions: Vec<Decision>) -> Self {
         Self {
-            events: Vec::new(),
             decisions: decisions.into(),
+            ..Self::default()
         }
     }
 
@@ -227,6 +232,14 @@ impl Output for RecordingOutput {
 
     fn end_turn(&mut self) {
         self.events.push(Shown::EndTurn);
+    }
+
+    fn thinking(&mut self) {
+        self.thinking += 1;
+    }
+
+    fn tokens(&mut self, used: u64) {
+        self.tokens.push(used);
     }
 
     fn confirm(&mut self, request: &Confirmation<'_>) -> Decision {

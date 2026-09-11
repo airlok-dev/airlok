@@ -49,6 +49,10 @@ path = "compaction.rs"
 name = "repl"
 path = "repl.rs"
 
+[[test]]
+name = "plan_mode"
+path = "plan_mode.rs"
+
 [dependencies]
 airlok-core.workspace = true
 airlok-llm.workspace = true
