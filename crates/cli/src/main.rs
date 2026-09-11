@@ -1,4 +1,5 @@
 mod args;
+mod complete;
 mod diff;
 mod keys;
 mod output;
@@ -268,7 +269,8 @@ async fn run_repl(
         Ok(tty) => out.watch_keys(Keys::new(tty, interrupt.clone(), typed.clone())),
         Err(e) => tracing::debug!(error = %e, "no terminal to watch for Esc"),
     }
-    let mut lines = repl::Readline::new(typed).context("cannot start line editing")?;
+    let mut lines = repl::Readline::new(agent.config().cwd.clone(), typed)
+        .context("cannot start line editing")?;
     out.status(&startup_line(agent.config(), &notes));
     let backend = CliBackend {
         startup: agent.config().provider.clone(),
