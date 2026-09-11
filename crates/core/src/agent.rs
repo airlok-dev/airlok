@@ -183,6 +183,7 @@ impl Agent {
         } else {
             request.estimated_tokens()
         };
+        let summary_estimate = request.estimated_tokens();
         let mut silent = Silent;
         let mut never = Interrupt::new().watcher();
         let response = self
@@ -215,8 +216,14 @@ impl Agent {
         let system = system_prompt(&self.config, &self.context, session);
         let (next, _) = self.build_request(&system, &session.messages, &self.tools.specs());
         let after = next.estimated_tokens();
+        // The summary request cost real tokens too. Its context figure is
+        // then replaced by the estimate for the compacted history, which
+        // the next request's usage report overwrites; that estimate is a
+        // status-line figure, so it does not mark the session estimated.
+        session
+            .usage
+            .record(response.usage, summary_estimate, &response.content);
         session.usage.context_tokens = after;
-        session.usage.estimated = true;
         session.redactions = map;
         let record = Compaction {
             at: crate::session::now_rfc3339(),

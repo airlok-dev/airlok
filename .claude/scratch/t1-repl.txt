@@ -1,0 +1,37 @@
+What does the core crate do? Two sentences, no tools needed beyond reading.
+warning: confirmations are off; writes and commands will run without asking
+[2mairlok 0.4.0 · gpt-5.6-luna · /help for commands, Ctrl-D to quit[0m
+[?2004h[?2026h[Kgpt-5.6-luna airlok> [21C[?2026lWhat does the core crate do? Two sentences, no tools neede[?2026h[Kgpt-5.6-luna airlok> What does the core crate do? Two sentences, no tools needed
+[?2026l beyond reading.[?2004l
+[2K[2mreading 1 file...[0m[2K[2mreading 2 files...[0m
+The core crate implements airlok’s 
+terminal-agnostic agent loop, including 
+model interaction, session persistence, 
+configuration, context gathering, and 
+interactive REPL behavior. It also 
+provides privacy redaction/rehydration, 
+safety confirmations, interrupt 
+handling, and file-system tools such as 
+reading, editing, searching, and shell 
+execution.
+[?2004h[?2026h[Kgpt-5.6-luna airlok> [21C[?2026lAnd the llm crate? Two sentences.[?2004l
+[2K[2mreading 1 file...[0m[2K[2mreading 2 files...[0m
+The llm crate defines the provider 
+abstraction and shared message/tool-call
+types used to communicate with language 
+models. It implements streaming 
+integrations for Anthropic’s Messages 
+API and OpenAI-compatible Chat 
+Completions APIs, including server-sent 
+event parsing and token-usage reporting.
+[?2004h[?2026h[Kgpt-5.6-luna airlok> [21C[?2026lWhich of those two has more tests? Count the test files.[?2004l
+[2K[2mreading 1 file...[0m[2K[2mreading 2 files...[0m[2K[2mreading 3 files...[0m[2K[2mreading 4 files...[0m[2K[2mreading 5 files...[0m[2K[2mreading 6 files...[0m[2K[2mreading 7 files...[0m[2K[2mreading 8 files...[0m
+The core crate has more: [1m10[0m[1m [0m[1mtest[0m[1m [0m[1mfiles[0m 
+under [48;5;237m[38;5;252mtests/[49m[39m, compared with [1m0[0m[1m [0m[1mtest[0m[1m [0m[1mfiles[0m
+for the llm crate.
+[?2004h[?2026h[Kgpt-5.6-luna airlok> [21C[?2026l/cost[?2004l
+[2minput 27k tokens, output 936 tokens over 3 turn(s)[0m
+[2mcontext 7k of 200k tokens (3%)[0m
+[?2004h[?2026h[Kgpt-5.6-luna airlok> [21C[?2026l[?2004l
+[2msession ac925c34 saved (3 turns); airlok --resume continues it[0m
+exit=0

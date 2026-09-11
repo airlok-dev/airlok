@@ -16,7 +16,7 @@ async fn crossing_the_threshold_sends_one_summary_request_without_tools_or_secre
     let provider = MockProvider::scripted(vec![
         with_usage(100, 10, reply("one")),
         with_usage(900, 10, reply("two")),
-        reply("SUMMARY: the token was mentioned"),
+        with_usage(950, 40, reply("SUMMARY: the token was mentioned")),
         with_usage(300, 10, reply("three")),
     ]);
     let mut agent = agent(provider.clone(), dir.path());
@@ -76,6 +76,13 @@ async fn crossing_the_threshold_sends_one_summary_request_without_tools_or_secre
     assert!(after.contains("SUMMARY: the token was mentioned"));
     assert!(!after.contains("the token is <<SECRET_1>>"));
     assert!(!after.contains(TOKEN));
+
+    // The summary request is counted; nothing was estimated, since every
+    // request reported usage, and the last report set the context.
+    assert_eq!(session.usage.input_tokens, 100 + 900 + 950 + 300);
+    assert_eq!(session.usage.output_tokens, 10 + 10 + 40 + 10);
+    assert_eq!(session.usage.context_tokens, 300);
+    assert!(!session.usage.estimated);
 
     assert_eq!(session.compactions.len(), 1);
     assert_eq!(session.compactions[0].before_tokens, 900);
