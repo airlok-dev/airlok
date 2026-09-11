@@ -5,8 +5,10 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use airlok_core::config::{ProviderConfig, ProviderName};
 use airlok_core::redact::SecretRedactor;
-use airlok_core::repl::{Line, LineSource};
+use airlok_core::redact::{RedactionMap, Redactor};
+use airlok_core::repl::{Backend, Line, LineSource, Switch};
 use airlok_core::tools::ToolRegistry;
 use airlok_core::{Agent, Config, Confirmation, Decision, Output};
 use airlok_llm::{LlmError, Provider, Request, StopReason, StreamEvent};
@@ -93,6 +95,39 @@ impl LineSource for ScriptedLines {
     fn read_line(&mut self, prompt: &str) -> Line {
         self.prompts.push(prompt.to_string());
         self.lines.pop_front().unwrap_or(Line::Eof)
+    }
+}
+
+/// A REPL backend whose providers are scripted. A provider with no entry
+/// fails the switch with "no key configured".
+#[derive(Default)]
+pub struct TestBackend {
+    pub switches: std::collections::HashMap<&'static str, Result<Arc<MockProvider>, String>>,
+}
+
+impl Backend for TestBackend {
+    fn fresh_redactor(&mut self) -> Box<dyn Redactor> {
+        Box::new(SecretRedactor::new())
+    }
+
+    fn switch(&mut self, name: ProviderName, seed: &RedactionMap) -> Result<Switch, String> {
+        let provider = self
+            .switches
+            .get(name.as_str())
+            .cloned()
+            .unwrap_or_else(|| Err("no key configured".into()))?;
+        Ok(Switch {
+            config: ProviderConfig {
+                name,
+                model: name.default_model().to_string(),
+                base_url: None,
+                api_key_env: None,
+                api_key_cmd: None,
+                context_window: airlok_core::config::DEFAULT_CONTEXT_WINDOW,
+            },
+            provider,
+            redactor: Box::new(SecretRedactor::new().with_map(seed)),
+        })
     }
 }
 

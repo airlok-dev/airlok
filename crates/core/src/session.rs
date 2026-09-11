@@ -23,7 +23,8 @@ pub struct Session {
     pub updated_at: String,
     pub provider: String,
     pub model: String,
-    /// The effective configuration when the session started.
+    /// The effective configuration: taken when the session started and
+    /// updated when `/model` or `/provider` changes it.
     pub config: ConfigFile,
     /// Plaintext history. Never leaves the machine as is.
     pub messages: Vec<Message>,

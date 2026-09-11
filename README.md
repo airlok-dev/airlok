@@ -43,12 +43,16 @@ Model output is rendered as markdown (headings, emphasis, lists, tables, highlig
 | Command | What it does |
 |---|---|
 | `/help` | list the commands |
+| `/model [<id>]` | show the model, or use `<id>` for the rest of the session; not validated, the provider rejects a bad id on the next turn |
+| `/provider [<name>]` | show the provider, or switch to `anthropic` or `openai` if a key is available for it; says which key is missing otherwise |
 | `/clear` | start a new session; the current one stays saved |
 | `/compact` | summarise older turns to free context |
 | `/cost` | tokens used so far, and whether they are estimates |
 | `/redactions` | what was redacted before leaving this machine (kind and length only) |
 | `/config` | the effective configuration |
 | `/exit` | save and quit |
+
+`[provider]` settings (`api_key_cmd`, `api_key_env`, `base_url`) belong to the configured provider. After `/provider` switches to the other one, it runs on that provider's default model and its default key variables (`ANTHROPIC_API_KEY`; `AZURE_OPENAI_API_KEY` or `OPENAI_API_KEY`); switching back restores the configured one. Both changes are written to the session file, and `--resume` continues on the session's last model when it used the configured provider and `--model` is not given.
 
 Every turn, one-shot or interactive, is saved under `$XDG_DATA_HOME/airlok/sessions/<hash of the directory>/` (`~/.local/share/airlok` by default). `airlok --resume` picks up the latest session for the directory; it rebuilds the context block, so the model sees the current tree and git state, and adds a note with the resume time. `airlok sessions` lists what is there.
 

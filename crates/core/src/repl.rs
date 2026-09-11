@@ -2,8 +2,13 @@
 //! Input arrives through [`LineSource`] so the binary can use readline and
 //! tests can feed a script.
 
+use std::sync::Arc;
+
+use airlok_llm::Provider;
+
 use crate::agent::{fmt_tokens, redaction_lines, Agent};
-use crate::redact::Redactor;
+use crate::config::{ProviderConfig, ProviderName};
+use crate::redact::{RedactionMap, Redactor};
 use crate::session::{Session, SessionStore};
 use crate::{CoreError, Interrupt, Output};
 
@@ -20,8 +25,33 @@ pub trait LineSource {
     fn read_line(&mut self, prompt: &str) -> Line;
 }
 
+/// What the REPL needs from the binary, which owns key resolution and
+/// provider construction.
+pub trait Backend: Send {
+    /// A redactor for a fresh session, knowing the current provider key.
+    fn fresh_redactor(&mut self) -> Box<dyn Redactor>;
+
+    /// Builds the provider `name` from the configuration. `seed` is the
+    /// session's redaction map: the returned redactor keeps its
+    /// placeholders and also knows the new provider's key. The error says
+    /// what is missing, such as the environment variable for the key.
+    fn switch(&mut self, name: ProviderName, seed: &RedactionMap) -> Result<Switch, String>;
+}
+
+/// A provider ready to take over the session.
+pub struct Switch {
+    pub config: ProviderConfig,
+    pub provider: Arc<dyn Provider>,
+    pub redactor: Box<dyn Redactor>,
+}
+
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "list the commands"),
+    ("/model", "show the model, or switch with /model <id>"),
+    (
+        "/provider",
+        "show the provider, or switch with /provider anthropic|openai",
+    ),
     ("/clear", "start a new session; the current one stays saved"),
     ("/compact", "summarise older turns to free context"),
     ("/cost", "tokens used so far"),
@@ -40,9 +70,8 @@ pub struct Repl<'a> {
     pub store: Option<&'a SessionStore>,
     /// Fired by Ctrl-C during a turn.
     pub interrupt: Interrupt,
-    /// Builds the redactor for a session started by `/clear`, so the new
-    /// session does not inherit placeholders from the old one.
-    pub new_redactor: Box<dyn FnMut() -> Box<dyn Redactor> + Send + 'a>,
+    /// Builds redactors for `/clear` and providers for `/provider`.
+    pub backend: Box<dyn Backend + 'a>,
 }
 
 #[derive(PartialEq)]
@@ -116,7 +145,25 @@ impl Repl<'_> {
         session: &mut Session,
         out: &mut dyn Output,
     ) -> Flow {
-        match command.trim() {
+        let (name, arg) = match command.trim().split_once(char::is_whitespace) {
+            Some((name, arg)) => (name, arg.trim()),
+            None => (command.trim(), ""),
+        };
+        match name {
+            "model" if arg.is_empty() => {
+                out.status(&format!("model {} ({})", session.model, session.provider))
+            }
+            "model" => {
+                self.agent.config_mut().provider.model = arg.to_string();
+                self.record_provider(session);
+                out.status(&format!("model {arg} for the rest of this session"));
+                self.save(session, out);
+            }
+            "provider" if arg.is_empty() => out.status(&format!(
+                "provider {} (model {}); switch with /provider anthropic|openai",
+                session.provider, session.model
+            )),
+            "provider" => self.switch_provider(arg, session, out),
             "help" => {
                 for (name, what) in COMMANDS {
                     out.status(&format!("{name:<12} {what}"));
@@ -124,7 +171,7 @@ impl Repl<'_> {
             }
             "clear" => {
                 self.save(session, out);
-                self.agent.set_redactor((self.new_redactor)());
+                self.agent.set_redactor(self.backend.fresh_redactor());
                 *session = self.agent.new_session();
                 out.status(&format!("new session {}", session.id));
             }
@@ -160,6 +207,41 @@ impl Repl<'_> {
             other => out.status(&format!("unknown command /{other}; /help lists them")),
         }
         Flow::Continue
+    }
+
+    fn switch_provider(&mut self, arg: &str, session: &mut Session, out: &mut dyn Output) {
+        let name = match arg.to_ascii_lowercase().as_str() {
+            "anthropic" => ProviderName::Anthropic,
+            "openai" => ProviderName::OpenAi,
+            other => {
+                out.status(&format!("unknown provider {other}: anthropic or openai"));
+                return;
+            }
+        };
+        match self.backend.switch(name, &session.redactions) {
+            Ok(switch) => {
+                self.agent.config_mut().provider = switch.config;
+                self.agent.set_provider(switch.provider);
+                self.agent.set_redactor(switch.redactor);
+                self.record_provider(session);
+                out.status(&format!(
+                    "provider {} with model {} for the rest of this session",
+                    session.provider, session.model
+                ));
+                self.save(session, out);
+            }
+            Err(missing) => out.status(&format!("cannot switch to {}: {missing}", name.as_str())),
+        }
+    }
+
+    /// Writes the agent's current provider and model into the session, so
+    /// the saved file and a later resume see the change.
+    fn record_provider(&self, session: &mut Session) {
+        let config = self.agent.config();
+        session.provider = config.provider.name.as_str().to_string();
+        session.model = config.provider.model.clone();
+        session.config = config.to_file();
+        session.touch();
     }
 
     fn save(&self, session: &Session, out: &mut dyn Output) {
