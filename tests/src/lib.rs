@@ -91,6 +91,7 @@ pub enum Shown {
     ToolCall { name: String, summary: String },
     ConfirmWrite { path: PathBuf, diff: String },
     ConfirmCommand { command: String },
+    Status(String),
 }
 
 /// Records everything shown and answers confirmations from a script.
@@ -131,6 +132,10 @@ impl Output for RecordingOutput {
             name: name.to_string(),
             summary: summary.to_string(),
         });
+    }
+
+    fn status(&mut self, line: &str) {
+        self.events.push(Shown::Status(line.to_string()));
     }
 
     fn confirm(&mut self, request: &Confirmation<'_>) -> Decision {

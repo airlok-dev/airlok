@@ -41,6 +41,10 @@ path = "redact_only.rs"
 name = "sessions"
 path = "sessions.rs"
 
+[[test]]
+name = "compaction"
+path = "compaction.rs"
+
 [dependencies]
 airlok-core.workspace = true
 airlok-llm.workspace = true

@@ -21,7 +21,7 @@ use crate::redact::{
     for_display, redact_only_in, split_incomplete_placeholder, RedactionMap, Redactor,
 };
 use crate::safety::{CommandVerdict, Confirmation, Decision};
-use crate::session::Session;
+use crate::session::{Compaction, Session};
 use crate::tools::{truncate_output, Plan, Tool, ToolError, ToolRegistry};
 use crate::{CoreError, Output};
 
@@ -114,6 +114,13 @@ impl Agent {
         prompt: &str,
         out: &mut dyn Output,
     ) -> Result<usize, CoreError> {
+        let threshold = self
+            .config
+            .agent
+            .compact_threshold(self.config.provider.context_window);
+        if session.usage.context_tokens >= threshold {
+            self.compact(session, out).await?;
+        }
         let start = session.messages.len();
         let result = self.rounds(session, prompt, out).await;
         if result.is_err() {
@@ -122,6 +129,75 @@ impl Agent {
             session.messages.truncate(start);
         }
         result
+    }
+
+    /// Replaces everything but the last `keep_recent_turns` turns with a
+    /// model-written summary. One request, no tools, through the redactor
+    /// like any other. Returns `None` when there is nothing to fold.
+    pub async fn compact(
+        &mut self,
+        session: &mut Session,
+        out: &mut dyn Output,
+    ) -> Result<Option<Compaction>, CoreError> {
+        let starts = session.turn_starts();
+        let keep = self.config.agent.keep_recent_turns;
+        if starts.len() <= keep {
+            return Ok(None);
+        }
+        let cut = starts[starts.len() - keep];
+        let mut to_summarise = session.messages[..cut].to_vec();
+        to_summarise.push(Message::user_text(SUMMARY_INSTRUCTION));
+        let (request, map) = self.build_request(SUMMARY_SYSTEM, &to_summarise, &[]);
+        let before = if session.usage.context_tokens > 0 {
+            session.usage.context_tokens
+        } else {
+            request.estimated_tokens()
+        };
+        let mut silent = Silent;
+        let response = self.stream_response(request, &map, &mut silent).await?;
+        let summary: String = response
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if summary.trim().is_empty() {
+            return Err(airlok_llm::LlmError::Protocol("empty compaction summary".into()).into());
+        }
+
+        let mut messages = vec![
+            Message::user_text(format!(
+                "Summary of the conversation so far, written when it was compacted:\n\n{summary}"
+            )),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "Understood. I will continue from that summary.".into(),
+            }]),
+        ];
+        messages.extend_from_slice(&session.messages[cut..]);
+        session.messages = messages;
+        let system = system_prompt(&self.config, &self.context, session);
+        let (next, _) = self.build_request(&system, &session.messages, &self.tools.specs());
+        let after = next.estimated_tokens();
+        session.usage.context_tokens = after;
+        session.usage.estimated = true;
+        session.redactions = map;
+        let record = Compaction {
+            at: crate::session::now_rfc3339(),
+            before_tokens: before,
+            after_tokens: after,
+            summary,
+        };
+        session.compactions.push(record.clone());
+        session.touch();
+        out.status(&format!(
+            "compacted: {} -> {} tokens",
+            fmt_tokens(before),
+            fmt_tokens(after)
+        ));
+        Ok(Some(record))
     }
 
     async fn rounds(
@@ -488,6 +564,35 @@ fn system_prompt(config: &Config, context: &str, session: &Session) -> String {
         ));
     }
     prompt
+}
+
+const SUMMARY_SYSTEM: &str = "You are summarising a coding session so it can continue with less context. \
+    Write a compact summary under these headings: Task, Progress so far, Decisions, Files touched, Open items. \
+    Keep exact file paths, commands, error messages, and placeholder strings such as <<SECRET_1>> verbatim. \
+    Include nothing that is not in the conversation.";
+
+const SUMMARY_INSTRUCTION: &str =
+    "Summarise the conversation above for a continuation. Reply with the summary only.";
+
+/// Swallows the summary stream; the user sees the status line instead.
+struct Silent;
+
+impl Output for Silent {
+    fn text(&mut self, _chunk: &str) {}
+    fn tool_call(&mut self, _name: &str, _summary: &str) {}
+    fn status(&mut self, _line: &str) {}
+    fn confirm(&mut self, _request: &Confirmation<'_>) -> Decision {
+        Decision::Reject
+    }
+}
+
+/// `180k` for anything past a thousand, else the number itself.
+pub fn fmt_tokens(n: u64) -> String {
+    if n >= 1000 {
+        format!("{}k", (n + 500) / 1000)
+    } else {
+        n.to_string()
+    }
 }
 
 /// Applies `f` to every string leaf of a JSON value, in place.

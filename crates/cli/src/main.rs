@@ -367,6 +367,18 @@ impl Stdout {
 }
 
 impl Output for Stdout {
+    fn status(&mut self, line: &str) {
+        let rest = self.renderer.finish();
+        self.write(&rest);
+        self.end_line();
+        let text = if self.renderer.is_rich() {
+            format!("\x1b[2m{line}\x1b[0m\n")
+        } else {
+            format!("{line}\n")
+        };
+        self.write(&text);
+    }
+
     fn text(&mut self, chunk: &str) {
         if self.collapsed > 0 {
             self.end_line();

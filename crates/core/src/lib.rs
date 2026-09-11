@@ -22,6 +22,9 @@ pub trait Output: Send {
     fn text(&mut self, chunk: &str);
     /// One tool call about to run, e.g. name `bash` with summary `ls`.
     fn tool_call(&mut self, name: &str, summary: &str);
+    /// A one-line note about the run itself, such as a compaction. Shown
+    /// dim, never part of the model's text.
+    fn status(&mut self, line: &str);
     /// Ask the user before a write or a command. Only called when the
     /// configuration says to confirm.
     fn confirm(&mut self, request: &Confirmation<'_>) -> Decision;

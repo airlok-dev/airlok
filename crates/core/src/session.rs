@@ -141,6 +141,20 @@ impl Session {
             .count()
     }
 
+    /// Index of the message that starts each turn: a user message whose
+    /// content is text, not tool results.
+    pub fn turn_starts(&self) -> Vec<usize> {
+        self.messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.role == airlok_llm::Role::User
+                    && matches!(m.content.first(), Some(ContentBlock::Text { .. }))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     pub fn touch(&mut self) {
         self.updated_at = now_rfc3339();
     }
