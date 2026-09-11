@@ -60,6 +60,9 @@ async fn secret_never_reaches_logs() {
         "key leaked into logs:\n{captured}"
     );
     assert_eq!(captured.matches(KEY).count(), 0);
-    // The user still sees the real value; only the logs must not.
-    assert_eq!(out.text(), format!("The key is {KEY}."));
+    // The terminal shows it masked; the logs must not show it at all.
+    assert_eq!(
+        out.text(),
+        format!("The key is {}.", airlok_core::redact::mask(KEY))
+    );
 }

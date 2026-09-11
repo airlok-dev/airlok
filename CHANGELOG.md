@@ -2,6 +2,12 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.3.1] - 2026-09-11
+
+### Security
+
+- The provider API key could be shown in the terminal: it was an ordinary redaction entry, so when the model echoed its placeholder the display path rehydrated it. Redaction entries now have a class. `rehydrate` entries (secrets found in files and tool output) are restored into files and commands and shown masked in the terminal, with `[redact] show_secrets_in_output = true` to opt into full display. `redact-only` entries, the provider API key, are never restored anywhere: the terminal shows `[redacted: the provider API key]` and a tool call carrying the placeholder is refused. `airlok redactions` lists kinds and classes; `--show-redactions` now shows the class.
+
 ## [0.3.0] - 2026-09-11
 
 ### Added

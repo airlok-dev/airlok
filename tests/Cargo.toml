@@ -33,6 +33,10 @@ path = "context.rs"
 name = "tools"
 path = "tools.rs"
 
+[[test]]
+name = "redact_only"
+path = "redact_only.rs"
+
 [dependencies]
 airlok-core.workspace = true
 airlok-llm.workspace = true

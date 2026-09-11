@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use airlok_core::config::{self, KeySource, Overrides, ProviderName, Sources};
 use airlok_core::context::{self, ContextInput};
-use airlok_core::redact::{Redactor, SecretRedactor};
+use airlok_core::redact::{Class, Redactor, SecretRedactor};
 use airlok_core::tools::{ToolRegistry, READ_ONLY_TOOLS};
 use airlok_core::CoreError;
 use airlok_core::{Agent, Config, Confirmation, Decision, Output, RunReport};
@@ -66,6 +66,21 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Config {
             action: ConfigAction::Show,
         }) => return config_show(&config, &sources),
+        Some(Command::Redactions) => {
+            println!("{:<28} {:<12} meaning", "kind", "class");
+            for (kind, class) in SecretRedactor::new().catalog() {
+                println!(
+                    "{kind:<28} {:<12} restored into files and commands; masked in the terminal",
+                    class.as_str()
+                );
+            }
+            println!(
+                "{:<28} {:<12} never restored anywhere; [redacted] in the terminal, refused in tool arguments",
+                "the provider API key",
+                Class::RedactOnly.as_str()
+            );
+            return Ok(());
+        }
         Some(Command::Context) => {
             // What leaves the machine: the block after redaction. The
             // provider key is not resolved here, so it is not in the map.
@@ -98,7 +113,8 @@ async fn main() -> anyhow::Result<()> {
         .resolve_key()
         .with_context(|| format!("cannot read the API key from {}", config.key_source()))?;
     let provider = build_provider(&config, key.clone());
-    let redactor = SecretRedactor::new().with_known("the provider API key", &key);
+    let redactor =
+        SecretRedactor::new().with_known("the provider API key", &key, Class::RedactOnly);
     let tools = ToolRegistry::defaults(&cwd, config.agent.bash_timeout);
 
     let mut agent =

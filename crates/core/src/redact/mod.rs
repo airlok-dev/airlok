@@ -1,5 +1,12 @@
 //! The airlock. Text leaving the machine passes through [`Redactor::redact`];
-//! text coming back passes through [`Redactor::rehydrate`].
+//! text coming back passes through [`Redactor::rehydrate`] for files and
+//! commands, and through [`for_display`] for the terminal.
+//!
+//! Entries have a [`Class`]. `Rehydrate` entries are secrets found in the
+//! user's files and tool output: they must be restored into files and
+//! commands or edits would break, and they are shown masked in the terminal
+//! unless configured otherwise. `RedactOnly` entries, such as the provider
+//! API key, are never restored anywhere.
 //!
 //! TODO(stage N): user-defined patterns, PII and hostname detectors, and
 //! per-project allow lists.
@@ -10,8 +17,33 @@ use std::collections::BTreeMap;
 
 pub use secrets::SecretRedactor;
 
-/// Placeholder (for example `<<SECRET_1>>`) to the original value.
-pub type RedactionMap = BTreeMap<String, String>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// Restored into files and commands; masked in the terminal by default.
+    Rehydrate,
+    /// Never restored. Shown as `[redacted: <kind>]`; refused in tool arguments.
+    RedactOnly,
+}
+
+impl Class {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Class::Rehydrate => "rehydrate",
+            Class::RedactOnly => "redact-only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub value: String,
+    /// What the value is, such as "anthropic api key", for display.
+    pub kind: String,
+    pub class: Class,
+}
+
+/// Placeholder (for example `<<SECRET_1>>`) to what it replaced.
+pub type RedactionMap = BTreeMap<String, Entry>;
 
 pub trait Redactor: Send {
     /// Replaces sensitive spans with placeholders. The same value always maps
@@ -19,12 +51,52 @@ pub trait Redactor: Send {
     /// cumulative map for every call so far.
     fn redact(&mut self, input: &str) -> (String, RedactionMap);
 
-    /// Puts the original values back in place of their placeholders.
-    fn rehydrate(&self, input: &str, map: &RedactionMap) -> String;
+    /// Puts `Rehydrate` values back in place of their placeholders, for
+    /// files and commands. `RedactOnly` placeholders are left untouched.
+    fn rehydrate(&self, input: &str, map: &RedactionMap) -> String {
+        let mut out = input.to_string();
+        for (placeholder, entry) in map {
+            if entry.class == Class::Rehydrate && out.contains(placeholder) {
+                out = out.replace(placeholder, &entry.value);
+            }
+        }
+        out
+    }
+}
 
-    /// What kind of value a placeholder stands for, such as
-    /// "anthropic api key", for display without the value.
-    fn kind_of(&self, placeholder: &str) -> Option<&str>;
+/// Text for the terminal. `RedactOnly` placeholders become
+/// `[redacted: <kind>]`; `Rehydrate` ones become the value when
+/// `show_secrets` is set and a mask otherwise.
+pub fn for_display(input: &str, map: &RedactionMap, show_secrets: bool) -> String {
+    let mut out = input.to_string();
+    for (placeholder, entry) in map {
+        if !out.contains(placeholder) {
+            continue;
+        }
+        let replacement = match entry.class {
+            Class::RedactOnly => format!("[redacted: {}]", entry.kind),
+            Class::Rehydrate if show_secrets => entry.value.clone(),
+            Class::Rehydrate => mask(&entry.value),
+        };
+        out = out.replace(placeholder, &replacement);
+    }
+    out
+}
+
+/// First four characters and the length, for example `sk-a… (49 chars)`.
+pub fn mask(value: &str) -> String {
+    let shown: String = value.chars().take(4).collect();
+    format!("{shown}… ({} chars)", value.chars().count())
+}
+
+/// The `RedactOnly` entries whose placeholder appears in `input`.
+pub fn redact_only_in<'a>(input: &str, map: &'a RedactionMap) -> Vec<(&'a str, &'a Entry)> {
+    map.iter()
+        .filter(|(placeholder, entry)| {
+            entry.class == Class::RedactOnly && input.contains(placeholder.as_str())
+        })
+        .map(|(placeholder, entry)| (placeholder.as_str(), entry))
+        .collect()
 }
 
 /// Longest placeholder we will ever hold back while streaming. Anything held
@@ -32,7 +104,7 @@ pub trait Redactor: Send {
 const MAX_PLACEHOLDER_LEN: usize = 32;
 
 /// Splits streamed text into (emit now, hold back) so a placeholder that is
-/// still arriving is not shown half-rehydrated.
+/// still arriving is not shown half-substituted.
 pub fn split_incomplete_placeholder(buffer: &str) -> (&str, &str) {
     if let Some(start) = buffer.rfind("<<") {
         let tail = &buffer[start..];
@@ -50,6 +122,66 @@ pub fn split_incomplete_placeholder(buffer: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::split_incomplete_placeholder as split;
+    use super::*;
+
+    fn map() -> RedactionMap {
+        let mut map = RedactionMap::new();
+        map.insert(
+            "<<SECRET_1>>".into(),
+            Entry {
+                value: "0123456789abcdef".into(),
+                kind: "the provider API key".into(),
+                class: Class::RedactOnly,
+            },
+        );
+        map.insert(
+            "<<SECRET_2>>".into(),
+            Entry {
+                value: "sk-ant-api03-xyz".into(),
+                kind: "anthropic api key".into(),
+                class: Class::Rehydrate,
+            },
+        );
+        map
+    }
+
+    struct Plain;
+    impl Redactor for Plain {
+        fn redact(&mut self, input: &str) -> (String, RedactionMap) {
+            (input.to_string(), map())
+        }
+    }
+
+    #[test]
+    fn rehydrate_restores_only_rehydrate_entries() {
+        let text = "a <<SECRET_1>> b <<SECRET_2>> c";
+        assert_eq!(
+            Plain.rehydrate(text, &map()),
+            "a <<SECRET_1>> b sk-ant-api03-xyz c"
+        );
+    }
+
+    #[test]
+    fn display_masks_or_shows_and_never_reveals_redact_only() {
+        let text = "a <<SECRET_1>> b <<SECRET_2>> c";
+        assert_eq!(
+            for_display(text, &map(), false),
+            "a [redacted: the provider API key] b sk-a… (16 chars) c"
+        );
+        assert_eq!(
+            for_display(text, &map(), true),
+            "a [redacted: the provider API key] b sk-ant-api03-xyz c"
+        );
+    }
+
+    #[test]
+    fn finds_redact_only_placeholders() {
+        let m = map();
+        let found = redact_only_in("x <<SECRET_2>> y <<SECRET_1>>", &m);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "<<SECRET_1>>");
+        assert!(redact_only_in("nothing", &m).is_empty());
+    }
 
     #[test]
     fn holds_back_partial_placeholder() {

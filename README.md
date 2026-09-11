@@ -23,6 +23,7 @@ airlok --show-redactions "..."                 # list what was redacted (kind an
 airlok config init                             # write a commented config to the user path
 airlok config show                             # print the effective config and the key source
 airlok context                                 # print the context block sent with the system prompt, after redaction
+airlok redactions                              # list what the redactor detects and how each kind is treated
 ```
 
 Every `write_file` and `edit_file` call shows a unified diff and asks `Apply? [y]es / [n]o / [a]ll / [q]uit`. Every `bash` call that is not on the allow list shows the command and asks the same way. `y` applies this one, `n` sends a rejection back to the model so it can adapt, `a` approves the rest of that kind for the run, and `q` aborts the run with a non-zero exit. Prompts are read from the terminal, not stdin, so piped input still works; without a terminal, pass `--yes` or turn the confirmations off in the config.
@@ -86,9 +87,16 @@ bash_denylist = ["rm -rf", "git push --force", "sudo"]
 
 [context]
 max_bytes = 32768        # cap on the context block; tree is cut first, then instructions
+
+[redact]
+show_secrets_in_output = false   # show secrets from files in full in the terminal instead of masked
 ```
 
 For openai, `base_url` falls back to the `OPENAI_BASE_URL` environment variable when the config does not set it.
+
+### What comes back, and what never does
+
+Every placeholder belongs to one of two classes, listed by `airlok redactions`. Secrets found in your files and in tool output are `rehydrate`: the real value is restored into files and commands, so edits keep working, and shown masked in the terminal (first four characters and the length) unless `[redact] show_secrets_in_output = true`. The provider API key is `redact-only`: it is never restored anywhere. If the model echoes its placeholder it prints as `[redacted: the provider API key]`, and a tool call carrying it is refused with a message to the model. `--show-redactions` lists each placeholder's kind, length, and class, never the value.
 
 The key is read from exactly one place. `api_key_cmd` wins if set, then `api_key_env`, then the provider default: `ANTHROPIC_API_KEY` for anthropic, and `AZURE_OPENAI_API_KEY` then `OPENAI_API_KEY` for openai. A command runs once per process and its output is never logged. `airlok config show` prints the env var name or the command, never the value. Whatever key is in use is also added to the redactor, so it can never leave the machine inside a file or command output either.
 
