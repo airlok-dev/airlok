@@ -73,6 +73,7 @@ pub struct ConfigFile {
     pub provider: ProviderSection,
     pub agent: AgentSection,
     pub safety: SafetySection,
+    pub context: ContextSection,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -112,6 +113,13 @@ pub struct SafetySection {
     pub bash_allowlist: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bash_denylist: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContextSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
 }
 
 impl ConfigFile {
@@ -158,6 +166,9 @@ impl ConfigFile {
                 bash_allowlist: over.safety.bash_allowlist.or(self.safety.bash_allowlist),
                 bash_denylist: over.safety.bash_denylist.or(self.safety.bash_denylist),
             },
+            context: ContextSection {
+                max_bytes: over.context.max_bytes.or(self.context.max_bytes),
+            },
         }
     }
 }
@@ -176,6 +187,7 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub agent: AgentConfig,
     pub safety: SafetyConfig,
+    pub context: ContextConfig,
     /// Directory the agent works in. Tools resolve relative paths against it.
     pub cwd: PathBuf,
 }
@@ -205,6 +217,14 @@ pub struct SafetyConfig {
     pub bash_allowlist: Vec<String>,
     pub bash_denylist: Vec<String>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextConfig {
+    /// Upper bound on the context block prepended to the system prompt.
+    pub max_bytes: usize,
+}
+
+pub const DEFAULT_CONTEXT_MAX_BYTES: usize = 32 * 1024;
 
 pub const DEFAULT_BASH_ALLOWLIST: &[&str] = &[
     "git status",
@@ -315,6 +335,9 @@ impl Config {
                     .bash_denylist
                     .unwrap_or_else(|| to_strings(DEFAULT_BASH_DENYLIST)),
             },
+            context: ContextConfig {
+                max_bytes: file.context.max_bytes.unwrap_or(DEFAULT_CONTEXT_MAX_BYTES),
+            },
             cwd,
         }
     }
@@ -339,6 +362,9 @@ impl Config {
                 confirm_bash: Some(self.safety.confirm_bash),
                 bash_allowlist: Some(self.safety.bash_allowlist.clone()),
                 bash_denylist: Some(self.safety.bash_denylist.clone()),
+            },
+            context: ContextSection {
+                max_bytes: Some(self.context.max_bytes),
             },
         }
     }
@@ -456,6 +482,9 @@ pub const TEMPLATE: &str = r##"# airlok configuration. Precedence: CLI flags > .
 # confirm_bash = true      # ask before running a command that is not allowlisted
 # bash_allowlist = ["git status", "git diff", "ls", "cat", "pwd", "find", "grep", "rg", "cargo check", "cargo test", "cargo build"]
 # bash_denylist = ["rm -rf", "git push --force", "sudo"]
+
+[context]
+# max_bytes = 32768         # cap on the context block (tree is cut first, then instructions)
 "##;
 
 #[cfg(test)]

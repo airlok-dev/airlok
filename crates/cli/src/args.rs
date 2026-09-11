@@ -44,6 +44,8 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Print the context block that would be sent with the system prompt, after redaction
+    Context,
 }
 
 #[derive(Debug, Subcommand)]

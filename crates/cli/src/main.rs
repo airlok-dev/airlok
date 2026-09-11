@@ -6,7 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use airlok_core::config::{self, KeySource, Overrides, ProviderName, Sources};
-use airlok_core::redact::SecretRedactor;
+use airlok_core::context::{self, ContextInput};
+use airlok_core::redact::{Redactor, SecretRedactor};
 use airlok_core::tools::ToolRegistry;
 use airlok_core::{Agent, Config, Confirmation, Decision, Output, RunReport};
 use airlok_llm::openai::Auth;
@@ -45,6 +46,16 @@ async fn main() -> anyhow::Result<()> {
         cwd.clone(),
     )?;
 
+    let user_instructions = user_path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|dir| dir.join("AIRLOK.md"));
+    let context = context::build(&ContextInput {
+        cwd: &cwd,
+        user_instructions: user_instructions.as_deref(),
+        max_bytes: config.context.max_bytes,
+    });
+
     match args.command {
         Some(Command::Config {
             action: ConfigAction::Init,
@@ -52,6 +63,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Config {
             action: ConfigAction::Show,
         }) => return config_show(&config, &sources),
+        Some(Command::Context) => {
+            // What leaves the machine: the block after redaction. The
+            // provider key is not resolved here, so it is not in the map.
+            let (redacted, _) = SecretRedactor::new().redact(&context.text);
+            print!("{redacted}");
+            return Ok(());
+        }
         None => {}
     }
     let Some(prompt) = args.prompt else {
@@ -80,7 +98,8 @@ async fn main() -> anyhow::Result<()> {
     let redactor = SecretRedactor::new().with_known("the provider API key", &key);
     let tools = ToolRegistry::defaults(&cwd, config.agent.bash_timeout);
 
-    let mut agent = Agent::new(provider, tools, Box::new(redactor), config);
+    let mut agent =
+        Agent::new(provider, tools, Box::new(redactor), config).with_context(context.text);
     let mut out = Stdout {
         mid_line: false,
         terminal,

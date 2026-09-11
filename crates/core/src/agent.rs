@@ -4,8 +4,7 @@
 //! at send time, and every response is rehydrated before it is stored or
 //! acted on. The provider only ever sees placeholders.
 //!
-//! TODO(stage N): context injection (repo map, instructions file),
-//! compaction when history grows, subagents.
+//! TODO(stage N): compaction when history grows, subagents.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,6 +27,8 @@ pub struct Agent {
     tools: ToolRegistry,
     redactor: Box<dyn Redactor>,
     config: Config,
+    /// Rendered `core::context` block, appended to the system prompt.
+    context: String,
 }
 
 /// What happened during one run.
@@ -66,7 +67,14 @@ impl Agent {
             tools,
             redactor,
             config,
+            context: String::new(),
         }
+    }
+
+    /// Sets the context block built by [`crate::context::build`].
+    pub fn with_context(mut self, context: String) -> Self {
+        self.context = context;
+        self
     }
 
     pub fn config_mut(&mut self) -> &mut Config {
@@ -78,7 +86,7 @@ impl Agent {
         prompt: &str,
         out: &mut dyn Output,
     ) -> Result<RunReport, CoreError> {
-        let system = system_prompt(&self.config);
+        let system = system_prompt(&self.config, &self.context);
         let specs = self.tools.specs();
         let mut history = vec![Message::user_text(prompt)];
         let mut report = RunReport::default();
@@ -375,15 +383,20 @@ enum Gate {
     Stop(String),
 }
 
-fn system_prompt(config: &Config) -> String {
-    format!(
+fn system_prompt(config: &Config, context: &str) -> String {
+    let mut prompt = format!(
         "You are airlok, a coding agent working in the directory {cwd}. \
          Complete the user's task using the available tools, then reply with a short summary of what you did. \
          Some values in files and command output are replaced with placeholders that look like <<SECRET_1>>. \
          Treat them as opaque strings: reproduce them exactly as given whenever they must appear in a file, \
          a command, or your reply, and never invent or alter them.",
         cwd = config.cwd.display()
-    )
+    );
+    if !context.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(context);
+    }
+    prompt
 }
 
 /// Applies `f` to every string leaf of a JSON value, in place.

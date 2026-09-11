@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod context;
 pub mod redact;
 pub mod safety;
 pub mod session;
