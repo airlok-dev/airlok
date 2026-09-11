@@ -110,7 +110,7 @@ impl Agent {
                 .collect();
             let wants_tools = response.stop_reason == StopReason::ToolUse && !tool_calls.is_empty();
             let results = if wants_tools {
-                self.execute_tools(&tool_calls, out, &mut approved).await
+                self.execute_tools(&tool_calls, out, &mut approved).await?
             } else {
                 Vec::new()
             };
@@ -255,7 +255,7 @@ impl Agent {
         calls: &[&ContentBlock],
         out: &mut dyn Output,
         approved: &mut Approved,
-    ) -> Vec<ContentBlock> {
+    ) -> Result<Vec<ContentBlock>, CoreError> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
             let ContentBlock::ToolUse { id, name, input } = call else {
@@ -264,7 +264,7 @@ impl Agent {
             let (content, is_error) = match self.tools.get(name) {
                 Some(tool) => {
                     out.tool_call(name, &tool.summary(input));
-                    self.run_tool(name, tool, input, out, approved).await
+                    self.run_tool(name, tool, input, out, approved).await?
                 }
                 None => {
                     warn!(tool = %name, "unknown tool requested");
@@ -278,7 +278,7 @@ impl Agent {
                 is_error,
             });
         }
-        results
+        Ok(results)
     }
 
     /// Plans, asks if the policy says so, then executes.
@@ -289,8 +289,8 @@ impl Agent {
         input: &Value,
         out: &mut dyn Output,
         approved: &mut Approved,
-    ) -> (String, bool) {
-        match self.gate(tool, input, out, approved).await {
+    ) -> Result<(String, bool), CoreError> {
+        Ok(match self.gate(tool, input, out, approved).await {
             Ok(Gate::Proceed) => {
                 info!(tool = %name, "executing");
                 match tool.execute(input.clone()).await {
@@ -305,11 +305,15 @@ impl Agent {
                 info!(tool = %name, "not executed");
                 (reason, true)
             }
+            Ok(Gate::Abort) => {
+                info!(tool = %name, "run aborted by the user");
+                return Err(CoreError::Aborted);
+            }
             Err(e) => {
                 warn!(tool = %name, error = %e, "tool could not be planned");
                 (format!("error: {e}"), true)
             }
-        }
+        })
     }
 
     async fn gate(
@@ -340,6 +344,7 @@ impl Agent {
                          explain what you intended or propose a different approach.",
                         path.display()
                     )),
+                    Decision::Quit => Gate::Abort,
                 }
             }
             Plan::Command { command } => match safety.classify(&command) {
@@ -362,6 +367,7 @@ impl Agent {
                             "The user declined to run `{command}`. Do not retry it unchanged; \
                              explain what you intended or propose a different approach."
                         )),
+                        Decision::Quit => Gate::Abort,
                     }
                 }
             },
@@ -381,6 +387,8 @@ enum Gate {
     Proceed,
     /// Not executed; the string goes back to the model as an error result.
     Stop(String),
+    /// The user quit; the run ends without another provider call.
+    Abort,
 }
 
 fn system_prompt(config: &Config, context: &str) -> String {

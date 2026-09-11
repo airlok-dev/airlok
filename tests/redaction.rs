@@ -247,3 +247,28 @@ async fn secret_in_grep_output_never_reaches_the_provider() {
     );
     assert!(!wire.contains("sk-ant-"), "{wire}");
 }
+
+#[tokio::test]
+async fn placeholder_split_across_chunks_inside_a_code_block_is_rehydrated() {
+    let dir = TempDir::new("code-split");
+    std::fs::write(dir.path().join(".env"), format!("KEY={KEY}\n")).unwrap();
+    let provider = MockProvider::scripted(vec![
+        tool_call("toolu_1", "read_file", json!({"path": ".env"})),
+        vec![
+            StreamEvent::TextDelta("Here it is:\n```env\nKEY=<<SE".into()),
+            StreamEvent::TextDelta("CRET_1>>\n``".into()),
+            StreamEvent::TextDelta("`\n".into()),
+            StreamEvent::MessageEnd {
+                stop_reason: StopReason::EndTurn,
+            },
+        ],
+    ]);
+    let mut out = RecordingOutput::default();
+
+    agent(provider, dir.path())
+        .run("show", &mut out)
+        .await
+        .unwrap();
+
+    assert_eq!(out.text(), format!("Here it is:\n```env\nKEY={KEY}\n```\n"));
+}

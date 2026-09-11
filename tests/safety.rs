@@ -268,3 +268,30 @@ async fn confirmations_off_never_prompt() {
     assert!(dir.path().join("c.txt").exists());
     assert_eq!(out.decisions.len(), 2);
 }
+
+#[tokio::test]
+async fn quit_aborts_the_run_before_anything_else_happens() {
+    let dir = TempDir::new("quit");
+    std::fs::write(dir.path().join("a.txt"), "keep\n").unwrap();
+    let provider = MockProvider::scripted(vec![
+        tool_call(
+            "toolu_1",
+            "write_file",
+            json!({"path": "a.txt", "content": "clobbered\n"}),
+        ),
+        reply("never reached"),
+    ]);
+    let mut out = RecordingOutput::answering(vec![Decision::Quit]);
+
+    let err = agent(provider.clone(), dir.path())
+        .run("go", &mut out)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, airlok_core::CoreError::Aborted), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "keep\n"
+    );
+    assert_eq!(provider.requests().len(), 1, "no request after the abort");
+}
