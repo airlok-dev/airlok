@@ -1,4 +1,5 @@
 mod args;
+mod diff;
 mod keys;
 mod output;
 mod render;

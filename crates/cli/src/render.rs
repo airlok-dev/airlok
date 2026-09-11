@@ -12,6 +12,8 @@
 //! whenever each fits alone, leaving the label or the bullet on a line of
 //! its own.
 
+use std::sync::OnceLock;
+
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -29,8 +31,6 @@ pub enum Renderer {
 pub struct Rich {
     skin: MadSkin,
     width: usize,
-    syntaxes: SyntaxSet,
-    theme: Theme,
     /// The incomplete last line of the current chunk.
     pending: String,
     block: Block,
@@ -47,6 +47,21 @@ enum Block {
     Table {
         lines: Vec<String>,
     },
+}
+
+/// Syntax definitions and the colour theme, loaded once and shared by
+/// code blocks in replies and by diffs.
+pub struct Highlighting {
+    pub syntaxes: SyntaxSet,
+    pub theme: Theme,
+}
+
+pub fn highlighting() -> &'static Highlighting {
+    static LOADED: OnceLock<Highlighting> = OnceLock::new();
+    LOADED.get_or_init(|| Highlighting {
+        syntaxes: SyntaxSet::load_defaults_newlines(),
+        theme: ThemeSet::load_defaults().themes["base16-ocean.dark"].clone(),
+    })
 }
 
 impl Renderer {
@@ -68,8 +83,6 @@ impl Renderer {
         Renderer::Rich(Box::new(Rich {
             skin: MadSkin::default_dark(),
             width,
-            syntaxes: SyntaxSet::load_defaults_newlines(),
-            theme: ThemeSet::load_defaults().themes["base16-ocean.dark"].clone(),
             pending: String::new(),
             block: Block::Prose(Vec::new()),
         }))
@@ -212,16 +225,17 @@ impl Rich {
     }
 
     fn code(&self, lang: &str, lines: &[String]) -> String {
-        let syntax = self
+        let h = highlighting();
+        let syntax = h
             .syntaxes
             .find_syntax_by_token(lang)
-            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
-        let mut highlighter = HighlightLines::new(syntax, &self.theme);
+            .unwrap_or_else(|| h.syntaxes.find_syntax_plain_text());
+        let mut highlighter = HighlightLines::new(syntax, &h.theme);
         let mut out = String::new();
         for line in lines {
             let text = format!("{line}\n");
             let ranges = highlighter
-                .highlight_line(&text, &self.syntaxes)
+                .highlight_line(&text, &h.syntaxes)
                 .unwrap_or_else(|_| vec![(syntect::highlighting::Style::default(), text.as_str())]);
             out.push_str("  ");
             out.push_str(&as_24_bit_terminal_escaped(&ranges, false));

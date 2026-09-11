@@ -11,8 +11,9 @@ use std::time::Duration;
 use airlok_core::tools::READ_ONLY_TOOLS;
 use airlok_core::{Confirmation, Decision, Output};
 
+use crate::diff;
 use crate::keys::{Cbreak, Keys};
-use crate::render::Renderer;
+use crate::render::{highlighting, Renderer};
 use crate::status::{self, Screen};
 use crate::terminal::Terminal;
 
@@ -203,9 +204,19 @@ impl Output for Stdout {
         let decision = match self.terminal.as_mut() {
             None => Decision::Reject,
             Some(terminal) => match request {
-                Confirmation::Write { diff, .. } => {
-                    terminal.show_diff(diff);
-                    terminal.ask("Apply?")
+                Confirmation::Write { path, diff } => {
+                    let colors = std::env::var_os("NO_COLOR").is_none().then(highlighting);
+                    let lines = diff::render(&path.display().to_string(), diff, colors);
+                    let (page, rest) = lines.split_at(lines.len().min(diff::PAGE));
+                    terminal.show_lines(page);
+                    if !rest.is_empty() {
+                        let marker = diff::more_lines(rest.len());
+                        terminal.show_lines(&[match colors {
+                            Some(_) => format!("\x1b[2m{marker}\x1b[0m"),
+                            None => marker,
+                        }]);
+                    }
+                    terminal.ask_paged("Apply?", rest)
                 }
                 Confirmation::Command { command } => terminal.ask(&format!("Run `{command}`?")),
             },
