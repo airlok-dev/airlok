@@ -1,9 +1,11 @@
 mod args;
+mod output;
 mod render;
 mod repl;
+mod status;
 mod terminal;
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -12,11 +14,9 @@ use airlok_core::context::{self, ContextInput};
 use airlok_core::redact::{Class, RedactionMap, Redactor, SecretRedactor};
 use airlok_core::repl::{Backend, Repl, Switch};
 use airlok_core::session::Summary;
-use airlok_core::tools::{ToolRegistry, READ_ONLY_TOOLS};
+use airlok_core::tools::ToolRegistry;
 use airlok_core::CoreError;
-use airlok_core::{
-    Agent, Config, Confirmation, Decision, Interrupt, Output, RunReport, SessionStore,
-};
+use airlok_core::{Agent, Config, Interrupt, Output, RunReport, SessionStore};
 use airlok_llm::openai::Auth;
 use airlok_llm::{Anthropic, OpenAi, Provider};
 use anyhow::{anyhow, bail, Context};
@@ -24,7 +24,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use args::{Args, Command, ConfigAction, SessionsAction};
-use render::Renderer;
+use output::Stdout;
 use terminal::Terminal;
 
 #[tokio::main]
@@ -114,7 +114,11 @@ async fn main() -> anyhow::Result<()> {
             )
         })?)
     } else {
-        eprintln!("warning: confirmations are off; writes and commands will run without asking");
+        if prompt.is_some() {
+            eprintln!(
+                "warning: confirmations are off; writes and commands will run without asking"
+            );
+        }
         None
     };
 
@@ -126,8 +130,17 @@ async fn main() -> anyhow::Result<()> {
         })?),
         None => None,
     };
+    // Notes for the REPL's startup line; a one-shot run prints them on
+    // stderr instead.
+    let mut notes = Vec::new();
     if let Some(session) = &resumed {
-        restore_session_model(&mut config, session, args.model.is_some());
+        if session.provider != config.provider.name.as_str() {
+            notes.push(format!("session last used {}", session.provider));
+        }
+        let note = restore_session_model(&mut config, session, args.model.is_some());
+        if let (Some(note), Some(_)) = (note, &prompt) {
+            eprintln!("{note}");
+        }
     }
 
     // The key is read once, after every check that could abort the run.
@@ -144,25 +157,49 @@ async fn main() -> anyhow::Result<()> {
 
     let mut agent =
         Agent::new(provider, tools, Box::new(redactor), config).with_context(context.text);
+    agent.set_plan_mode(args.plan);
     let mut session = match resumed {
         Some(mut session) => {
             session.resume();
-            eprintln!(
-                "resumed session {} ({} turns, last updated {})",
-                session.id,
-                session.turns(),
-                session.updated_at
-            );
+            if prompt.is_some() {
+                eprintln!(
+                    "resumed session {} ({} turns, last updated {})",
+                    session.id,
+                    session.turns(),
+                    session.updated_at
+                );
+            } else {
+                notes.insert(
+                    0,
+                    format!("resumed {} ({} turns)", session.id, session.turns()),
+                );
+            }
             session
         }
         None => agent.new_session(),
     };
+    if args.plan {
+        notes.push("plan mode".into());
+    }
+    if !prompting {
+        notes.push("confirmations off".into());
+    }
     let mut out = Stdout::new(terminal, args.verbose);
     let Some(prompt) = prompt else {
-        return run_repl(agent, session, &store, key, user_instructions, &mut out).await;
+        return run_repl(
+            agent,
+            session,
+            &store,
+            key,
+            user_instructions,
+            notes,
+            &mut out,
+        )
+        .await;
     };
+    out.begin_turn();
     let result = agent.turn(&mut session, &prompt, &mut out).await;
-    out.finish();
+    out.end_turn();
     if let Err(e) = store.save(&session) {
         eprintln!("warning: could not save the session: {e}");
     }
@@ -198,6 +235,7 @@ async fn run_repl(
     store: &SessionStore,
     key: String,
     user_instructions: Option<PathBuf>,
+    notes: Vec<String>,
     out: &mut Stdout,
 ) -> anyhow::Result<()> {
     let interrupt = Interrupt::new();
@@ -212,11 +250,7 @@ async fn run_repl(
         });
     }
     let mut lines = repl::Readline::new().context("cannot start line editing")?;
-    out.status(&format!(
-        "airlok {} · {} · /help for commands, Ctrl-D to quit",
-        env!("CARGO_PKG_VERSION"),
-        agent.config().provider.model
-    ));
+    out.status(&startup_line(agent.config(), &notes));
     let backend = CliBackend {
         startup: agent.config().provider.clone(),
         config: agent.config().clone(),
@@ -241,23 +275,48 @@ async fn run_repl(
 
 const KEY_LABEL: &str = "the provider API key";
 
+/// The REPL's one line at startup: version, model, directory, anything
+/// unusual about this start, and where the commands are.
+fn startup_line(config: &Config, notes: &[String]) -> String {
+    let dir = config
+        .cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| config.cwd.display().to_string());
+    let mut parts = vec![
+        format!("airlok {}", env!("CARGO_PKG_VERSION")),
+        config.provider.model.clone(),
+        dir,
+    ];
+    parts.extend(notes.iter().cloned());
+    parts.push("/help for commands".into());
+    parts.join(" · ")
+}
+
 /// Continues a resumed session on the model it last used, when it used
-/// the configured provider and `--model` was not given.
-fn restore_session_model(config: &mut Config, session: &airlok_core::Session, model_flag: bool) {
+/// the configured provider and `--model` was not given. Returns what to
+/// tell the user when the provider or the model differs from the config.
+fn restore_session_model(
+    config: &mut Config,
+    session: &airlok_core::Session,
+    model_flag: bool,
+) -> Option<String> {
     if session.provider != config.provider.name.as_str() {
-        eprintln!(
+        Some(format!(
             "note: the session last used {} ({}); continuing with {} ({}). /provider switches.",
             session.provider,
             session.model,
             config.provider.name.as_str(),
             config.provider.model
-        );
+        ))
     } else if !model_flag && session.model != config.provider.model {
-        eprintln!(
+        config.provider.model = session.model.clone();
+        Some(format!(
             "continuing on {}, the model this session last used",
             session.model
-        );
-        config.provider.model = session.model.clone();
+        ))
+    } else {
+        None
     }
 }
 
@@ -464,118 +523,6 @@ fn config_show(config: &Config, sources: &Sources) -> anyhow::Result<()> {
     println!();
     print!("{}", toml::to_string_pretty(&config.to_file())?);
     Ok(())
-}
-
-/// Streams model text to stdout as rendered markdown, shows tool calls
-/// dimmed (collapsing runs of read-only calls), and asks for
-/// confirmations on the terminal.
-struct Stdout {
-    renderer: Renderer,
-    terminal: Option<Terminal>,
-    verbose: bool,
-    /// Something is on the current line that needs a newline before
-    /// the next block of output.
-    mid_line: bool,
-    /// Consecutive read-only calls shown as one updating line.
-    collapsed: usize,
-}
-
-impl Stdout {
-    fn new(terminal: Option<Terminal>, verbose: bool) -> Self {
-        Self {
-            renderer: Renderer::for_stdout(),
-            terminal,
-            verbose,
-            mid_line: false,
-            collapsed: 0,
-        }
-    }
-
-    fn write(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        let mut stdout = std::io::stdout().lock();
-        let _ = stdout.write_all(text.as_bytes());
-        let _ = stdout.flush();
-        self.mid_line = !text.ends_with('\n');
-    }
-
-    fn end_line(&mut self) {
-        self.collapsed = 0;
-        if self.mid_line {
-            self.write("\n");
-        }
-    }
-
-    /// Flushes held markdown and closes the line at the end of the run.
-    fn finish(&mut self) {
-        let rest = self.renderer.finish();
-        self.write(&rest);
-        self.end_line();
-    }
-}
-
-impl Output for Stdout {
-    fn status(&mut self, line: &str) {
-        let rest = self.renderer.finish();
-        self.write(&rest);
-        self.end_line();
-        let text = if self.renderer.is_rich() {
-            format!("\x1b[2m{line}\x1b[0m\n")
-        } else {
-            format!("{line}\n")
-        };
-        self.write(&text);
-    }
-
-    fn end_turn(&mut self) {
-        self.finish();
-    }
-
-    fn text(&mut self, chunk: &str) {
-        if self.collapsed > 0 {
-            self.end_line();
-        }
-        let rendered = self.renderer.push(chunk);
-        self.write(&rendered);
-    }
-
-    fn tool_call(&mut self, name: &str, summary: &str) {
-        let rest = self.renderer.finish();
-        self.write(&rest);
-        let read_only = READ_ONLY_TOOLS.contains(&name);
-        if read_only && self.renderer.is_rich() && !self.verbose {
-            self.collapsed += 1;
-            let n = self.collapsed;
-            let line = format!(
-                "\r\x1b[2K\x1b[2mreading {n} file{}...\x1b[0m",
-                if n == 1 { "" } else { "s" }
-            );
-            self.write(&line);
-            return;
-        }
-        self.end_line();
-        if self.renderer.is_rich() {
-            self.write(&format!("\x1b[2m> {name}: {summary}\x1b[0m\n"));
-        } else {
-            self.write(&format!("> {name}: {summary}\n"));
-        }
-    }
-
-    fn confirm(&mut self, request: &Confirmation<'_>) -> Decision {
-        self.end_line();
-        let Some(terminal) = self.terminal.as_mut() else {
-            return Decision::Reject;
-        };
-        match request {
-            Confirmation::Write { diff, .. } => {
-                terminal.show_diff(diff);
-                terminal.ask("Apply?")
-            }
-            Confirmation::Command { command } => terminal.ask(&format!("Run `{command}`?")),
-        }
-    }
 }
 
 /// Lists what was redacted as kind and length only. Values never appear,
