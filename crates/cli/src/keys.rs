@@ -184,7 +184,10 @@ fn pop_char(typed: &mut Vec<u8>) {
     }
 }
 
-/// Whether `fd` has input within `timeout`.
+/// Whether `fd` has input within `timeout`. When poll cannot wait on the
+/// descriptor (macOS answers POLLNVAL for `/dev/tty`) or it has hung up,
+/// this sleeps out the timeout rather than return at once, so a caller's
+/// loop cannot spin.
 fn readable(fd: RawFd, timeout: Duration) -> bool {
     let mut poll = libc::pollfd {
         fd,
@@ -194,7 +197,11 @@ fn readable(fd: RawFd, timeout: Duration) -> bool {
     let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
     // SAFETY: one valid pollfd, and its count.
     let ready = unsafe { libc::poll(&mut poll, 1, ms) };
-    ready > 0 && poll.revents & libc::POLLIN != 0
+    if ready > 0 && poll.revents & libc::POLLIN == 0 {
+        std::thread::sleep(timeout);
+        return false;
+    }
+    ready > 0
 }
 
 #[cfg(test)]
@@ -255,6 +262,16 @@ pub mod tests {
                     .await
                     .is_ok()
             })
+    }
+
+    #[test]
+    fn a_descriptor_poll_rejects_is_waited_out_not_spun_on() {
+        // Not open, so poll answers POLLNVAL at once, as macOS does for
+        // /dev/tty.
+        let fd: RawFd = 9_999;
+        let started = std::time::Instant::now();
+        assert!(!readable(fd, Duration::from_millis(200)));
+        assert!(started.elapsed() >= Duration::from_millis(150));
     }
 
     #[test]

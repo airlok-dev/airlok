@@ -9,6 +9,7 @@ mod status;
 mod terminal;
 
 use std::io::IsTerminal;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -263,11 +264,16 @@ async fn run_repl(
         }
     });
     // Esc interrupts a turn; what else is typed during one starts the
-    // next prompt.
+    // next prompt. The keys come from stdin, which is the terminal in a
+    // session: macOS cannot poll /dev/tty.
     let typed = Arc::new(Mutex::new(Vec::new()));
-    match std::fs::File::open("/dev/tty") {
-        Ok(tty) => out.watch_keys(Keys::new(tty, interrupt.clone(), typed.clone())),
-        Err(e) => tracing::debug!(error = %e, "no terminal to watch for Esc"),
+    match std::io::stdin().as_fd().try_clone_to_owned() {
+        Ok(stdin) => out.watch_keys(Keys::new(
+            std::fs::File::from(stdin),
+            interrupt.clone(),
+            typed.clone(),
+        )),
+        Err(e) => tracing::debug!(error = %e, "cannot watch the terminal for Esc"),
     }
     let mut lines = repl::Readline::new(agent.config().cwd.clone(), typed)
         .context("cannot start line editing")?;
