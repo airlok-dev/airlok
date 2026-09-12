@@ -18,7 +18,7 @@ use rustyline::{Context, Helper};
 /// Rows of the menu under the line: enough for every command, so a bare
 /// `/` lists them all.
 /// At least as many as there are commands, so a bare `/` lists them all.
-const MENU_ROWS: usize = 16;
+const MENU_ROWS: usize = 24;
 /// Paths offered for one `@`.
 const PATH_MATCHES: usize = 10;
 /// Entries read from the working directory for `@`, at most.
@@ -476,14 +476,18 @@ mod tests {
         let menu = prompt.menu("/co", 3).unwrap();
         let lines: Vec<&str> = menu.display().lines().collect();
         assert_eq!(lines[0], "st", "the rest of /cost, inline");
-        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines.len(), 5, "{lines:?}");
         assert!(lines[1].starts_with("  /cost ") && lines[1].contains("tokens used"));
         assert!(lines[2].starts_with("  /compact "));
         assert!(lines[3].starts_with("  /config "));
+        assert!(lines[4].starts_with("  /context "));
         assert_eq!(menu.completion(), Some("st"));
         let (start, pairs) = prompt.candidates("/co", 3);
         assert_eq!(start, 0);
-        assert_eq!(replacements(&pairs), ["/cost", "/compact", "/config"]);
+        assert_eq!(
+            replacements(&pairs),
+            ["/cost", "/compact", "/config", "/context"]
+        );
         let all = prompt.menu("/", 1).unwrap();
         assert_eq!(
             all.display().lines().count(),

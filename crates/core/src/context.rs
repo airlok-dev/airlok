@@ -28,6 +28,9 @@ pub struct ContextBlock {
     pub text: String,
     /// Instruction files that were loaded, in order.
     pub instruction_files: Vec<PathBuf>,
+    /// How many bytes of `text` are instruction sections, after any
+    /// truncation. `/context` reports this as their share of the block.
+    pub instruction_bytes: usize,
 }
 
 /// The current git branch of `cwd`, when it is in a repository at all.
@@ -57,15 +60,17 @@ pub fn build(input: &ContextInput<'_>) -> ContextBlock {
 
     let head = environment_section(input.cwd, git.as_ref());
     let full_tree = tree_section(&root, false);
-    let text = assemble(&head, &full_tree, &project, &user, input.max_bytes).unwrap_or_else(|| {
-        let short_tree = tree_section(&root, true);
-        assemble(&head, &short_tree, &project, &user, input.max_bytes).unwrap_or_else(|| {
-            assemble_truncated(&head, &short_tree, &project, &user, input.max_bytes)
-        })
-    });
+    let (text, instruction_bytes) = assemble(&head, &full_tree, &project, &user, input.max_bytes)
+        .unwrap_or_else(|| {
+            let short_tree = tree_section(&root, true);
+            assemble(&head, &short_tree, &project, &user, input.max_bytes).unwrap_or_else(|| {
+                assemble_truncated(&head, &short_tree, &project, &user, input.max_bytes)
+            })
+        });
     ContextBlock {
         text,
         instruction_files,
+        instruction_bytes,
     }
 }
 
@@ -79,9 +84,9 @@ fn assemble(
     project: &Instructions,
     user: &Option<(PathBuf, String)>,
     max_bytes: usize,
-) -> Option<String> {
-    let text = format!(
-        "{head}{tree}{}{}",
+) -> Option<(String, usize)> {
+    let instructions = format!(
+        "{}{}",
         project
             .as_ref()
             .map(|(_, label, body)| section(label, body))
@@ -90,7 +95,8 @@ fn assemble(
             .map(|(path, body)| section(&format!("User instructions ({})", path.display()), body))
             .unwrap_or_default()
     );
-    (text.len() <= max_bytes).then_some(text)
+    let text = format!("{head}{tree}{instructions}");
+    (text.len() <= max_bytes).then_some((text, instructions.len()))
 }
 
 /// Last resort: the short tree stays, the instructions are cut to fit.
@@ -100,9 +106,10 @@ fn assemble_truncated(
     project: &Instructions,
     user: &Option<(PathBuf, String)>,
     max_bytes: usize,
-) -> String {
+) -> (String, usize) {
     const MARK: &str = "\n[instructions truncated to fit context.max_bytes]\n";
     let mut text = format!("{head}{tree}");
+    let without_instructions = text.len();
     let mut budget = max_bytes.saturating_sub(text.len());
     let parts: Vec<(String, &str)> = project
         .iter()
@@ -130,7 +137,8 @@ fn assemble_truncated(
             break;
         }
     }
-    text
+    let instructions = text.len() - without_instructions;
+    (text, instructions)
 }
 
 fn section(label: &str, body: &str) -> String {

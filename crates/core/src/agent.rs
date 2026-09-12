@@ -36,6 +36,10 @@ pub struct Agent {
     config: Config,
     /// Rendered `core::context` block, appended to the system prompt.
     context: String,
+    /// How many bytes of `context` are instruction files. `/context`
+    /// reports their share; it travels with the block so a rebuilt one
+    /// cannot leave a stale figure behind.
+    context_instructions: usize,
     /// Plan mode: the model gets only the read-only tools and is asked to
     /// end with a plan instead of carrying the task out.
     plan_mode: bool,
@@ -45,6 +49,25 @@ pub struct Agent {
     mcp_started: HashSet<String>,
     /// The last thing each of them did, for `/mcp` and `airlok mcp list`.
     mcp_statuses: Vec<mcp::Status>,
+}
+
+/// Where the context window goes, in bytes. `instructions` is a share of
+/// `context_block`, not a separate part, so `total` stays exact however
+/// the block was truncated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextParts {
+    pub system: usize,
+    pub context_block: usize,
+    pub instructions: usize,
+    pub history: usize,
+    pub tool_results: usize,
+    pub tool_schemas: usize,
+}
+
+impl ContextParts {
+    pub fn total(&self) -> usize {
+        self.system + self.context_block + self.history + self.tool_results + self.tool_schemas
+    }
 }
 
 /// What happened during one run.
@@ -91,6 +114,7 @@ impl Agent {
             redactor,
             config,
             context: String::new(),
+            context_instructions: 0,
             plan_mode: false,
             plan: None,
             mcp_started: HashSet::new(),
@@ -193,14 +217,64 @@ impl Agent {
     }
 
     /// Sets the context block built by [`crate::context::build`].
+    pub fn with_context_block(mut self, block: &crate::context::ContextBlock) -> Self {
+        self.set_context_block(block);
+        self
+    }
+
+    /// Context text with no instruction accounting behind it, which is
+    /// what a bare string is.
     pub fn with_context(mut self, context: String) -> Self {
         self.context = context;
+        self.context_instructions = 0;
         self
     }
 
     /// Replaces the context block, after something it reads changed.
-    pub fn set_context(&mut self, context: String) {
-        self.context = context;
+    pub fn set_context_block(&mut self, block: &crate::context::ContextBlock) {
+        self.context = block.text.clone();
+        self.context_instructions = block.instruction_bytes;
+    }
+
+    /// Where the next request's context would go, in bytes. The parts add
+    /// up to the whole, counted the way `Request::estimated_tokens` counts.
+    pub fn context_parts(&self, session: &Session) -> ContextParts {
+        let system = system_prompt(
+            &self.config,
+            &self.context,
+            session,
+            self.plan_note().as_deref(),
+            self.mcp_note().as_deref(),
+        );
+        let context_block = self.context.len();
+        let mut history = 0usize;
+        let mut tool_results = 0usize;
+        for message in &session.messages {
+            for block in &message.content {
+                match block {
+                    ContentBlock::Text { text } => history += text.len(),
+                    ContentBlock::ToolUse { name, input, .. } => {
+                        history += name.len() + input.to_string().len();
+                    }
+                    ContentBlock::ToolResult { content, .. } => tool_results += content.len(),
+                }
+            }
+        }
+        let tool_schemas = self
+            .specs()
+            .iter()
+            .map(|spec| {
+                spec.name.len() + spec.description.len() + spec.input_schema.to_string().len()
+            })
+            .sum();
+        ContextParts {
+            system: system.len().saturating_sub(context_block),
+            context_block,
+            instructions: self.context_instructions.min(context_block),
+            history,
+            tool_results,
+            tool_schemas,
+        }
     }
 
     /// Turns plan mode on or off. Either way the previous plan is dropped.

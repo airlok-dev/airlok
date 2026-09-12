@@ -178,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
     let tools = ToolRegistry::defaults(&cwd, config.agent.bash_timeout);
 
     let mut agent =
-        Agent::new(provider, tools, Box::new(redactor), config).with_context(context.text);
+        Agent::new(provider, tools, Box::new(redactor), config).with_context_block(&context);
     agent.set_plan_mode(args.plan);
     let mut session = match resumed {
         Some(mut session) => {
@@ -517,15 +517,12 @@ impl Backend for CliBackend {
         models
     }
 
-    fn context(&mut self) -> Option<String> {
-        Some(
-            context::build(&ContextInput {
-                cwd: &self.config.cwd,
-                user_instructions: self.user_instructions.as_deref(),
-                max_bytes: self.config.context.max_bytes,
-            })
-            .text,
-        )
+    fn context(&mut self) -> Option<airlok_core::context::ContextBlock> {
+        Some(context::build(&ContextInput {
+            cwd: &self.config.cwd,
+            user_instructions: self.user_instructions.as_deref(),
+            max_bytes: self.config.context.max_bytes,
+        }))
     }
 }
 

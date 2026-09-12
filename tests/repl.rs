@@ -401,8 +401,12 @@ impl Backend for Reloading {
         Err("not in this test".into())
     }
 
-    fn context(&mut self) -> Option<String> {
-        Some(self.0.to_string())
+    fn context(&mut self) -> Option<airlok_core::context::ContextBlock> {
+        Some(airlok_core::context::ContextBlock {
+            text: self.0.to_string(),
+            instruction_files: Vec::new(),
+            instruction_bytes: 0,
+        })
     }
 }
 
@@ -739,6 +743,82 @@ async fn an_unknown_effort_is_questioned_rather_than_taken() {
         questions[0].1.first().map(String::as_str),
         Some("enormous"),
         "the typed value is offered first, so Enter on it is a choice"
+    );
+}
+
+#[tokio::test]
+async fn context_accounting_sums_to_the_total_and_shows_no_values() {
+    const DETECTED: &str = concat!("ghp_", "abcdefabcdefabcdefabcdefabcdef123456");
+
+    let dir = TempDir::new("repl-context");
+    let provider = MockProvider::scripted(vec![reply("done")]);
+    let mut agent = agent(provider, dir.path());
+    let mut session = agent.new_session();
+    session.redactions.insert(
+        "<<SECRET_1>>".into(),
+        Entry {
+            value: DETECTED.into(),
+            kind: "github token".into(),
+            class: Class::Rehydrate,
+        },
+    );
+    let mut lines = ScriptedLines::typed(&["write something", "/context"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let statuses = out.statuses();
+    let text = statuses.join("\n");
+    assert!(
+        !text.contains(DETECTED),
+        "no value reaches /context: {text}"
+    );
+
+    let header = statuses
+        .iter()
+        .find(|l| l.starts_with("context: about "))
+        .unwrap_or_else(|| panic!("{statuses:?}"));
+    let total: u64 = header
+        .split_whitespace()
+        .nth(2)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{header}"));
+
+    // Each row ends in `<tokens> (<share>%)`.
+    let row_total: u64 = statuses
+        .iter()
+        .filter(|l| {
+            [
+                "system prompt",
+                "context block",
+                "history",
+                "tool results",
+                "tool schemas",
+            ]
+            .iter()
+            .any(|label| l.starts_with(&format!("  {label}")))
+        })
+        .map(|l| {
+            let before_share = l.rsplit_once(" (").expect("a share").0;
+            before_share
+                .split_whitespace()
+                .next_back()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("{l}"))
+        })
+        .sum();
+    assert_eq!(row_total, total, "the parts add up: {statuses:?}");
+    assert!(
+        statuses.iter().any(|l| l.starts_with("compaction at ")),
+        "{statuses:?}"
     );
 }
 

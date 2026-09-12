@@ -54,7 +54,7 @@ pub trait Backend: Send {
 
     /// The context block rebuilt from disk, after `#` changed AIRLOK.md.
     /// `None` keeps the current block.
-    fn context(&mut self) -> Option<String> {
+    fn context(&mut self) -> Option<crate::context::ContextBlock> {
         None
     }
 
@@ -129,6 +129,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "version, provider, session, config files, MCP servers, redaction counts",
     ),
     (
+        "/context",
+        "where the context window is going, and how near compaction is",
+    ),
+    (
         "/goal",
         "show the session goal, set it with /goal <statement>, or /goal clear",
     ),
@@ -168,6 +172,22 @@ pub fn resolve_command(name: &str) -> Resolved {
 
 /// How many ids to print when there is no terminal to pick with.
 const MENU_CHOICES: usize = 10;
+
+/// `part` as a percentage of `whole`, and 0 when there is no whole.
+fn share(part: u64, whole: u64) -> u64 {
+    (part * 100).checked_div(whole).unwrap_or(0)
+}
+
+/// A twenty-cell bar for a percentage.
+fn bar(percent: u64) -> String {
+    const CELLS: u64 = 20;
+    let filled = (percent * CELLS / 100).min(CELLS) as usize;
+    format!(
+        "{}{}",
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(CELLS as usize - filled)
+    )
+}
 
 /// The first line of `text`, cut to `width` columns with an ellipsis.
 fn first_line(text: &str, width: usize) -> String {
@@ -538,6 +558,7 @@ impl Repl<'_> {
                 self.save(session, out);
             }
             "status" => self.status(session, out),
+            "context" => self.context_report(session, out),
             "exit" => return Flow::Exit,
             other => unreachable!("/{other} is in COMMANDS but not handled"),
         }
@@ -634,8 +655,8 @@ impl Repl<'_> {
             out.status(&format!("cannot write {}: {e}", path.display()));
             return;
         }
-        if let Some(context) = self.backend.context() {
-            self.agent.set_context(context);
+        if let Some(block) = self.backend.context() {
+            self.agent.set_context_block(&block);
         }
         // AIRLOK.md takes precedence, so a new one hides the fallbacks.
         let hidden = INSTRUCTION_FILES[1..]
@@ -749,6 +770,63 @@ impl Repl<'_> {
             "reasoning effort {value} for {model} for the rest of this session"
         ));
         self.save(session, out);
+    }
+
+    /// Where the context window is going, part by part. The parts are
+    /// counted the way the request estimator counts them, and the total is
+    /// their sum, so the breakdown always adds up to what is reported.
+    fn context_report(&mut self, session: &Session, out: &mut dyn Output) {
+        let parts = self.agent.context_parts(session);
+        let config = self.agent.config();
+        let window = config.provider.context_window;
+        let threshold = config.agent.compact_threshold(window);
+
+        let tokens = |bytes: usize| (bytes / 4) as u64;
+        let rows = [
+            ("system prompt", tokens(parts.system)),
+            ("context block", tokens(parts.context_block)),
+            ("history", tokens(parts.history)),
+            ("tool results", tokens(parts.tool_results)),
+            ("tool schemas", tokens(parts.tool_schemas)),
+        ];
+        let total: u64 = rows.iter().map(|(_, t)| *t).sum();
+
+        out.status(&format!(
+            "context: about {total} tokens of {window} ({}% of the window)",
+            share(total, window)
+        ));
+        for (label, count) in rows {
+            out.status(&format!(
+                "  {label:<14} {} {count:>7} ({}%)",
+                bar(share(count, total)),
+                share(count, total)
+            ));
+        }
+        if parts.instructions > 0 {
+            out.status(&format!(
+                "  of the block, {} tokens are instruction files",
+                tokens(parts.instructions)
+            ));
+        }
+        if session.usage.context_tokens > 0 {
+            out.status(&format!(
+                "  the last request measured {} tokens{}",
+                session.usage.context_tokens,
+                if session.usage.estimated {
+                    " (estimated)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        out.status(&format!(
+            "compaction at {threshold} tokens: {}",
+            if total >= threshold {
+                "due on the next turn".to_string()
+            } else {
+                format!("about {} tokens away", threshold - total)
+            }
+        ));
     }
 
     /// One screen of what this session is: names, counts and where things
