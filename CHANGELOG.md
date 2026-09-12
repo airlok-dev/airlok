@@ -2,6 +2,18 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.6.0] - 2026-09-12
+
+### Added
+
+- MCP servers. `[[mcp]]` blocks configure servers over stdio or streamable HTTP, and their tools are offered to the model as `<server>__<tool>`, alongside the built-ins. A server starts on the first turn that can use it; one that fails to start is reported and skipped, and the run continues without it. Tools can be limited with `tools = ["name"]`, and a built-in keeps its name if a server ever claims one. The client is the official `rmcp` SDK.
+- `trust` per server decides the gate: `prompt`, the default, shows the server, the tool, and the arguments and asks with the usual `[y]es / [n]o / [a]ll / [q]uit`, where `a` covers that one server for the run; `allow` never asks; `deny` keeps the server's tools from the model. `[safety] confirm_mcp` turns the prompting off wholesale, and `--yes` includes it.
+- `rehydrate` per server decides what an MCP server receives. It is off by default, so secrets found in your files leave as placeholders rather than values, and the confirmation shows exactly what will be sent. The provider API key is refused in arguments either way, as it is for every tool.
+- Tool descriptions and results from a server reach the model inside markers naming the server and saying the text is data, so a server cannot instruct the model or change airlok's own confirmations and deny list.
+- Secrets for a server come from commands: `env_cmd` and `header_cmd` take their values from stdout, the way `api_key_cmd` does, so no token is written in the config.
+- `airlok mcp list` shows each server, whether it answers, and its tools. `airlok mcp call <server> <tool> '<json>'` calls one tool through the same gates. `/mcp` does the listing in a session, and `/mcp <name>` enables a disabled server for that session.
+- Plan mode offers no MCP tools, as it offers no write tools, and starts no servers.
+
 ## [0.5.0] - 2026-09-12
 
 ### Added
