@@ -142,6 +142,8 @@ Three files are read, each winning over the one above it. A server named in more
 | project | `./.mcp.json` | the project's servers, meant to be committed |
 | local | `./.airlok/mcp.json` | your own overrides, gitignored |
 
+A `.mcp.json` arrives with a clone, so a project-scoped server starts only once this checkout has been asked about it. On first sight of one, or of a definition that changed since the last answer, airlok lists the servers and the commands they would run and asks once. The answer is recorded in `.airlok/`, per repository and gitignored. Until then the server shows as pending in `airlok mcp list` and nothing is started, and listing never counts as approving. `airlok mcp reset-project-choices` forgets the answer so the next run asks again. Servers from your own user file, your local file, or a `[[mcp]]` block are not gated: you wrote those.
+
 `${VAR}` and `${VAR:-default}` expand from the environment in `command`, `args`, `env`, `url`, and `headers`. A variable that is unset or empty with no default is an error naming it, rather than an empty string that fails later in a way nobody can read. For a secret, prefer `env_cmd` and `header_cmd`, which take the value from a command's stdout: nothing is written in the file, and nothing has to sit in your environment where every other process can read it.
 
 Managing them:
@@ -150,6 +152,8 @@ Managing them:
 |---|---|
 | `airlok mcp list` | every server, its scope, whether it answers, and its tools |
 | `airlok mcp add <name> --scope user -- npx -y server-filesystem .` | write a stdio server; `--url` with `--transport http` for an http one |
+| `airlok mcp add-json <name> '<json>'` | write a server from an entry pasted as JSON |
+| `airlok mcp reset-project-choices` | forget whether this repository's own `.mcp.json` servers may start |
 | `airlok mcp get <name>` | the resolved entry and which file it came from |
 | `airlok mcp remove <name> [--scope ...]` | take it out again |
 | `airlok mcp import <path>` | merge another tool's `mcpServers` file into a scope |
