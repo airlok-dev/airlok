@@ -747,6 +747,75 @@ async fn an_unknown_effort_is_questioned_rather_than_taken() {
 }
 
 #[tokio::test]
+async fn a_side_question_carries_no_tools_and_leaves_only_a_note() {
+    let dir = TempDir::new("repl-btw");
+    let provider = MockProvider::scripted(vec![reply("first"), reply("beside the point")]);
+    let mut agent = agent(provider.clone(), dir.path());
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["do the task", "/btw what is a placeholder?"]);
+    let mut out = RecordingOutput::default();
+    let session = {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await
+    };
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        !requests[0].tools.is_empty(),
+        "the ordinary turn still offers tools"
+    );
+    assert!(
+        requests[1].tools.is_empty(),
+        "a side question offers none: {:?}",
+        requests[1].tools
+    );
+    assert!(
+        requests[1]
+            .messages
+            .last()
+            .map(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("what is a placeholder?")))
+            })
+            .unwrap_or(false),
+        "the question was asked: {:?}",
+        requests[1].messages.last()
+    );
+
+    // The turn left a user message and a reply; the aside left one note.
+    let notes: Vec<&str> = session
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } if text.starts_with("[asked and answered beside") => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "{:?}", session.messages);
+    assert!(notes[0].contains("what is a placeholder?"), "{}", notes[0]);
+    assert!(
+        !session
+            .messages
+            .iter()
+            .any(|m| text_of(m.content.first().unwrap()).contains("beside the point")),
+        "the answer itself stayed out of history: {:?}",
+        session.messages
+    );
+    assert_eq!(session.turns(), 1, "the aside is not a turn");
+}
+
+#[tokio::test]
 async fn context_accounting_sums_to_the_total_and_shows_no_values() {
     const DETECTED: &str = concat!("ghp_", "abcdefabcdefabcdefabcdefabcdef123456");
 

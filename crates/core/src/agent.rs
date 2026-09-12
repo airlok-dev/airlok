@@ -370,6 +370,62 @@ impl Agent {
         result
     }
 
+    /// A question answered beside the task. The model sees the project and
+    /// the conversation so the answer is informed, gets no tools, and
+    /// neither the question nor the answer joins the history. What stays
+    /// is one note, as an assistant message so the turn count does not
+    /// move for something the user did not ask the agent to do.
+    pub async fn aside(
+        &mut self,
+        session: &mut Session,
+        question: &str,
+        out: &mut dyn Output,
+        interrupt: &Interrupt,
+    ) -> Result<String, CoreError> {
+        let system = format!(
+            "{}\n\nThe user has asked a question beside the task. Answer it directly and briefly. \
+             You have no tools for this question, and neither it nor your answer becomes part of \
+             the task's conversation.",
+            system_prompt(
+                &self.config,
+                &self.context,
+                session,
+                self.plan_note().as_deref(),
+                self.mcp_note().as_deref(),
+            )
+        );
+        let mut messages = session.messages.clone();
+        messages.push(Message::user_text(question));
+        let (request, map) = self.build_request(&system, &messages, &[]);
+        let mut watcher = interrupt.watcher();
+        let answer = self
+            .stream_response(request, &map, out, &mut watcher, 0)
+            .await?
+            .response;
+        let text = answer
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let asked = question.lines().next().unwrap_or_default().trim();
+        let asked: String = if asked.chars().count() > 60 {
+            format!("{}\u{2026}", asked.chars().take(59).collect::<String>())
+        } else {
+            asked.to_string()
+        };
+        session
+            .messages
+            .push(Message::assistant(vec![ContentBlock::Text {
+                text: format!("[asked and answered beside the task, not part of it: {asked}]"),
+            }]));
+        session.touch();
+        Ok(text)
+    }
+
     /// Replaces everything but the last `keep_recent_turns` turns with a
     /// model-written summary. One request, no tools, through the redactor
     /// like any other. Returns `None` when there is nothing to fold.

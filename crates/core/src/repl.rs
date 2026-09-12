@@ -133,6 +133,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "where the context window is going, and how near compaction is",
     ),
     (
+        "/btw",
+        "ask a side question; the answer is printed and stays out of the task",
+    ),
+    (
         "/goal",
         "show the session goal, set it with /goal <statement>, or /goal clear",
     ),
@@ -559,6 +563,16 @@ impl Repl<'_> {
             }
             "status" => self.status(session, out),
             "context" => self.context_report(session, out),
+            "btw" if arg.is_empty() => {
+                out.status("/btw <question> answers beside the task, without joining it")
+            }
+            "btw" => {
+                let interrupt = self.interrupt.clone();
+                match self.agent.aside(session, arg, out, &interrupt).await {
+                    Ok(_) => self.save(session, out),
+                    Err(e) => out.status(&format!("the side question failed: {e}")),
+                }
+            }
             "exit" => return Flow::Exit,
             other => unreachable!("/{other} is in COMMANDS but not handled"),
         }
