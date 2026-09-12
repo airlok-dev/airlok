@@ -43,7 +43,17 @@ impl Terminal {
 
     /// [`Terminal::ask`] after a diff shown in part: `v` prints `rest`,
     /// the lines that did not fit, and asks again.
-    pub fn ask_paged(&mut self, question: &str, mut rest: &[String]) -> Decision {
+    pub fn ask_paged(&mut self, question: &str, rest: &[String]) -> Decision {
+        self.ask_inner(question, rest, false)
+    }
+
+    /// [`Terminal::ask_paged`] with `s` as well: approve every later call
+    /// like this one and remember it past this run.
+    pub fn ask_savable(&mut self, question: &str, rest: &[String]) -> Decision {
+        self.ask_inner(question, rest, true)
+    }
+
+    fn ask_inner(&mut self, question: &str, mut rest: &[String], savable: bool) -> Decision {
         if !self.hinted {
             self.hinted = true;
             let _ = writeln!(
@@ -51,8 +61,13 @@ impl Terminal {
                 "\x1b[2m(a = approve everything for this run)\x1b[0m"
             );
         }
+        let options = if savable {
+            "[y]es / [n]o / [a]ll / [s]ave / [q]uit "
+        } else {
+            "[y]es / [n]o / [a]ll / [q]uit "
+        };
         loop {
-            let _ = write!(self.writer, "{question} [y]es / [n]o / [a]ll / [q]uit ");
+            let _ = write!(self.writer, "{question} {options}");
             let _ = self.writer.flush();
             let mut answer = String::new();
             if self.reader.read_line(&mut answer).is_err() {
@@ -61,6 +76,7 @@ impl Terminal {
             match answer.trim().to_ascii_lowercase().as_str() {
                 "y" | "yes" => return Decision::Approve,
                 "a" | "all" => return Decision::ApproveAll,
+                "s" | "save" if savable => return Decision::SaveAll,
                 "q" | "quit" => return Decision::Quit,
                 "v" | "view" if !rest.is_empty() => {
                     self.show_lines(rest);
@@ -114,6 +130,26 @@ mod tests {
         let shown = written(&mut controller);
         assert!(shown.contains("41 + the rest"), "{shown:?}");
         assert_eq!(shown.matches("Apply?").count(), 2, "{shown:?}");
+    }
+
+    #[test]
+    fn save_is_offered_only_where_it_means_something() {
+        let (mut controller, tty) = pty();
+        let mut terminal = Terminal::on(tty).unwrap();
+        controller.write_all(b"s\n").unwrap();
+        assert_eq!(
+            terminal.ask_savable("Call `x` on `y`?", &[]),
+            Decision::SaveAll
+        );
+        assert!(written(&mut controller).contains("[s]ave"));
+
+        let (mut controller, tty) = pty();
+        let mut terminal = Terminal::on(tty).unwrap();
+        controller.write_all(b"s\n").unwrap();
+        // The same answer to a prompt that cannot be saved is a refusal,
+        // not a silent approval.
+        assert_eq!(terminal.ask("Run `ls`?"), Decision::Reject);
+        assert!(!written(&mut controller).contains("[s]ave"));
     }
 
     #[test]
