@@ -1040,6 +1040,35 @@ async fn a_side_question_carries_no_tools_and_leaves_only_a_note() {
         session.messages
     );
     assert_eq!(session.turns(), 1, "the aside is not a turn");
+
+    // The answer has to reach the screen, and the renderer has to be
+    // flushed after it: without that a short reply sits in the block
+    // buffer until something else happens to flush it.
+    let printed: String = out
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Shown::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        printed.contains("beside the point"),
+        "the answer was printed: {printed:?}"
+    );
+    let last_text = out
+        .events
+        .iter()
+        .rposition(|e| matches!(e, Shown::Text(_)))
+        .expect("some text was printed");
+    assert!(
+        out.events
+            .iter()
+            .skip(last_text)
+            .any(|e| matches!(e, Shown::EndTurn)),
+        "the renderer is flushed after the answer: {:?}",
+        out.events
+    );
 }
 
 #[tokio::test]

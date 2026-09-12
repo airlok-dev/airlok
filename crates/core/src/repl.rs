@@ -750,7 +750,13 @@ impl Repl<'_> {
             }
             "btw" => {
                 let interrupt = self.interrupt.clone();
-                match self.agent.aside(session, arg, out, &interrupt).await {
+                // Bracketed like a turn: the renderer holds text back until
+                // end_turn, and without it a short answer sits in the
+                // buffer until something else flushes it.
+                out.begin_turn();
+                let asked = self.agent.aside(session, arg, out, &interrupt).await;
+                out.end_turn();
+                match asked {
                     Ok(_) => self.save(session, out),
                     Err(e) => out.status(&format!("the side question failed: {e}")),
                 }
