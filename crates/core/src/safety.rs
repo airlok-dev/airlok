@@ -20,6 +20,13 @@ pub enum Confirmation<'a> {
     Command {
         command: &'a str,
     },
+    /// A call to a tool on an external MCP server. `arguments` is what
+    /// will be sent, so the user can see whether a secret would leave.
+    Mcp {
+        server: &'a str,
+        tool: &'a str,
+        arguments: &'a str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

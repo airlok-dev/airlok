@@ -65,6 +65,15 @@ pub enum Plan {
     Write { path: PathBuf, diff: String },
     /// A shell command will run.
     Command { command: String },
+    /// A tool on an external MCP server will be called. `arguments` is
+    /// what will actually be sent, placeholders included.
+    McpCall {
+        server: String,
+        tool: String,
+        arguments: String,
+    },
+    /// The configuration forbids this call outright.
+    Denied { why: String },
 }
 
 #[async_trait]
@@ -79,6 +88,13 @@ pub trait Tool: Send + Sync {
     async fn plan(&self, input: &Value) -> Result<Plan, ToolError> {
         let _ = input;
         Ok(Plan::Safe)
+    }
+    /// Whether the tool is given the secrets behind the placeholders.
+    /// True for the built-in tools: an edit or a command must carry the
+    /// real value or it would break. A tool that sends arguments off the
+    /// machine says false, and receives the placeholders instead.
+    fn rehydrate_arguments(&self) -> bool {
+        true
     }
     async fn execute(&self, input: Value) -> Result<String, ToolError>;
 }
@@ -108,6 +124,30 @@ impl ToolRegistry {
     pub fn with(mut self, tool: impl Tool + 'static) -> Self {
         self.tools.push(Box::new(tool));
         self
+    }
+
+    /// Adds a tool discovered at runtime, such as one from an MCP server.
+    /// A name already in the registry wins, so nothing can shadow a
+    /// built-in; the rejected name is returned.
+    pub fn add(&mut self, tool: Box<dyn Tool>) -> Result<(), String> {
+        let name = tool.name().to_string();
+        if self.get(&name).is_some() {
+            return Err(name);
+        }
+        self.tools.push(tool);
+        Ok(())
+    }
+
+    /// Removes every tool whose name starts with `prefix`, for a server
+    /// that is turned off during a session.
+    pub fn remove_prefixed(&mut self, prefix: &str) -> usize {
+        let before = self.tools.len();
+        self.tools.retain(|tool| !tool.name().starts_with(prefix));
+        before - self.tools.len()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.tools.iter().map(|t| t.name().to_string()).collect()
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {

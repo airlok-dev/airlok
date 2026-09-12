@@ -219,6 +219,24 @@ impl Output for Stdout {
                     terminal.ask_paged("Apply?", rest)
                 }
                 Confirmation::Command { command } => terminal.ask(&format!("Run `{command}`?")),
+                Confirmation::Mcp {
+                    server,
+                    tool,
+                    arguments,
+                } => {
+                    let header = format!("mcp {server} · {tool} · arguments as they will be sent");
+                    let mut lines = vec![match std::env::var_os("NO_COLOR") {
+                        None => format!("\x1b[2m{header}\x1b[0m"),
+                        Some(_) => header,
+                    }];
+                    lines.extend(arguments.lines().map(str::to_string));
+                    let (page, rest) = lines.split_at(lines.len().min(diff::PAGE));
+                    terminal.show_lines(page);
+                    if !rest.is_empty() {
+                        terminal.show_lines(&[diff::more_lines(rest.len())]);
+                    }
+                    terminal.ask_paged(&format!("Call `{tool}` on `{server}`?"), rest)
+                }
             },
         };
         if ticking {

@@ -163,9 +163,22 @@ pub fn tool_call(id: &str, name: &str, input: Value) -> Vec<StreamEvent> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shown {
     Text(String),
-    ToolCall { name: String, summary: String },
-    ConfirmWrite { path: PathBuf, diff: String },
-    ConfirmCommand { command: String },
+    ToolCall {
+        name: String,
+        summary: String,
+    },
+    ConfirmWrite {
+        path: PathBuf,
+        diff: String,
+    },
+    ConfirmCommand {
+        command: String,
+    },
+    ConfirmMcp {
+        server: String,
+        tool: String,
+        arguments: String,
+    },
     Status(String),
     EndTurn,
 }
@@ -251,6 +264,15 @@ impl Output for RecordingOutput {
             Confirmation::Command { command } => Shown::ConfirmCommand {
                 command: command.to_string(),
             },
+            Confirmation::Mcp {
+                server,
+                tool,
+                arguments,
+            } => Shown::ConfirmMcp {
+                server: server.to_string(),
+                tool: tool.to_string(),
+                arguments: arguments.to_string(),
+            },
         });
         self.decisions.pop_front().unwrap_or(Decision::Approve)
     }
@@ -322,7 +344,16 @@ pub fn agent(provider: Arc<MockProvider>, cwd: &Path) -> Agent {
 
 /// An agent with the default tools and the given redactor.
 pub fn agent_with(provider: Arc<MockProvider>, cwd: &Path, redactor: SecretRedactor) -> Agent {
-    let config = Config::new(cwd.to_path_buf());
-    let tools = ToolRegistry::defaults(cwd, config.agent.bash_timeout);
+    agent_configured(provider, Config::new(cwd.to_path_buf()), redactor)
+}
+
+/// An agent on a configuration the test built, such as one with `[[mcp]]`
+/// servers in it.
+pub fn agent_configured(
+    provider: Arc<MockProvider>,
+    config: Config,
+    redactor: SecretRedactor,
+) -> Agent {
+    let tools = ToolRegistry::defaults(&config.cwd, config.agent.bash_timeout);
     Agent::new(provider, tools, Box::new(redactor), config)
 }
