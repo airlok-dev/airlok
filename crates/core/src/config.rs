@@ -33,6 +33,13 @@ pub enum ConfigError {
     KeyEnvUnset(String),
     #[error("api_key_cmd `{command}` {problem}")]
     KeyCommand { command: String, problem: String },
+    #[error("mcp server `{server}`: {what} `{command}` {problem}")]
+    McpCommand {
+        server: String,
+        what: String,
+        command: String,
+        problem: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +87,9 @@ pub struct ConfigFile {
     /// Azure. They apply whichever way the model was chosen, `/model` included.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, ModelSection>,
+    /// `[[mcp]]`: external MCP servers whose tools the model may call.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<McpSection>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -87,6 +97,110 @@ pub struct ConfigFile {
 pub struct ModelSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+}
+
+/// One `[[mcp]]` entry on disk. `name` is required; everything else is
+/// optional so layers can be merged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpSection {
+    /// Unique; it prefixes every tool the server offers.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<McpTransport>,
+    /// stdio: the program to run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
+    /// Environment values read from a command's stdout, so a token never
+    /// sits in the file. Same idea as `api_key_cmd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_cmd: Option<BTreeMap<String, String>>,
+    /// http: the endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
+    /// Header values read from a command's stdout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_cmd: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<McpTools>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<McpTrust>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehydrate: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// A child process speaking JSON-RPC on its stdin and stdout.
+    Stdio,
+    /// Streamable HTTP.
+    Http,
+}
+
+/// Whether calls to a server's tools are confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTrust {
+    /// Ask before every call, like an unlisted shell command.
+    Prompt,
+    /// Never ask.
+    Allow,
+    /// Never call: the tools are listed but not offered to the model.
+    Deny,
+}
+
+/// `tools = "all"`, or a list of the tool names to offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpTools {
+    All,
+    Only(Vec<String>),
+}
+
+impl McpTools {
+    pub fn allows(&self, tool: &str) -> bool {
+        match self {
+            McpTools::All => true,
+            McpTools::Only(names) => names.iter().any(|name| name == tool),
+        }
+    }
+}
+
+impl Serialize for McpTools {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            McpTools::All => serializer.serialize_str("all"),
+            McpTools::Only(names) => names.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for McpTools {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Word(String),
+            List(Vec<String>),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Word(word) if word == "all" => Ok(McpTools::All),
+            Raw::Word(word) => Err(serde::de::Error::custom(format!(
+                "tools must be \"all\" or a list of tool names, not {word:?}"
+            ))),
+            Raw::List(names) => Ok(McpTools::Only(names)),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,6 +242,8 @@ pub struct SafetySection {
     pub confirm_writes: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirm_bash: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm_mcp: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bash_allowlist: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,6 +314,7 @@ impl ConfigFile {
             safety: SafetySection {
                 confirm_writes: over.safety.confirm_writes.or(self.safety.confirm_writes),
                 confirm_bash: over.safety.confirm_bash.or(self.safety.confirm_bash),
+                confirm_mcp: over.safety.confirm_mcp.or(self.safety.confirm_mcp),
                 bash_allowlist: over.safety.bash_allowlist.or(self.safety.bash_allowlist),
                 bash_denylist: over.safety.bash_denylist.or(self.safety.bash_denylist),
             },
@@ -211,8 +328,39 @@ impl ConfigFile {
                     .or(self.redact.show_secrets_in_output),
             },
             models: layer_models(self.models, over.models),
+            mcp: layer_mcp(self.mcp, over.mcp),
         }
     }
+}
+
+/// Merges `[[mcp]]` by server name, then per key; `over` wins where both
+/// set one. A name only `over` has is appended.
+fn layer_mcp(mut base: Vec<McpSection>, over: Vec<McpSection>) -> Vec<McpSection> {
+    for section in over {
+        match base.iter().position(|s| s.name == section.name) {
+            Some(at) => {
+                let under = base[at].clone();
+                base[at] = McpSection {
+                    name: section.name,
+                    transport: section.transport.or(under.transport),
+                    command: section.command.or(under.command),
+                    args: section.args.or(under.args),
+                    env: section.env.or(under.env),
+                    env_cmd: section.env_cmd.or(under.env_cmd),
+                    url: section.url.or(under.url),
+                    headers: section.headers.or(under.headers),
+                    header_cmd: section.header_cmd.or(under.header_cmd),
+                    enabled: section.enabled.or(under.enabled),
+                    timeout_secs: section.timeout_secs.or(under.timeout_secs),
+                    tools: section.tools.or(under.tools),
+                    trust: section.trust.or(under.trust),
+                    rehydrate: section.rehydrate.or(under.rehydrate),
+                };
+            }
+            None => base.push(section),
+        }
+    }
+    base
 }
 
 /// Merges `[models]` per model and per key; `over` wins where both set one.
@@ -250,6 +398,8 @@ pub struct Config {
     pub redact: RedactConfig,
     /// Per-model settings by model id.
     pub models: BTreeMap<String, ModelConfig>,
+    /// External MCP servers, in the order they were configured.
+    pub mcp: Vec<McpServer>,
     /// Directory the agent works in. Tools resolve relative paths against it.
     pub cwd: PathBuf,
 }
@@ -259,6 +409,105 @@ pub struct ModelConfig {
     /// Sent as `reasoning_effort` by the openai provider. Not validated: the
     /// provider rejects values it does not accept.
     pub reasoning_effort: Option<String>,
+}
+
+/// A configured MCP server. Commands that produce secrets are kept as
+/// commands and run when connecting, so `config show` never holds a value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpServer {
+    pub name: String,
+    pub transport: McpTransport,
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub env_cmd: BTreeMap<String, String>,
+    pub url: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    pub header_cmd: BTreeMap<String, String>,
+    pub enabled: bool,
+    /// How long to wait for the server to start and answer.
+    pub timeout: Duration,
+    pub tools: McpTools,
+    pub trust: McpTrust,
+    /// Whether `Rehydrate` secrets are restored in arguments. Off by
+    /// default, so a server is sent placeholders.
+    pub rehydrate: bool,
+}
+
+pub const DEFAULT_MCP_TIMEOUT_SECS: u64 = 30;
+
+impl McpServer {
+    fn from_section(section: McpSection) -> Self {
+        let url = section.url;
+        let transport = section.transport.unwrap_or(if url.is_some() {
+            McpTransport::Http
+        } else {
+            McpTransport::Stdio
+        });
+        Self {
+            name: section.name,
+            transport,
+            command: section.command,
+            args: section.args.unwrap_or_default(),
+            env: section.env.unwrap_or_default(),
+            env_cmd: section.env_cmd.unwrap_or_default(),
+            url,
+            headers: section.headers.unwrap_or_default(),
+            header_cmd: section.header_cmd.unwrap_or_default(),
+            enabled: section.enabled.unwrap_or(true),
+            timeout: Duration::from_secs(section.timeout_secs.unwrap_or(DEFAULT_MCP_TIMEOUT_SECS)),
+            tools: section.tools.unwrap_or(McpTools::All),
+            trust: section.trust.unwrap_or(McpTrust::Prompt),
+            rehydrate: section.rehydrate.unwrap_or(false),
+        }
+    }
+
+    fn to_section(&self) -> McpSection {
+        McpSection {
+            name: self.name.clone(),
+            transport: Some(self.transport),
+            command: self.command.clone(),
+            args: Some(self.args.clone()),
+            env: Some(self.env.clone()),
+            env_cmd: Some(self.env_cmd.clone()),
+            url: self.url.clone(),
+            headers: Some(self.headers.clone()),
+            header_cmd: Some(self.header_cmd.clone()),
+            enabled: Some(self.enabled),
+            timeout_secs: Some(self.timeout.as_secs()),
+            tools: Some(self.tools.clone()),
+            trust: Some(self.trust),
+            rehydrate: Some(self.rehydrate),
+        }
+    }
+
+    /// The child process environment, running each `env_cmd` once. The
+    /// values are secrets: never log them.
+    pub fn resolved_env(&self) -> Result<BTreeMap<String, String>, ConfigError> {
+        let mut env = self.env.clone();
+        for (name, command) in &self.env_cmd {
+            env.insert(name.clone(), self.run(command, "env_cmd", name)?);
+        }
+        Ok(env)
+    }
+
+    /// The HTTP headers, running each `header_cmd` once.
+    pub fn resolved_headers(&self) -> Result<BTreeMap<String, String>, ConfigError> {
+        let mut headers = self.headers.clone();
+        for (name, command) in &self.header_cmd {
+            headers.insert(name.clone(), self.run(command, "header_cmd", name)?);
+        }
+        Ok(headers)
+    }
+
+    fn run(&self, command: &str, what: &str, key: &str) -> Result<String, ConfigError> {
+        command_stdout(command).map_err(|problem| ConfigError::McpCommand {
+            server: self.name.clone(),
+            what: format!("{what} for {key}"),
+            command: command.to_string(),
+            problem,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -297,6 +546,8 @@ impl AgentConfig {
 pub struct SafetyConfig {
     pub confirm_writes: bool,
     pub confirm_bash: bool,
+    /// Ask before a call to an MCP server whose `trust` is `prompt`.
+    pub confirm_mcp: bool,
     pub bash_allowlist: Vec<String>,
     pub bash_denylist: Vec<String>,
 }
@@ -425,6 +676,7 @@ impl Config {
             safety: SafetyConfig {
                 confirm_writes: file.safety.confirm_writes.unwrap_or(true),
                 confirm_bash: file.safety.confirm_bash.unwrap_or(true),
+                confirm_mcp: file.safety.confirm_mcp.unwrap_or(true),
                 bash_allowlist: file
                     .safety
                     .bash_allowlist
@@ -452,6 +704,7 @@ impl Config {
                     )
                 })
                 .collect(),
+            mcp: file.mcp.into_iter().map(McpServer::from_section).collect(),
             cwd,
         }
     }
@@ -477,6 +730,7 @@ impl Config {
             safety: SafetySection {
                 confirm_writes: Some(self.safety.confirm_writes),
                 confirm_bash: Some(self.safety.confirm_bash),
+                confirm_mcp: Some(self.safety.confirm_mcp),
                 bash_allowlist: Some(self.safety.bash_allowlist.clone()),
                 bash_denylist: Some(self.safety.bash_denylist.clone()),
             },
@@ -498,6 +752,7 @@ impl Config {
                     )
                 })
                 .collect(),
+            mcp: self.mcp.iter().map(McpServer::to_section).collect(),
         }
     }
 
@@ -550,6 +805,7 @@ impl Overrides {
         if self.yes {
             layer.safety.confirm_writes = Some(false);
             layer.safety.confirm_bash = Some(false);
+            layer.safety.confirm_mcp = Some(false);
         }
         layer
     }
@@ -560,23 +816,28 @@ fn env_is_set(name: &str) -> bool {
 }
 
 fn run_key_command(command: &str) -> Result<String, ConfigError> {
-    let fail = |problem: String| ConfigError::KeyCommand {
+    command_stdout(command).map_err(|problem| ConfigError::KeyCommand {
         command: command.to_string(),
         problem,
-    };
+    })
+}
+
+/// Runs `command` and returns its trimmed stdout, or why that failed. The
+/// output is a secret, so it never appears in the returned problem.
+fn command_stdout(command: &str) -> Result<String, String> {
     let output = Command::new("sh")
         .arg("-c")
         .arg(command)
         .output()
-        .map_err(|e| fail(format!("could not start: {e}")))?;
+        .map_err(|e| format!("could not start: {e}"))?;
     if !output.status.success() {
-        return Err(fail(format!("exited with {}", output.status)));
+        return Err(format!("exited with {}", output.status));
     }
-    let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if key.is_empty() {
-        return Err(fail("printed nothing on stdout".to_string()));
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        return Err("printed nothing on stdout".to_string());
     }
-    Ok(key)
+    Ok(value)
 }
 
 /// `$XDG_CONFIG_HOME/airlok/config.toml`, falling back to `~/.config`.
@@ -615,6 +876,7 @@ pub const TEMPLATE: &str = r##"# airlok configuration. Precedence: CLI flags > .
 [safety]
 # confirm_writes = true    # show a diff and ask before write_file / edit_file
 # confirm_bash = true      # ask before running a command that is not allowlisted
+# confirm_mcp = true      # ask before calling a tool on an MCP server whose trust is "prompt"
 # bash_allowlist = ["git status", "git diff", "ls", "cat", "pwd", "find", "grep", "rg", "cargo check", "cargo test", "cargo build"]
 # bash_denylist = ["rm -rf", "git push --force", "sudo"]
 
@@ -627,6 +889,20 @@ pub const TEMPLATE: &str = r##"# airlok configuration. Precedence: CLI flags > .
 # Settings for one model id (the deployment name on Azure), applied however it is chosen, /model included.
 # [models."gpt-6-astra"]
 # reasoning_effort = "none"   # openai only, sent as reasoning_effort; Azure's gpt-6-astra needs "none" to use tools on Chat Completions
+
+# An MCP server whose tools the model may call, offered as <name>__<tool>. Repeat the block for more.
+# [[mcp]]
+# name = "files"
+# transport = "stdio"   # "stdio" runs command + args; "http" posts to url
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# env = { NODE_ENV = "production" }        # env_cmd = { TOKEN = "..." } takes the value from a command's stdout instead
+# url = "https://example.com/mcp"          # http only; headers = { ... } and header_cmd = { ... } work the same way
+# enabled = true
+# timeout_secs = 30        # starting the server and every call
+# tools = "all"            # or a list: ["read_text_file", "list_directory"]
+# trust = "prompt"         # "prompt" asks before each call, "allow" never asks, "deny" keeps the tools from the model
+# rehydrate = false        # false sends placeholders in arguments; true restores the secrets first
 "##;
 
 #[cfg(test)]
@@ -780,6 +1056,7 @@ mod tests {
         let (config, _) = Config::load(None, None, &overrides, PathBuf::from(".")).unwrap();
         assert!(!config.safety.confirm_writes);
         assert!(!config.safety.confirm_bash);
+        assert!(!config.safety.confirm_mcp);
     }
 
     #[test]
@@ -808,6 +1085,19 @@ mod tests {
             Some("none")
         );
         resolved.models.clear();
+        // So is its [[mcp]] entry, and it shows every key at its default.
+        let server = resolved.mcp.remove(0);
+        assert_eq!(server.name, "files");
+        assert_eq!(server.transport, McpTransport::Stdio);
+        assert_eq!(server.command.as_deref(), Some("npx"));
+        assert!(server.enabled);
+        assert_eq!(
+            server.timeout,
+            Duration::from_secs(DEFAULT_MCP_TIMEOUT_SECS)
+        );
+        assert_eq!(server.tools, McpTools::All);
+        assert_eq!(server.trust, McpTrust::Prompt);
+        assert!(!server.rehydrate);
         // The template shows openai-only examples for these; the defaults leave them unset.
         assert_eq!(
             resolved.provider.base_url.as_deref(),
@@ -853,6 +1143,104 @@ mod tests {
         config.provider.api_key_cmd = Some("true".into());
         let err = config.resolve_key().unwrap_err().to_string();
         assert!(err.contains("printed nothing"), "{err}");
+    }
+
+    #[test]
+    fn mcp_servers_merge_by_name_and_new_names_are_appended() {
+        let user = ConfigFile::parse(
+            r#"
+            [[mcp]]
+            name = "files"
+            command = "npx"
+            args = ["-y", "server-filesystem", "."]
+            trust = "prompt"
+            [[mcp]]
+            name = "docs"
+            url = "https://example.com/mcp"
+            "#,
+            Path::new("user"),
+        )
+        .unwrap();
+        let project = ConfigFile::parse(
+            r#"
+            [[mcp]]
+            name = "files"
+            trust = "allow"
+            tools = ["read_text_file"]
+            [[mcp]]
+            name = "tickets"
+            command = "./tickets-mcp"
+            "#,
+            Path::new("project"),
+        )
+        .unwrap();
+
+        let config = Config::resolve(user.layer(project), PathBuf::from("."));
+
+        let names: Vec<&str> = config.mcp.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["files", "docs", "tickets"]);
+        let files = &config.mcp[0];
+        // The project layer wins per key; the rest comes from the user file.
+        assert_eq!(files.trust, McpTrust::Allow);
+        assert_eq!(files.tools, McpTools::Only(vec!["read_text_file".into()]));
+        assert_eq!(files.command.as_deref(), Some("npx"));
+        assert_eq!(files.args.len(), 3);
+        // transport follows url when it is not given.
+        assert_eq!(config.mcp[1].transport, McpTransport::Http);
+        assert_eq!(config.mcp[2].transport, McpTransport::Stdio);
+        // Defaults for everything unset.
+        assert!(files.enabled);
+        assert!(!files.rehydrate);
+    }
+
+    #[test]
+    fn mcp_tools_is_all_or_a_list_and_nothing_else() {
+        let parse = |text: &str| ConfigFile::parse(text, Path::new("x"));
+        let all = parse("[[mcp]]\nname = \"a\"\ntools = \"all\"\n").unwrap();
+        assert_eq!(all.mcp[0].tools, Some(McpTools::All));
+        let list = parse("[[mcp]]\nname = \"a\"\ntools = [\"one\", \"two\"]\n").unwrap();
+        assert_eq!(
+            list.mcp[0].tools,
+            Some(McpTools::Only(vec!["one".into(), "two".into()]))
+        );
+        let err = parse("[[mcp]]\nname = \"a\"\ntools = \"some\"\n").unwrap_err();
+        assert!(err.to_string().contains("tools must be"), "{err}");
+        // A name is required, and unknown keys are still rejected.
+        assert!(parse("[[mcp]]\ncommand = \"x\"\n").is_err());
+        assert!(parse("[[mcp]]\nname = \"a\"\nnope = 1\n").is_err());
+        assert!(McpTools::All.allows("anything"));
+        assert!(!McpTools::Only(vec!["a".into()]).allows("b"));
+    }
+
+    #[test]
+    fn mcp_secrets_come_from_commands_and_failures_never_carry_the_output() {
+        let file = ConfigFile::parse(
+            r#"
+            [[mcp]]
+            name = "docs"
+            url = "https://example.com/mcp"
+            headers = { Accept = "application/json" }
+            header_cmd = { Authorization = "printf 'Bearer %s' $((1000 + 337))" }
+            env_cmd = { TOKEN = "echo $((1000 + 337)); exit 3" }
+            "#,
+            Path::new("x"),
+        )
+        .unwrap();
+        let config = Config::resolve(file, PathBuf::from("."));
+        let server = &config.mcp[0];
+
+        let headers = server.resolved_headers().unwrap();
+        assert_eq!(headers["Accept"], "application/json");
+        assert_eq!(headers["Authorization"], "Bearer 1337");
+
+        // The config keeps the command, never the value it produces.
+        let shown = toml::to_string(&config.to_file()).unwrap();
+        assert!(shown.contains("printf"), "{shown}");
+        assert!(!shown.contains("1337"), "{shown}");
+
+        let err = server.resolved_env().unwrap_err().to_string();
+        assert!(err.contains("env_cmd for TOKEN"), "{err}");
+        assert!(!err.contains("1337"), "{err}");
     }
 
     #[test]
