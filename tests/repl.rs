@@ -5,6 +5,7 @@ use airlok_core::agent::INTERRUPTED_MARKER;
 use airlok_core::config::{ModelConfig, ProviderName};
 use airlok_core::redact::{Class, Entry, RedactionMap, Redactor, SecretRedactor};
 use airlok_core::repl::{Backend, Line, Repl, Switch};
+use airlok_core::safety::Decision;
 use airlok_core::tools::READ_ONLY_TOOLS;
 use airlok_core::{Interrupt, SessionStore};
 use airlok_llm::{ContentBlock, Request};
@@ -743,6 +744,96 @@ async fn an_unknown_effort_is_questioned_rather_than_taken() {
         questions[0].1.first().map(String::as_str),
         Some("enormous"),
         "the typed value is offered first, so Enter on it is a choice"
+    );
+}
+
+#[tokio::test]
+async fn unallowing_an_entry_makes_the_next_bash_call_ask() {
+    let dir = TempDir::new("repl-permissions-allow");
+    // Two turns, each running the same allow-listed command.
+    let provider = MockProvider::scripted(vec![
+        tool_call("toolu_1", "bash", json!({"command": "echo hi"})),
+        reply("ran it"),
+        tool_call("toolu_2", "bash", json!({"command": "echo hi"})),
+        reply("ran it again"),
+    ]);
+    let mut agent = agent(provider, dir.path());
+    agent.config_mut().safety.confirm_bash = true;
+    agent.config_mut().safety.bash_allowlist = vec!["echo".into()];
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["first", "/permissions unallow echo", "second"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let asked: Vec<&Shown> = out
+        .events
+        .iter()
+        .filter(|e| matches!(e, Shown::ConfirmCommand { .. }))
+        .collect();
+    assert_eq!(
+        asked.len(),
+        1,
+        "allow-listed first, asked after unallow: {:?}",
+        out.events
+    );
+    assert!(
+        out.statuses()
+            .iter()
+            .any(|l| l.contains("no longer") || l.contains("asks before running")),
+        "{:?}",
+        out.statuses()
+    );
+}
+
+#[tokio::test]
+async fn saving_permissions_writes_only_after_approval() {
+    let dir = TempDir::new("repl-permissions-save");
+    let path = dir.path().join("airlok.toml");
+    std::fs::write(&path, "[agent]\n# a comment worth keeping\nmax_turns = 7\n").unwrap();
+
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider, dir.path());
+    agent.config_mut().safety.confirm_bash = false;
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["/permissions save", "/permissions save"]);
+    let mut out = RecordingOutput::default();
+    out.decisions.push_back(Decision::Reject);
+    out.decisions.push_back(Decision::Approve);
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let shown: Vec<&Shown> = out
+        .events
+        .iter()
+        .filter(|e| matches!(e, Shown::ConfirmWrite { .. }))
+        .collect();
+    assert_eq!(shown.len(), 2, "asked both times: {:?}", out.events);
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains("[safety]") && written.contains("confirm_bash = false"),
+        "the approved save landed: {written}"
+    );
+    assert!(
+        written.contains("# a comment worth keeping") && written.contains("max_turns = 7"),
+        "the rest of the file survived: {written}"
     );
 }
 

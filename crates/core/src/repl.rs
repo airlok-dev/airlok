@@ -14,6 +14,7 @@ use crate::agent::{fmt_tokens, redaction_lines, Agent};
 use crate::config::{ProviderConfig, ProviderName};
 use crate::context::INSTRUCTION_FILES;
 use crate::redact::{RedactionMap, Redactor};
+use crate::safety::{Confirmation, Decision};
 use crate::session::{Session, SessionStore};
 use crate::tools::{truncate_output, Bash, Tool};
 use crate::{CoreError, Interrupt, Output};
@@ -137,6 +138,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "ask a side question; the answer is printed and stays out of the task",
     ),
     (
+        "/permissions",
+        "what airlok asks about; set one with /permissions <name> <value>, or save",
+    ),
+    (
         "/goal",
         "show the session goal, set it with /goal <statement>, or /goal clear",
     ),
@@ -176,6 +181,17 @@ pub fn resolve_command(name: &str) -> Resolved {
 
 /// How many ids to print when there is no terminal to pick with.
 const MENU_CHOICES: usize = 10;
+
+/// The settings `/permissions` can change, for Tab and for the error.
+pub const PERMISSION_NAMES: &[&str] = &[
+    "confirm_writes",
+    "confirm_bash",
+    "confirm_mcp",
+    "allow",
+    "unallow",
+    "deny",
+    "undeny",
+];
 
 /// `part` as a percentage of `whole`, and 0 when there is no whole.
 fn share(part: u64, whole: u64) -> u64 {
@@ -317,6 +333,14 @@ impl Repl<'_> {
         );
         candidates.insert("effort", self.effort_choices());
         candidates.insert("goal", vec!["clear".to_string()]);
+        candidates.insert(
+            "permissions",
+            PERMISSION_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .chain(std::iter::once("save".to_string()))
+                .collect(),
+        );
         candidates
     }
 
@@ -563,6 +587,7 @@ impl Repl<'_> {
             }
             "status" => self.status(session, out),
             "context" => self.context_report(session, out),
+            "permissions" => self.permissions(arg, session, out),
             "btw" if arg.is_empty() => {
                 out.status("/btw <question> answers beside the task, without joining it")
             }
@@ -784,6 +809,149 @@ impl Repl<'_> {
             "reasoning effort {value} for {model} for the rest of this session"
         ));
         self.save(session, out);
+    }
+
+    /// Shows what airlok asks about, changes one setting for the session,
+    /// or writes the session's settings to the project config after asking.
+    fn permissions(&mut self, arg: &str, session: &mut Session, out: &mut dyn Output) {
+        let mut words = arg.split_whitespace();
+        let Some(name) = words.next() else {
+            return self.show_permissions(out);
+        };
+        if name == "save" {
+            return self.save_permissions(session, out);
+        }
+        let value = words.collect::<Vec<_>>().join(" ");
+        if value.is_empty() {
+            out.status(&format!("/permissions {name} <value> sets it"));
+            return;
+        }
+        let safety = &mut self.agent.config_mut().safety;
+        let flag = |value: &str| match value {
+            "on" | "true" | "yes" => Some(true),
+            "off" | "false" | "no" => Some(false),
+            _ => None,
+        };
+        match name {
+            "confirm_writes" | "confirm_bash" | "confirm_mcp" => match flag(&value) {
+                Some(on) => {
+                    match name {
+                        "confirm_writes" => safety.confirm_writes = on,
+                        "confirm_bash" => safety.confirm_bash = on,
+                        _ => safety.confirm_mcp = on,
+                    }
+                    out.status(&format!(
+                        "{name} {} for the rest of this session",
+                        if on { "on" } else { "off" }
+                    ));
+                }
+                None => out.status(&format!("{name} takes on or off, not {value}")),
+            },
+            "allow" => {
+                if !safety.bash_allowlist.iter().any(|e| e == &value) {
+                    safety.bash_allowlist.push(value.clone());
+                }
+                out.status(&format!("commands starting `{value}` run without asking"));
+            }
+            "deny" => {
+                if !safety.bash_denylist.iter().any(|e| e == &value) {
+                    safety.bash_denylist.push(value.clone());
+                }
+                out.status(&format!("`{value}` is refused"));
+            }
+            "unallow" => {
+                let before = safety.bash_allowlist.len();
+                safety.bash_allowlist.retain(|e| e != &value);
+                out.status(&if safety.bash_allowlist.len() == before {
+                    format!("`{value}` was not on the allow list")
+                } else {
+                    format!("`{value}` now asks before running")
+                });
+            }
+            // Emptying the deny list silently is exactly what this must
+            // not do, so removing an entry says what it did.
+            "undeny" => {
+                let before = safety.bash_denylist.len();
+                safety.bash_denylist.retain(|e| e != &value);
+                out.status(&if safety.bash_denylist.len() == before {
+                    format!("`{value}` was not on the deny list")
+                } else {
+                    format!("`{value}` is no longer refused; it asks instead")
+                });
+            }
+            other => out.status(&format!(
+                "unknown setting {other}; one of {}",
+                PERMISSION_NAMES.join(", ")
+            )),
+        }
+    }
+
+    fn show_permissions(&mut self, out: &mut dyn Output) {
+        let safety = &self.agent.config().safety;
+        let onoff = |on: bool| if on { "on" } else { "off" };
+        out.status(&format!(
+            "confirm_writes {} · confirm_bash {} · confirm_mcp {}",
+            onoff(safety.confirm_writes),
+            onoff(safety.confirm_bash),
+            onoff(safety.confirm_mcp)
+        ));
+        out.status(&if safety.bash_allowlist.is_empty() {
+            "allow list: empty, so every command asks".to_string()
+        } else {
+            format!("allow list: {}", safety.bash_allowlist.join(", "))
+        });
+        out.status(&if safety.bash_denylist.is_empty() {
+            "deny list: empty".to_string()
+        } else {
+            format!("deny list: {}", safety.bash_denylist.join(", "))
+        });
+        let cwd = self.agent.config().cwd.clone();
+        let trust = crate::mcp::trust::load(&cwd);
+        let lines = trust.lines();
+        if lines.is_empty() {
+            out.status("mcp trust: nothing saved past this run");
+        } else {
+            for line in lines {
+                out.status(&format!("mcp trust: {line}"));
+            }
+        }
+        out.status("/permissions <name> <value> changes one, /permissions save writes them");
+    }
+
+    /// Writes the session's safety settings into the project config, after
+    /// showing exactly what would change and asking.
+    fn save_permissions(&mut self, session: &mut Session, out: &mut dyn Output) {
+        let cwd = self.agent.config().cwd.clone();
+        let path = cwd.join(crate::config::PROJECT_CONFIG_NAME);
+        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        let safety = self.agent.config().safety.clone();
+        let updated = match crate::config::with_safety_section(&current, &safety) {
+            Ok(text) => text,
+            Err(e) => {
+                out.status(&format!("cannot update {}: {e}", path.display()));
+                return;
+            }
+        };
+        if updated == current {
+            out.status(&format!("{} already says this", path.display()));
+            return;
+        }
+        let diff = crate::tools::unified_diff(&path.display().to_string(), &current, &updated);
+        match out.confirm(&Confirmation::Write {
+            path: &path,
+            diff: &diff,
+        }) {
+            Decision::Approve | Decision::ApproveAll | Decision::SaveAll => {
+                match std::fs::write(&path, &updated) {
+                    Ok(()) => {
+                        out.status(&format!("wrote {}", path.display()));
+                        self.save(session, out);
+                    }
+                    Err(e) => out.status(&format!("cannot write {}: {e}", path.display())),
+                }
+            }
+            Decision::Reject | Decision::Quit => out.status("left the project config alone"),
+        }
     }
 
     /// Where the context window is going, part by part. The parts are
