@@ -2,6 +2,21 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.8.2] - 2026-09-12
+
+### Added
+
+- `/effort` shows the reasoning effort in force for the model in use and where it came from: the per-model config, this session, or the provider's own default. `/effort <value>` sets it for the rest of the session, using the same picker and the same did-you-mean question as `/model`, offering what the provider accepts (`none`, `minimal`, `low`, `medium`, `high`). The value is recorded in the session, so `--resume` keeps it, and on resume the session's value wins over the config file for the model it continues on. Only the openai provider sends a reasoning effort, so on anthropic the command says so rather than offering a list.
+- Tab completes `/effort` arguments, alongside `/model` and `/provider`.
+
+### Changed
+
+- `/e` now resolves to `/effort` rather than `/exit`. Commands are matched by prefix in the order they are listed, and `/effort` is listed beside `/model`. `/exit`, `/quit` and Ctrl-D are unchanged.
+
+### Fixed
+
+- Ctrl-C leaves the `/model` and `/provider` picker, the way Esc does. The picker's terminal mode kept signals on, so Ctrl-C raised SIGINT and the list stayed up until Esc. Signals come back the moment the picker closes, so Ctrl-C at the prompt still clears the line.
+
 ## [0.8.1] - 2026-09-12
 
 ### Added
