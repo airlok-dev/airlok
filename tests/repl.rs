@@ -34,6 +34,7 @@ async fn a_scripted_session_runs_turns_commands_clear_and_exit() {
         store: Some(&store),
         interrupt: Interrupt::new(),
         backend: Box::new(TestBackend::default()),
+        used: Vec::new(),
     };
     let first = repl.agent.new_session();
     let mut lines = ScriptedLines::typed(&[
@@ -124,6 +125,7 @@ async fn ctrl_c_keeps_the_partial_reply_marked_interrupted() {
         store: Some(&store),
         interrupt,
         backend: Box::new(TestBackend::default()),
+        used: Vec::new(),
     };
     let session = repl.agent.new_session();
     let mut lines = ScriptedLines::new(vec![
@@ -168,13 +170,20 @@ async fn model_and_provider_switch_for_the_rest_of_the_session() {
     let first = MockProvider::scripted(vec![reply("one"), reply("two")]);
     let second = MockProvider::scripted(vec![reply("three")]);
     let mut agent = agent(first.clone(), dir.path());
-    let mut backend = TestBackend::default();
+    // The bare /model opens the picker, which this cancels. my-new-model is
+    // an id airlok has not seen here, so switching to it is questioned, and
+    // the second answer takes the typed id.
+    let mut backend = TestBackend {
+        choices: vec![None, Some("my-new-model".into())].into(),
+        ..TestBackend::default()
+    };
     backend.switches.insert("openai", Ok(second.clone()));
     let mut repl = Repl {
         agent: &mut agent,
         store: Some(&store),
         interrupt: Interrupt::new(),
         backend: Box::new(backend),
+        used: Vec::new(),
     };
     let session = repl.agent.new_session();
     let mut lines = ScriptedLines::typed(&[
@@ -260,7 +269,13 @@ async fn a_model_switch_is_saved_before_the_next_turn() {
         agent: &mut agent,
         store: Some(&store),
         interrupt: Interrupt::new(),
-        backend: Box::new(TestBackend::default()),
+        // other-model is not an id airlok has seen, so it asks before
+        // switching; this answers that question with the typed id.
+        backend: Box::new(TestBackend {
+            choices: vec![Some("other-model".into())].into(),
+            ..TestBackend::default()
+        }),
+        used: Vec::new(),
     };
     let session = repl.agent.new_session();
     // Ctrl-C at the prompt ends nothing; the switch must already be on disk.
@@ -302,6 +317,7 @@ async fn slash_prefixes_run_the_first_match_and_typos_get_a_suggestion() {
         store: None,
         interrupt: Interrupt::new(),
         backend: Box::new(TestBackend::default()),
+        used: Vec::new(),
     };
     let session = repl.agent.new_session();
     let mut lines = ScriptedLines::typed(&["/co", "/modle x", "/", "/quit", "never read"]);
@@ -335,6 +351,7 @@ async fn a_bang_command_runs_here_and_the_next_turn_sees_it() {
         store: Some(&store),
         interrupt: Interrupt::new(),
         backend: Box::new(TestBackend::default()),
+        used: Vec::new(),
     };
     let session = repl.agent.new_session();
     let mut lines = ScriptedLines::typed(&[
@@ -400,6 +417,7 @@ async fn a_hash_note_is_appended_to_airlok_md_and_applies_next_turn() {
         store: None,
         interrupt: Interrupt::new(),
         backend: Box::new(Reloading("RELOADED CONTEXT")),
+        used: Vec::new(),
     };
     let session = repl.agent.new_session();
     let mut lines = ScriptedLines::typed(&["# always run the tests", "#- keep it short", "hi"]);
@@ -434,6 +452,7 @@ async fn a_hash_note_creates_airlok_md_and_says_what_it_hides() {
         store: None,
         interrupt: Interrupt::new(),
         backend: Box::new(TestBackend::default()),
+        used: Vec::new(),
     };
     let session = repl.agent.new_session();
     let mut lines = ScriptedLines::typed(&["# prefer spaces"]);
@@ -478,6 +497,7 @@ async fn plan_then_go_researches_read_only_then_runs_with_every_tool() {
         store: None,
         interrupt: Interrupt::new(),
         backend: Box::new(TestBackend::default()),
+        used: Vec::new(),
     };
     let session = repl.agent.new_session();
     let mut lines =
@@ -532,6 +552,7 @@ async fn plan_again_leaves_without_running_the_plan() {
         store: None,
         interrupt: Interrupt::new(),
         backend: Box::new(TestBackend::default()),
+        used: Vec::new(),
     };
     let session = repl.agent.new_session();
     let mut lines = ScriptedLines::typed(&["/plan", "plan it", "/plan", "/go"]);
@@ -546,6 +567,133 @@ async fn plan_again_leaves_without_running_the_plan() {
 }
 
 #[tokio::test]
+async fn an_unknown_model_id_is_questioned_rather_than_taken() {
+    let dir = TempDir::new("repl-unknown-model");
+    let provider = MockProvider::scripted(vec![reply("hi")]);
+    let mut agent = agent(provider, dir.path());
+    let before = agent.config().provider.model.clone();
+    let session = agent.new_session();
+    let backend = TestBackend::default();
+    let asked = backend.questions();
+    let mut lines = ScriptedLines::typed(&["/model gpt-9-nonesuch"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(backend),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let statuses = out.statuses();
+    assert!(
+        statuses
+            .iter()
+            .any(|line| line.contains("not a model airlok has seen here")),
+        "{statuses:?}"
+    );
+    assert!(
+        statuses.iter().any(|line| line == "left the model alone"),
+        "{statuses:?}"
+    );
+    assert_eq!(
+        agent.config().provider.model,
+        before,
+        "an unknown id must not switch anything on its own"
+    );
+
+    let questions = asked.lock().unwrap();
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    assert_eq!(
+        questions[0].1.first().map(String::as_str),
+        Some("gpt-9-nonesuch"),
+        "the typed id is offered first, so Enter on it is a choice rather than a fuzzy match"
+    );
+}
+
+#[tokio::test]
+async fn a_near_miss_is_named_and_can_be_taken() {
+    let dir = TempDir::new("repl-near-miss");
+    let provider = MockProvider::scripted(vec![reply("hi")]);
+    let mut agent = agent(provider, dir.path());
+    let known = agent.config().provider.model.clone();
+    // One character out from the model in use.
+    let typo = format!("{}x", &known[..known.len() - 1]);
+    let session = agent.new_session();
+    let backend = TestBackend {
+        choices: vec![Some(known.clone())].into(),
+        ..TestBackend::default()
+    };
+    let mut lines = ScriptedLines::typed(&[&format!("/model {typo}")]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(backend),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let statuses = out.statuses();
+    assert!(
+        statuses
+            .iter()
+            .any(|line| line.starts_with("did you mean:") && line.contains(&known)),
+        "{statuses:?}"
+    );
+    // Picking the offered id switches to it, rather than to the typo.
+    assert_eq!(agent.config().provider.model, known);
+}
+
+#[tokio::test]
+async fn a_provider_failure_reads_as_a_sentence_and_the_session_stays_open() {
+    let dir = TempDir::new("repl-404");
+    let provider = MockProvider::failing(
+        404,
+        r#"{"error":{"code":"DeploymentNotFound","message":"The API deployment for this resource does not exist"}}"#,
+    );
+    let mut agent = agent(provider, dir.path());
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["hello", "/cost"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let statuses = out.statuses();
+    assert!(
+        statuses
+            .iter()
+            .any(|line| line.contains("has no model called")),
+        "{statuses:?}"
+    );
+    assert!(
+        !statuses
+            .iter()
+            .any(|line| line.contains("DeploymentNotFound")),
+        "the raw body belongs in the debug log, not on the prompt: {statuses:?}"
+    );
+    // The loop carried on: the command after the failed turn ran.
+    assert!(
+        statuses.iter().any(|line| line.starts_with("input ")),
+        "the session should still be open: {statuses:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_footer_follows_each_turn() {
     let dir = TempDir::new("repl-footer");
     let provider = MockProvider::scripted(vec![with_usage(50_000, 10, reply("hi"))]);
@@ -555,6 +703,7 @@ async fn a_footer_follows_each_turn() {
         store: None,
         interrupt: Interrupt::new(),
         backend: Box::new(TestBackend::default()),
+        used: Vec::new(),
     };
     let session = repl.agent.new_session();
     let mut lines = ScriptedLines::typed(&["hello"]);

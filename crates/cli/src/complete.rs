@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 
-use airlok_core::repl::COMMANDS;
+use airlok_core::repl::{Candidates, COMMANDS};
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::hint::{Hint, Hinter};
@@ -29,6 +29,10 @@ pub struct Prompt {
     dim: bool,
     /// Paths under `cwd`, read on the first `@` after a refresh.
     index: OnceCell<Vec<String>>,
+    /// What Tab offers after a command that takes an argument. The REPL
+    /// refreshes these before every prompt, since they depend on the
+    /// session.
+    candidates: Candidates,
 }
 
 /// A menu under the line. Only a command name can be completed from it
@@ -54,7 +58,26 @@ impl Prompt {
             cwd,
             dim,
             index: OnceCell::new(),
+            candidates: Candidates::new(),
         }
+    }
+
+    pub fn set_candidates(&mut self, candidates: Candidates) {
+        self.candidates = candidates;
+    }
+
+    /// The candidates for the command on this line that start with what
+    /// has been typed, or all of them when nothing has.
+    fn arguments_matching(&self, command: &str, typed: &str) -> Vec<String> {
+        let Some(candidates) = self.candidates.get(command) else {
+            return Vec::new();
+        };
+        let typed = typed.to_ascii_lowercase();
+        candidates
+            .iter()
+            .filter(|candidate| candidate.to_ascii_lowercase().starts_with(&typed))
+            .cloned()
+            .collect()
     }
 
     /// Forgets the paths read so far, so the next `@` sees the files the
@@ -83,6 +106,9 @@ impl Prompt {
                 .collect();
             return (0, pairs(names));
         }
+        if let Some((command, start, typed)) = argument_word(line, pos) {
+            return (start, pairs(self.arguments_matching(command, typed)));
+        }
         (pos, Vec::new())
     }
 
@@ -102,6 +128,18 @@ impl Prompt {
             return Some(MenuHint {
                 display,
                 completion: Some(rest),
+            });
+        }
+        if let Some((command, _, typed)) = argument_word(line, pos) {
+            let matching = self.arguments_matching(command, typed);
+            let first = matching.first()?;
+            let mut display = first[typed.len()..].to_string();
+            for candidate in matching.iter().take(MENU_ROWS) {
+                display.push_str(&format!("\n  {candidate}"));
+            }
+            return Some(MenuHint {
+                display,
+                completion: None,
             });
         }
         let (_, query) = at_word(line, pos)?;
@@ -197,6 +235,25 @@ fn command_word(line: &str, pos: usize) -> Option<&str> {
 
 /// Commands whose name starts with `typed`, in menu order: the first is
 /// what Enter runs.
+/// The command and the argument being typed after it, when the line is a
+/// slash command with a space and the cursor is in the argument. Returns
+/// the command without its slash, where the argument starts, and what has
+/// been typed of it.
+fn argument_word(line: &str, pos: usize) -> Option<(&str, usize, &str)> {
+    let rest = line.strip_prefix('/')?;
+    let (command, _) = rest.split_once(char::is_whitespace)?;
+    if command.is_empty() {
+        return None;
+    }
+    // One argument, so it starts after the first run of spaces.
+    let after = 1 + command.len();
+    let start = after + line[after..].len() - line[after..].trim_start().len();
+    if pos < start {
+        return None;
+    }
+    Some((command, start, &line[start..pos]))
+}
+
 fn commands_matching(
     typed: &str,
 ) -> impl Iterator<Item = &'static (&'static str, &'static str)> + '_ {
@@ -260,6 +317,92 @@ fn fuzzy_score(query: &str, path: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prompt_with_models() -> Prompt {
+        let mut prompt = Prompt::new(std::env::temp_dir(), false);
+        let mut candidates = Candidates::new();
+        candidates.insert(
+            "model",
+            ["gpt-5.6-luna", "gpt-6-astra", "claude-sonnet-4-6"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        candidates.insert(
+            "provider",
+            ["anthropic", "openai"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        prompt.set_candidates(candidates);
+        prompt
+    }
+
+    #[test]
+    fn tab_after_a_command_completes_its_argument() {
+        let prompt = prompt_with_models();
+        let line = "/model gpt-6";
+        let (start, pairs) = prompt.candidates(line, line.len());
+        assert_eq!(start, "/model ".len());
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|pair| pair.replacement.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-6-astra"]
+        );
+
+        // Nothing typed yet offers all of them, in the order given.
+        let line = "/model ";
+        let (start, pairs) = prompt.candidates(line, line.len());
+        assert_eq!(start, line.len());
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].replacement, "gpt-5.6-luna");
+
+        // And the same for /provider.
+        let line = "/provider open";
+        let (_, pairs) = prompt.candidates(line, line.len());
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|pair| pair.replacement.as_str())
+                .collect::<Vec<_>>(),
+            ["openai"]
+        );
+    }
+
+    #[test]
+    fn a_command_without_candidates_completes_nothing() {
+        let prompt = prompt_with_models();
+        let line = "/compact something";
+        let (_, pairs) = prompt.candidates(line, line.len());
+        assert!(pairs.is_empty(), "{:?}", pairs.len());
+        // And the command name itself still completes.
+        let line = "/mod";
+        let (start, pairs) = prompt.candidates(line, line.len());
+        assert_eq!(start, 0);
+        assert_eq!(pairs[0].replacement, "/model");
+    }
+
+    #[test]
+    fn the_menu_lists_the_arguments_on_offer() {
+        let prompt = prompt_with_models();
+        let line = "/model gpt";
+        let hint = prompt.menu(line, line.len()).expect("a menu");
+        assert!(
+            hint.display().contains("gpt-5.6-luna"),
+            "{}",
+            hint.display()
+        );
+        assert!(hint.display().contains("gpt-6-astra"), "{}", hint.display());
+        assert!(
+            !hint.display().contains("claude"),
+            "filtered out: {}",
+            hint.display()
+        );
+    }
+
     use std::process::Command;
 
     use airlok_tests::TempDir;

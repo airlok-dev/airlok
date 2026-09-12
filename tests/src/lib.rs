@@ -22,6 +22,8 @@ use serde_json::Value;
 pub struct MockProvider {
     scripts: Mutex<VecDeque<Vec<StreamEvent>>>,
     requests: Mutex<Vec<Request>>,
+    /// When set, every request fails with this status and body.
+    fails: Mutex<Option<(u16, String)>>,
 }
 
 impl MockProvider {
@@ -29,6 +31,17 @@ impl MockProvider {
         Arc::new(Self {
             scripts: Mutex::new(turns.into()),
             requests: Mutex::new(Vec::new()),
+            fails: Mutex::new(None),
+        })
+    }
+
+    /// Answers every request with an API error, as a provider does when
+    /// the deployment is missing or the key is wrong.
+    pub fn failing(status: u16, body: &str) -> Arc<Self> {
+        Arc::new(Self {
+            scripts: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+            fails: Mutex::new(Some((status, body.to_string()))),
         })
     }
 
@@ -40,6 +53,9 @@ impl MockProvider {
 impl Provider for MockProvider {
     fn stream(&self, request: Request) -> BoxStream<'_, Result<StreamEvent, LlmError>> {
         self.requests.lock().unwrap().push(request);
+        if let Some((status, body)) = self.fails.lock().unwrap().clone() {
+            return stream::iter(vec![Err(LlmError::Api { status, body })]).boxed();
+        }
         let events = self
             .scripts
             .lock()
@@ -98,16 +114,51 @@ impl LineSource for ScriptedLines {
     }
 }
 
+/// Every `choose` call the backend saw: the title, and the choices
+/// it was offered.
+pub type Asked = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
 /// A REPL backend whose providers are scripted. A provider with no entry
 /// fails the switch with "no key configured".
 #[derive(Default)]
 pub struct TestBackend {
     pub switches: std::collections::HashMap<&'static str, Result<Arc<MockProvider>, String>>,
+    /// Answers for the pickers, in order. An empty list is a cancel,
+    /// which is also what a front end with no terminal does.
+    /// One answer per `choose` call, in order. `None` cancels that one,
+    /// and an empty queue cancels everything, as a run with no terminal does.
+    pub choices: VecDeque<Option<String>>,
+    /// Every question the pickers asked: the title and what was offered.
+    pub asked: Asked,
+    /// Model ids saved sessions used, by provider.
+    pub saved_models: std::collections::HashMap<&'static str, Vec<String>>,
+}
+
+impl TestBackend {
+    /// What the pickers were asked, for a test to look at afterwards.
+    pub fn questions(&self) -> Asked {
+        self.asked.clone()
+    }
 }
 
 impl Backend for TestBackend {
     fn fresh_redactor(&mut self) -> Box<dyn Redactor> {
         Box::new(SecretRedactor::new())
+    }
+
+    fn choose(&mut self, title: &str, choices: &[String]) -> Option<String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((title.to_string(), choices.to_vec()));
+        self.choices.pop_front().flatten()
+    }
+
+    fn known_models(&mut self, provider: ProviderName) -> Vec<String> {
+        self.saved_models
+            .get(provider.as_str())
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn switch(&mut self, name: ProviderName, seed: &RedactionMap) -> Result<Switch, String> {
