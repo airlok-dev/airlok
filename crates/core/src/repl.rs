@@ -63,6 +63,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "list the commands"),
     ("/model", "show the model, or switch with /model <id>"),
     (
+        "/mcp",
+        "list the MCP servers and their tools, or enable one with /mcp <name>",
+    ),
+    (
         "/plan",
         "plan mode: read-only tools, the reply is a plan; /plan again leaves",
     ),
@@ -316,12 +320,48 @@ impl Repl<'_> {
                 Ok(text) => text.lines().for_each(|l| out.status(l)),
                 Err(e) => out.status(&format!("cannot render the config: {e}")),
             },
+            "mcp" if arg.is_empty() => {
+                let statuses = self.agent.start_mcp(out).await;
+                if statuses.is_empty() {
+                    out.status("no MCP servers configured; add [[mcp]] to the config");
+                }
+                for status in statuses {
+                    out.status(&status.line());
+                }
+            }
+            "mcp" => self.enable_mcp(arg, out).await,
             "plan" => self.toggle_plan(out),
             "go" => self.go(session, out).await,
             "exit" => return Flow::Exit,
             other => unreachable!("/{other} is in COMMANDS but not handled"),
         }
         Flow::Continue
+    }
+
+    /// Turns a disabled MCP server on for the rest of this session and
+    /// starts it. The configuration file is not changed.
+    async fn enable_mcp(&mut self, name: &str, out: &mut dyn Output) {
+        let Some(server) = self
+            .agent
+            .config_mut()
+            .mcp
+            .iter_mut()
+            .find(|server| server.name == name)
+        else {
+            out.status(&format!("no MCP server called {name}; /mcp lists them"));
+            return;
+        };
+        if server.enabled {
+            out.status(&format!("{name} is already enabled"));
+            return;
+        }
+        server.enabled = true;
+        self.agent.forget_mcp(name);
+        for status in self.agent.start_mcp(out).await {
+            if status.server == name {
+                out.status(&format!("{} (for this session)", status.line()));
+            }
+        }
     }
 
     fn toggle_plan(&mut self, out: &mut dyn Output) {

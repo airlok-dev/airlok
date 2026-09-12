@@ -66,10 +66,29 @@ pub enum Command {
     Context,
     /// List the kinds of value the redactor detects and how each is treated
     Redactions,
+    /// Inspect the configured MCP servers, or call one of their tools
+    Mcp {
+        #[command(subcommand)]
+        action: Option<McpAction>,
+    },
     /// List saved sessions for this directory, or delete some
     Sessions {
         #[command(subcommand)]
         action: Option<SessionsAction>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpAction {
+    /// Show each server, whether it answers, and the tools it offers
+    List,
+    /// Call one tool, for debugging. The same trust and confirmation apply
+    Call {
+        server: String,
+        tool: String,
+        /// Arguments as a JSON object
+        #[arg(default_value = "{}")]
+        arguments: String,
     },
 }
 
