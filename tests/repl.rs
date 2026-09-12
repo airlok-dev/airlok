@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use airlok_core::agent::Agent;
 use airlok_core::agent::INTERRUPTED_MARKER;
 use airlok_core::config::{ModelConfig, ProviderName};
 use airlok_core::redact::{RedactionMap, Redactor, SecretRedactor};
@@ -564,6 +565,181 @@ async fn plan_again_leaves_without_running_the_plan() {
     let statuses = out.statuses();
     assert!(statuses.contains(&"plan mode off".to_string()));
     assert!(statuses.contains(&"not in plan mode; /plan starts it".to_string()));
+}
+
+/// An agent on the openai provider, which is the only one that sends a
+/// reasoning effort, with `model` as the model in use.
+fn on_openai(provider: std::sync::Arc<MockProvider>, cwd: &std::path::Path, model: &str) -> Agent {
+    let mut agent = agent(provider, cwd);
+    agent.config_mut().provider.name = ProviderName::OpenAi;
+    agent.config_mut().provider.model = model.into();
+    agent
+}
+
+#[tokio::test]
+async fn anthropic_says_it_does_not_take_a_reasoning_effort() {
+    let dir = TempDir::new("effort-anthropic");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider, dir.path());
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["/effort", "/effort high"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let statuses = out.statuses();
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|line| line.contains("does not take a reasoning effort"))
+            .count(),
+        2,
+        "with and without an argument: {statuses:?}"
+    );
+    assert!(
+        agent
+            .config()
+            .models
+            .values()
+            .all(|m| m.reasoning_effort.is_none()),
+        "nothing was set on a provider that cannot send it"
+    );
+}
+
+#[tokio::test]
+async fn the_effort_in_force_says_where_it_came_from() {
+    let dir = TempDir::new("effort-provenance");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = on_openai(provider, dir.path(), "gpt-6-astra");
+    agent.config_mut().models.insert(
+        "gpt-6-astra".into(),
+        ModelConfig {
+            reasoning_effort: Some("none".into()),
+        },
+    );
+    let session = agent.new_session();
+    // The config file gave this model "none"; the backend knows that, so
+    // the first /effort reports the config and the second the session.
+    let mut backend = TestBackend {
+        choices: vec![Some("high".into())].into(),
+        ..TestBackend::default()
+    };
+    backend.efforts.insert("gpt-6-astra", "none".into());
+    let mut lines = ScriptedLines::typed(&["/effort", "/effort"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(backend),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let statuses = out.statuses();
+    assert!(
+        statuses
+            .iter()
+            .any(|line| line.contains("none, from the config for this model")),
+        "{statuses:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|line| line.contains("high, set for this session")),
+        "{statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_effort_set_in_the_session_reaches_the_next_request() {
+    let dir = TempDir::new("effort-sent");
+    let provider = MockProvider::scripted(vec![reply("before"), reply("after")]);
+    let mut agent = on_openai(provider.clone(), dir.path(), "gpt-6-astra");
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["first", "/effort minimal", "second"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(requests[0].reasoning_effort, None, "nothing set yet");
+    assert_eq!(
+        requests[1].reasoning_effort.as_deref(),
+        Some("minimal"),
+        "/effort applies to the next turn"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_effort_is_questioned_rather_than_taken() {
+    let dir = TempDir::new("effort-unknown");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = on_openai(provider, dir.path(), "gpt-6-astra");
+    let session = agent.new_session();
+    let backend = TestBackend::default();
+    let asked = backend.questions();
+    let mut lines = ScriptedLines::typed(&["/effort enormous"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(backend),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let statuses = out.statuses();
+    assert!(
+        statuses
+            .iter()
+            .any(|line| line.contains("not a reasoning effort airlok has seen here")),
+        "{statuses:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|line| line == "left the reasoning effort alone"),
+        "{statuses:?}"
+    );
+    assert!(
+        agent
+            .config()
+            .models
+            .get("gpt-6-astra")
+            .and_then(|m| m.reasoning_effort.as_deref())
+            .is_none(),
+        "an unknown effort must not be taken on its own"
+    );
+    let questions = asked.lock().unwrap();
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    assert_eq!(
+        questions[0].1.first().map(String::as_str),
+        Some("enormous"),
+        "the typed value is offered first, so Enter on it is a choice"
+    );
 }
 
 #[tokio::test]

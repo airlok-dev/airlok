@@ -123,8 +123,6 @@ pub type Asked = Arc<Mutex<Vec<(String, Vec<String>)>>>;
 #[derive(Default)]
 pub struct TestBackend {
     pub switches: std::collections::HashMap<&'static str, Result<Arc<MockProvider>, String>>,
-    /// Answers for the pickers, in order. An empty list is a cancel,
-    /// which is also what a front end with no terminal does.
     /// One answer per `choose` call, in order. `None` cancels that one,
     /// and an empty queue cancels everything, as a run with no terminal does.
     pub choices: VecDeque<Option<String>>,
@@ -132,6 +130,9 @@ pub struct TestBackend {
     pub asked: Asked,
     /// Model ids saved sessions used, by provider.
     pub saved_models: std::collections::HashMap<&'static str, Vec<String>>,
+    /// `reasoning_effort` the config files give a model, by model id, as
+    /// it stood before any session override.
+    pub efforts: std::collections::HashMap<&'static str, String>,
 }
 
 impl TestBackend {
@@ -152,6 +153,10 @@ impl Backend for TestBackend {
             .unwrap()
             .push((title.to_string(), choices.to_vec()));
         self.choices.pop_front().flatten()
+    }
+
+    fn startup_effort(&mut self, model: &str) -> Option<String> {
+        self.efforts.get(model).cloned()
     }
 
     fn known_models(&mut self, provider: ProviderName) -> Vec<String> {

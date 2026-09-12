@@ -69,6 +69,12 @@ pub trait Backend: Send {
     fn known_models(&mut self, _provider: ProviderName) -> Vec<String> {
         Vec::new()
     }
+
+    /// The reasoning effort the config files give `model`, before any
+    /// session override. `None` when the files say nothing about it.
+    fn startup_effort(&mut self, _model: &str) -> Option<String> {
+        None
+    }
 }
 
 /// A provider ready to take over the session.
@@ -83,6 +89,10 @@ pub struct Switch {
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "list the commands"),
     ("/model", "show the model, or switch with /model <id>"),
+    (
+        "/effort",
+        "show the reasoning effort, or set it with /effort <value>",
+    ),
     (
         "/mcp",
         "list the MCP servers and their tools, or enable one with /mcp <name>",
@@ -252,6 +262,7 @@ impl Repl<'_> {
                 ProviderName::OpenAi.as_str().to_string(),
             ],
         );
+        candidates.insert("effort", self.effort_choices());
         candidates
     }
 
@@ -375,8 +386,35 @@ impl Repl<'_> {
                 }
             }
             "model" => {
-                if let Some(id) = self.resolve_model(arg, session, out) {
+                let known = self.model_choices(session);
+                if let Some(id) = self.resolve_choice("model", arg, &known, out) {
                     self.set_model(&id, session, out);
+                }
+            }
+            "effort" => {
+                let choices = self.effort_choices();
+                if choices.is_empty() {
+                    out.status(&format!(
+                        "{} does not take a reasoning effort; openai sends it, anthropic does not",
+                        session.provider
+                    ));
+                } else if arg.is_empty() {
+                    let line = self.effort_line(session);
+                    out.status(&line);
+                    match self.backend.choose("reasoning effort", &choices) {
+                        Some(value) => self.set_effort(&value, session, out),
+                        // No terminal to pick with, or the user left it.
+                        None => {
+                            for value in &choices {
+                                out.status(&format!("  {value}"));
+                            }
+                            out.status("/effort <value> sets it");
+                        }
+                    }
+                } else if let Some(value) =
+                    self.resolve_choice("reasoning effort", arg, &choices, out)
+                {
+                    self.set_effort(&value, session, out);
                 }
             }
             "provider" if arg.is_empty() => {
@@ -575,31 +613,87 @@ impl Repl<'_> {
     /// knows. An exact match is taken as given. Anything else is offered
     /// with the nearest known ids and a question, rather than accepted
     /// silently and failing a turn later.
-    fn resolve_model(
+    /// `typed` when `known` contains it, else the nearest are named and
+    /// the user is asked whether to use it anyway. The typed value is
+    /// always offered first, so Enter never takes a near match. `kind`
+    /// names the thing being chosen, for the messages.
+    fn resolve_choice(
         &mut self,
-        arg: &str,
-        session: &Session,
+        kind: &str,
+        typed: &str,
+        known: &[String],
         out: &mut dyn Output,
     ) -> Option<String> {
-        let known = self.model_choices(session);
-        if known.iter().any(|id| id == arg) {
-            return Some(arg.to_string());
+        if known.iter().any(|value| value == typed) {
+            return Some(typed.to_string());
         }
-        let near: Vec<String> = nearest(arg, &known);
-        out.status(&format!("{arg} is not a model airlok has seen here"));
+        let near: Vec<String> = nearest(typed, known);
+        out.status(&format!("{typed} is not a {kind} airlok has seen here"));
         if !near.is_empty() {
             out.status(&format!("did you mean: {}", near.join(", ")));
         }
         match self.backend.choose(
-            &format!("use {arg} anyway, or pick one airlok knows"),
-            &once_then(arg, &near, &known),
+            &format!("use {typed} anyway, or pick one airlok knows"),
+            &once_then(typed, &near, known),
         ) {
             Some(chosen) => Some(chosen),
             None => {
-                out.status("left the model alone");
+                out.status(&format!("left the {kind} alone"));
                 None
             }
         }
+    }
+
+    /// What the provider in use accepts for `reasoning_effort`. Only the
+    /// openai provider sends it, so anthropic offers nothing.
+    fn effort_choices(&mut self) -> Vec<String> {
+        match self.agent.config().provider.name {
+            ProviderName::OpenAi => ["none", "minimal", "low", "medium", "high"]
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            ProviderName::Anthropic => Vec::new(),
+        }
+    }
+
+    /// The effort in force for the model in use, and where it came from:
+    /// the per-model config, this session, or the provider's own default.
+    fn effort_line(&mut self, session: &Session) -> String {
+        let model = session.model.clone();
+        let in_force = self
+            .agent
+            .config()
+            .models
+            .get(&model)
+            .and_then(|m| m.reasoning_effort.clone());
+        let configured = self.backend.startup_effort(&model);
+        match (in_force, configured) {
+            (None, _) => format!("reasoning effort for {model}: the provider's default"),
+            (Some(value), Some(from_file)) if value == from_file => {
+                format!("reasoning effort for {model}: {value}, from the config for this model")
+            }
+            (Some(value), _) => {
+                format!("reasoning effort for {model}: {value}, set for this session")
+            }
+        }
+    }
+
+    /// Uses `value` for the model in use for the rest of the session. It
+    /// goes in the config the request is built from, and `record_provider`
+    /// copies that into the session, so `--resume` keeps it.
+    fn set_effort(&mut self, value: &str, session: &mut Session, out: &mut dyn Output) {
+        let model = session.model.clone();
+        self.agent
+            .config_mut()
+            .models
+            .entry(model.clone())
+            .or_default()
+            .reasoning_effort = Some(value.to_string());
+        self.record_provider(session);
+        out.status(&format!(
+            "reasoning effort {value} for {model} for the rest of this session"
+        ));
+        self.save(session, out);
     }
 
     fn switch_provider(&mut self, arg: &str, session: &mut Session, out: &mut dyn Output) {
