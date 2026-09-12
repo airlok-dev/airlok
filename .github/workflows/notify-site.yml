@@ -1,0 +1,63 @@
+# Tells airlok-dev/airlok.dev to regenerate its docs page from the README at
+# the tag that was just released. release.yml calls this after a successful
+# announce; dist writes that call from `post-announce-jobs` in
+# dist-workspace.toml. Run it by hand to rebuild the site for any tag.
+#
+# It needs SITE_DISPATCH_TOKEN, a fine-grained token whose resource owner is
+# airlok-dev, limited to the airlok.dev repository, with Contents: Read and
+# write. Without the secret the job warns and does nothing, so a release is
+# never held up by the website.
+name: notify-site
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: tag to send to airlok.dev, for example v0.5.0
+        required: true
+        type: string
+
+jobs:
+  notify-site:
+    name: Regenerate the airlok.dev docs
+    runs-on: ubuntu-latest
+    env:
+      SITE_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+      PLAN: ${{ inputs.plan }}
+      INPUT_TAG: ${{ inputs.tag }}
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Work out the tag
+        id: pick
+        run: |
+          tag=$(printf '%s' "$PLAN" | jq -r '.announcement_tag // empty' 2>/dev/null || true)
+          [ -n "$tag" ] || tag="$INPUT_TAG"
+          [ -n "$tag" ] || tag="$REF_NAME"
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::not a release tag: '$tag'"; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch to airlok.dev
+        if: env.SITE_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          jq -nc --arg tag "$TAG" \
+            '{event_type: "airlok-release", client_payload: {tag: $tag}}' |
+            gh api repos/airlok-dev/airlok.dev/dispatches --input -
+          echo "asked airlok.dev to regenerate its docs for $TAG"
+
+      - name: Say that the secret is missing
+        if: env.SITE_TOKEN == ''
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          echo "::warning::SITE_DISPATCH_TOKEN is not set, so airlok.dev still documents the previous release. Set the secret, then run this workflow with tag $TAG."
