@@ -108,9 +108,20 @@ impl Stdout {
         }
     }
 
-    /// Flushes held markdown and closes the line.
+    /// Flushes held markdown and closes the line. For the end of a turn:
+    /// whatever is held is printed, finished or not.
     pub fn finish(&mut self) {
         let rest = self.renderer.finish();
+        self.write(&rest);
+        self.end_line();
+        self.flush_collapsed();
+    }
+
+    /// Makes room for a line of airlok's own in the middle of a turn. Only
+    /// complete markdown is flushed: text still arriving keeps its block,
+    /// so a tool call cannot cut a bullet from its text.
+    fn pause(&mut self) {
+        let rest = self.renderer.interrupt();
         self.write(&rest);
         self.end_line();
         self.flush_collapsed();
@@ -137,7 +148,7 @@ impl Stdout {
 
 impl Output for Stdout {
     fn status(&mut self, line: &str) {
-        self.finish();
+        self.pause();
         let text = if self.renderer.is_rich() {
             format!("\x1b[2m{line}\x1b[0m\n")
         } else {
@@ -178,7 +189,7 @@ impl Output for Stdout {
     }
 
     fn tool_call(&mut self, name: &str, summary: &str) {
-        let rest = self.renderer.finish();
+        let rest = self.renderer.interrupt();
         self.write(&rest);
         self.screen().set_action(&status::action(name, summary));
         if READ_ONLY_TOOLS.contains(&name) && self.screen().enabled() {
@@ -223,12 +234,32 @@ impl Output for Stdout {
                     server,
                     tool,
                     arguments,
+                    root,
+                    paths,
                 } => {
-                    let header = format!("mcp {server} · {tool} · arguments as they will be sent");
-                    let mut lines = vec![match std::env::var_os("NO_COLOR") {
-                        None => format!("\x1b[2m{header}\x1b[0m"),
-                        Some(_) => header,
-                    }];
+                    let colour = std::env::var_os("NO_COLOR").is_none();
+                    let dim = |text: String| match colour {
+                        true => format!("\x1b[2m{text}\x1b[0m"),
+                        false => text,
+                    };
+                    let mut lines = vec![dim(format!(
+                        "mcp {server} · {tool} · arguments as they will be sent"
+                    ))];
+                    if let Some(root) = root {
+                        lines.push(dim(format!("serving {root}")));
+                    }
+                    // Plain, not dim: a place outside the project is the
+                    // thing most worth seeing before answering.
+                    let here = std::env::current_dir().unwrap_or_default();
+                    for path in *paths {
+                        let outside = !std::path::Path::new(path).starts_with(&here);
+                        let note = if outside {
+                            "  (outside this project)"
+                        } else {
+                            ""
+                        };
+                        lines.push(format!("{path}{note}"));
+                    }
                     lines.extend(arguments.lines().map(str::to_string));
                     let (page, rest) = lines.split_at(lines.len().min(diff::PAGE));
                     terminal.show_lines(page);

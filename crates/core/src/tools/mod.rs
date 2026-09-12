@@ -66,11 +66,15 @@ pub enum Plan {
     /// A shell command will run.
     Command { command: String },
     /// A tool on an external MCP server will be called. `arguments` is
-    /// what will actually be sent, placeholders included.
+    /// what will actually be sent, placeholders included; `paths` are the
+    /// places on disk those arguments name, resolved, so approving one
+    /// call cannot approve a call that reaches somewhere else.
     McpCall {
         server: String,
         tool: String,
         arguments: String,
+        root: Option<String>,
+        paths: Vec<String>,
     },
     /// The configuration forbids this call outright.
     Denied { why: String },

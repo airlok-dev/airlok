@@ -7,7 +7,8 @@
 //!
 //! TODO(stage N): subagents.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use airlok_llm::{
@@ -110,7 +111,8 @@ impl Agent {
             .cloned()
             .collect();
         if !pending.is_empty() {
-            let (tools, statuses) = mcp::connect_all(&pending).await;
+            let cwd = self.config.cwd.clone();
+            let (tools, statuses) = mcp::connect_all(&pending, &cwd).await;
             for tool in tools {
                 // A built-in with the same name keeps it.
                 if let Err(name) = self.tools.add(tool) {
@@ -800,19 +802,24 @@ impl Agent {
                 server,
                 tool,
                 arguments,
+                root,
+                paths,
             } => {
-                if !safety.confirm_mcp || approved.mcp.contains(&server) {
+                if !safety.confirm_mcp || approved.covers_mcp(&server, &tool, &paths) {
                     return Ok(Gate::Proceed);
                 }
                 match out.confirm(&Confirmation::Mcp {
                     server: &server,
                     tool: &tool,
                     arguments: &arguments,
+                    root: root.as_deref(),
+                    paths: &paths,
                 }) {
                     Decision::Approve => Gate::Proceed,
                     Decision::ApproveAll => {
-                        // "All" is per server, not for every server.
-                        approved.mcp.insert(server);
+                        // "All" covers this tool on this server, for the
+                        // places this call named and nowhere else.
+                        approved.mcp.insert((server, tool), paths);
                         Gate::Proceed
                     }
                     Decision::Reject => Gate::Stop(format!(
@@ -870,8 +877,29 @@ fn refusal(forbidden: &[(&str, &crate::redact::Entry)]) -> String {
 struct Approved {
     writes: bool,
     bash: bool,
-    /// MCP servers approved for the rest of the run, by name.
-    mcp: HashSet<String>,
+    /// What "all" covers for MCP: the paths approved for one tool on one
+    /// server. A call to another tool, or to a place outside those paths,
+    /// asks again, because approving one call is not approving the next.
+    mcp: HashMap<(String, String), Vec<String>>,
+}
+
+impl Approved {
+    /// Whether a standing "all" already covers this call.
+    fn covers_mcp(&self, server: &str, tool: &str, paths: &[String]) -> bool {
+        let Some(approved) = self.mcp.get(&(server.to_string(), tool.to_string())) else {
+            return false;
+        };
+        if paths.is_empty() {
+            // A call naming no place is only covered by an approval that
+            // named none either.
+            return approved.is_empty();
+        }
+        paths.iter().all(|path| {
+            approved
+                .iter()
+                .any(|allowed| Path::new(path).starts_with(Path::new(allowed)))
+        })
+    }
 }
 
 enum Gate {

@@ -21,11 +21,15 @@ pub enum Confirmation<'a> {
         command: &'a str,
     },
     /// A call to a tool on an external MCP server. `arguments` is what
-    /// will be sent, so the user can see whether a secret would leave.
+    /// will be sent, so the user can see whether a secret would leave;
+    /// `root` is what the server can reach and `paths` what this call
+    /// names, so a path outside the project is visible.
     Mcp {
         server: &'a str,
         tool: &'a str,
         arguments: &'a str,
+        root: Option<&'a str>,
+        paths: &'a [String],
     },
 }
 
