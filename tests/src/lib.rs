@@ -133,6 +133,10 @@ pub struct TestBackend {
     /// `reasoning_effort` the config files give a model, by model id, as
     /// it stood before any session override.
     pub efforts: std::collections::HashMap<&'static str, String>,
+    /// What `/status` should report as the configuration files in effect.
+    pub config_files: Vec<String>,
+    /// What `/status` should report as the key's source, never its value.
+    pub key_source: Option<String>,
 }
 
 impl TestBackend {
@@ -142,6 +146,7 @@ impl TestBackend {
     }
 }
 
+#[async_trait::async_trait]
 impl Backend for TestBackend {
     fn fresh_redactor(&mut self) -> Box<dyn Redactor> {
         Box::new(SecretRedactor::new())
@@ -157,6 +162,14 @@ impl Backend for TestBackend {
 
     fn startup_effort(&mut self, model: &str) -> Option<String> {
         self.efforts.get(model).cloned()
+    }
+
+    fn config_files(&mut self) -> Vec<String> {
+        self.config_files.clone()
+    }
+
+    fn key_source(&mut self) -> Option<String> {
+        self.key_source.clone()
     }
 
     fn known_models(&mut self, provider: ProviderName) -> Vec<String> {

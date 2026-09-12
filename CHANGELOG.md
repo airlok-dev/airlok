@@ -2,6 +2,26 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.9.0] - 2026-09-13
+
+### Added
+
+- `/status`: version, provider, model and effort, session id and turn count, cwd and git branch, the configuration files in effect, the MCP servers with whether each is connected, and redaction counts by class. Names, counts and sources only; no value from the key or the redaction map can reach it.
+- `/context`: where the context window is going, as a bar per part for the system prompt, context block, history, tool results and tool schemas, with how near compaction is. The parts are counted the way the request estimator counts them and the total is their sum, so the breakdown always adds up.
+- `/doctor`, and `airlok doctor` as a subcommand that exits non-zero on failure so it works in CI. Seven checks: the config files, whether the key resolves, a minimal live request, every MCP server, git, the terminal, and write access to the session and trust directories.
+- `/diff`: what airlok changed on disk this session, diffed from what was there before its first write, using the same renderer and paging as a write confirmation. `/diff <path>` narrows to one file. Sessions now record the files `write_file` and `edit_file` touched, with the original content kept under a one megabyte budget; past it a file is reported as changed rather than shown with a misleading diff.
+- `/copy`: the last reply to the clipboard through pbcopy, wl-copy, xclip or xsel. `/copy <n>` takes the Nth from the end and `/copy code` the last fenced block. With no clipboard program it says which ones it tried.
+- `/permissions`: view and change what airlok asks about for the session, including both bash lists, and `/permissions save` to write them into the project config after showing a diff. Removing a deny entry says what it did rather than quietly emptying the list.
+- `/init`: propose an AIRLOK.md built from the repository, as a diff to approve. Build and test commands come from the marker files that are actually present, and an existing CLAUDE.md or AGENTS.md is carried over.
+- `/btw <question>`: a side question answered with the project and conversation as context but no tools. Neither the question nor the answer joins the history; one note is kept, as an assistant message so it is not counted as a turn.
+- `/goal <statement>`: what the session is working toward. It goes into the system prompt every turn with an instruction to say when it is met, shows in the footer, and survives `--resume`. `/goal` shows it and `/goal clear` removes it.
+- Tab completes the arguments of the new commands, as it does for `/model` and `/provider`.
+
+### Fixed
+
+- The renderer wraps to the terminal's current width rather than the width it had when the run started. It re-measures each turn and on SIGWINCH, so a window resized mid-session takes effect on the next block instead of leaving the terminal to wrap over-long lines mid-line.
+- The status line is sized to the terminal the same way, instead of keeping the width it was built with.
+
 ## [0.8.2] - 2026-09-12
 
 ### Added

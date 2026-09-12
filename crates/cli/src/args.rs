@@ -78,6 +78,8 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<SessionsAction>,
     },
+    /// Check everything airlok needs, and exit non-zero if anything fails
+    Doctor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

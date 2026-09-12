@@ -87,6 +87,15 @@ A cancelled turn keeps the text streamed so far in the history, marked as interr
 | `/compact` | summarise older turns to free context |
 | `/config` | the effective configuration |
 | `/redactions` | what was redacted before leaving this machine (kind and length only) |
+| `/status` | version, provider, model and effort, session and turn count, cwd and branch, config files in effect, MCP servers, redaction counts. Names and counts only, never a value |
+| `/context` | where the context window is going, part by part, and how near compaction is |
+| `/btw <question>` | a side question: same model, no tools, and neither it nor the answer joins the task's history |
+| `/permissions [<name> <value>]` | what airlok asks about, and change one for the session; `/permissions save` writes them to the project config after showing a diff |
+| `/init` | propose an AIRLOK.md for this repository, as a diff to approve |
+| `/copy [<n>\|code]` | copy the last reply to the clipboard; a number takes the Nth from the end, `code` the last fenced block |
+| `/diff [<path>]` | what airlok changed on disk this session, diffed from before its first write |
+| `/doctor` | check the config, key, provider, MCP servers, git, terminal and storage; `airlok doctor` does the same and exits non-zero on failure |
+| `/goal [<statement>\|clear]` | what the session is working toward, kept in the system prompt every turn and shown in the footer |
 | `/clear` | start a new session; the current one stays saved |
 | `/exit` | save and quit; `/quit` works too |
 

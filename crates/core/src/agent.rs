@@ -8,8 +8,8 @@
 //! TODO(stage N): subagents.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use airlok_llm::{
     ContentBlock, Message, Provider, Request, Response, StopReason, StreamEvent, ToolSpec,
@@ -36,6 +36,10 @@ pub struct Agent {
     config: Config,
     /// Rendered `core::context` block, appended to the system prompt.
     context: String,
+    /// How many bytes of `context` are instruction files. `/context`
+    /// reports their share; it travels with the block so a rebuilt one
+    /// cannot leave a stale figure behind.
+    context_instructions: usize,
     /// Plan mode: the model gets only the read-only tools and is asked to
     /// end with a plan instead of carrying the task out.
     plan_mode: bool,
@@ -45,6 +49,29 @@ pub struct Agent {
     mcp_started: HashSet<String>,
     /// The last thing each of them did, for `/mcp` and `airlok mcp list`.
     mcp_statuses: Vec<mcp::Status>,
+    /// Files written this turn, with what was on disk just before, waiting
+    /// to be recorded in the session. Executing a tool only has `&self`,
+    /// so observations collect here and the turn drains them.
+    observed_writes: Mutex<Vec<(PathBuf, Option<String>)>>,
+}
+
+/// Where the context window goes, in bytes. `instructions` is a share of
+/// `context_block`, not a separate part, so `total` stays exact however
+/// the block was truncated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextParts {
+    pub system: usize,
+    pub context_block: usize,
+    pub instructions: usize,
+    pub history: usize,
+    pub tool_results: usize,
+    pub tool_schemas: usize,
+}
+
+impl ContextParts {
+    pub fn total(&self) -> usize {
+        self.system + self.context_block + self.history + self.tool_results + self.tool_schemas
+    }
 }
 
 /// What happened during one run.
@@ -91,10 +118,12 @@ impl Agent {
             redactor,
             config,
             context: String::new(),
+            context_instructions: 0,
             plan_mode: false,
             plan: None,
             mcp_started: HashSet::new(),
             mcp_statuses: Vec::new(),
+            observed_writes: Mutex::new(Vec::new()),
         }
     }
 
@@ -181,20 +210,76 @@ impl Agent {
 
     /// Forgets that a server was started, so the next [`Agent::start_mcp`]
     /// tries it again. For `/mcp <name>` enabling a disabled server.
+    /// Whether `server` has been connected in this run. Reading it starts
+    /// nothing, which is what lets `/status` report without side effects.
+    pub fn mcp_connected(&self, server: &str) -> bool {
+        self.mcp_started.contains(server)
+    }
+
     pub fn forget_mcp(&mut self, server: &str) {
         self.mcp_started.remove(server);
         self.tools.remove_prefixed(&mcp::server_prefix(server));
     }
 
     /// Sets the context block built by [`crate::context::build`].
+    pub fn with_context_block(mut self, block: &crate::context::ContextBlock) -> Self {
+        self.set_context_block(block);
+        self
+    }
+
+    /// Context text with no instruction accounting behind it, which is
+    /// what a bare string is.
     pub fn with_context(mut self, context: String) -> Self {
         self.context = context;
+        self.context_instructions = 0;
         self
     }
 
     /// Replaces the context block, after something it reads changed.
-    pub fn set_context(&mut self, context: String) {
-        self.context = context;
+    pub fn set_context_block(&mut self, block: &crate::context::ContextBlock) {
+        self.context = block.text.clone();
+        self.context_instructions = block.instruction_bytes;
+    }
+
+    /// Where the next request's context would go, in bytes. The parts add
+    /// up to the whole, counted the way `Request::estimated_tokens` counts.
+    pub fn context_parts(&self, session: &Session) -> ContextParts {
+        let system = system_prompt(
+            &self.config,
+            &self.context,
+            session,
+            self.plan_note().as_deref(),
+            self.mcp_note().as_deref(),
+        );
+        let context_block = self.context.len();
+        let mut history = 0usize;
+        let mut tool_results = 0usize;
+        for message in &session.messages {
+            for block in &message.content {
+                match block {
+                    ContentBlock::Text { text } => history += text.len(),
+                    ContentBlock::ToolUse { name, input, .. } => {
+                        history += name.len() + input.to_string().len();
+                    }
+                    ContentBlock::ToolResult { content, .. } => tool_results += content.len(),
+                }
+            }
+        }
+        let tool_schemas = self
+            .specs()
+            .iter()
+            .map(|spec| {
+                spec.name.len() + spec.description.len() + spec.input_schema.to_string().len()
+            })
+            .sum();
+        ContextParts {
+            system: system.len().saturating_sub(context_block),
+            context_block,
+            instructions: self.context_instructions.min(context_block),
+            history,
+            tool_results,
+            tool_schemas,
+        }
     }
 
     /// Turns plan mode on or off. Either way the previous plan is dropped.
@@ -288,6 +373,62 @@ impl Agent {
             session.messages.truncate(start);
         }
         result
+    }
+
+    /// A question answered beside the task. The model sees the project and
+    /// the conversation so the answer is informed, gets no tools, and
+    /// neither the question nor the answer joins the history. What stays
+    /// is one note, as an assistant message so the turn count does not
+    /// move for something the user did not ask the agent to do.
+    pub async fn aside(
+        &mut self,
+        session: &mut Session,
+        question: &str,
+        out: &mut dyn Output,
+        interrupt: &Interrupt,
+    ) -> Result<String, CoreError> {
+        let system = format!(
+            "{}\n\nThe user has asked a question beside the task. Answer it directly and briefly. \
+             You have no tools for this question, and neither it nor your answer becomes part of \
+             the task's conversation.",
+            system_prompt(
+                &self.config,
+                &self.context,
+                session,
+                self.plan_note().as_deref(),
+                self.mcp_note().as_deref(),
+            )
+        );
+        let mut messages = session.messages.clone();
+        messages.push(Message::user_text(question));
+        let (request, map) = self.build_request(&system, &messages, &[]);
+        let mut watcher = interrupt.watcher();
+        let answer = self
+            .stream_response(request, &map, out, &mut watcher, 0)
+            .await?
+            .response;
+        let text = answer
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let asked = question.lines().next().unwrap_or_default().trim();
+        let asked: String = if asked.chars().count() > 60 {
+            format!("{}\u{2026}", asked.chars().take(59).collect::<String>())
+        } else {
+            asked.to_string()
+        };
+        session
+            .messages
+            .push(Message::assistant(vec![ContentBlock::Text {
+                text: format!("[asked and answered beside the task, not part of it: {asked}]"),
+            }]));
+        session.touch();
+        Ok(text)
     }
 
     /// Replaces everything but the last `keep_recent_turns` turns with a
@@ -507,6 +648,14 @@ impl Agent {
             } else {
                 Vec::new()
             };
+            for (path, before) in self
+                .observed_writes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..)
+            {
+                session.record_write(&path, before);
+            }
             session.redactions = map;
             session.messages.push(Message::assistant(response.content));
             session.touch();
@@ -775,43 +924,63 @@ impl Agent {
         out: &mut dyn Output,
         approved: &mut Approved,
     ) -> Result<(String, bool), CoreError> {
-        Ok(match self.gate(tool, input, out, approved).await {
-            Ok(Gate::Proceed) => {
-                info!(tool = %name, "executing");
-                match tool.execute(input.clone()).await {
-                    Ok(output) => (truncate_output(output), false),
-                    Err(e) => {
-                        warn!(tool = %name, error = %e, "tool failed");
-                        (format!("error: {e}"), true)
+        let mut wrote = None;
+        Ok(
+            match self.gate(tool, input, out, approved, &mut wrote).await {
+                Ok(Gate::Proceed) => {
+                    info!(tool = %name, "executing");
+                    // Read before executing: for a path airlok has not touched
+                    // yet, this is the state the session started from.
+                    let before = wrote
+                        .as_ref()
+                        .and_then(|path| std::fs::read_to_string(path).ok());
+                    match tool.execute(input.clone()).await {
+                        Ok(output) => {
+                            if let Some(path) = wrote {
+                                self.observed_writes
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push((path, before));
+                            }
+                            (truncate_output(output), false)
+                        }
+                        Err(e) => {
+                            warn!(tool = %name, error = %e, "tool failed");
+                            (format!("error: {e}"), true)
+                        }
                     }
                 }
-            }
-            Ok(Gate::Stop(reason)) => {
-                info!(tool = %name, "not executed");
-                (reason, true)
-            }
-            Ok(Gate::Abort) => {
-                info!(tool = %name, "run aborted by the user");
-                return Err(CoreError::Aborted);
-            }
-            Err(e) => {
-                warn!(tool = %name, error = %e, "tool could not be planned");
-                (format!("error: {e}"), true)
-            }
-        })
+                Ok(Gate::Stop(reason)) => {
+                    info!(tool = %name, "not executed");
+                    (reason, true)
+                }
+                Ok(Gate::Abort) => {
+                    info!(tool = %name, "run aborted by the user");
+                    return Err(CoreError::Aborted);
+                }
+                Err(e) => {
+                    warn!(tool = %name, error = %e, "tool could not be planned");
+                    (format!("error: {e}"), true)
+                }
+            },
+        )
     }
 
+    /// `wrote` is set to the path when the plan is a write, whether or not
+    /// it is confirmed, so the caller can capture what was there first.
     async fn gate(
         &self,
         tool: &dyn Tool,
         input: &Value,
         out: &mut dyn Output,
         approved: &mut Approved,
+        wrote: &mut Option<PathBuf>,
     ) -> Result<Gate, ToolError> {
         let safety = &self.config.safety;
         let gate = match tool.plan(input).await? {
             Plan::Safe => Gate::Proceed,
             Plan::Write { path, diff } => {
+                *wrote = Some(path.clone());
                 if !safety.confirm_writes || approved.writes {
                     return Ok(Gate::Proceed);
                 }
@@ -1008,6 +1177,17 @@ fn system_prompt(
     if let Some(note) = mcp_note {
         prompt.push_str("\n\n");
         prompt.push_str(note);
+    }
+    if let Some(goal) = session
+        .goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+    {
+        prompt.push_str(&format!(
+            "\n\nThe user set this goal for the session: {goal}\n\
+             Work toward it. When you believe it is met, say so plainly and say why."
+        ));
     }
     if let Some(note) = plan_note {
         prompt.push_str("\n\n");

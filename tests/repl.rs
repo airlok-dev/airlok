@@ -3,8 +3,9 @@ use std::time::Duration;
 use airlok_core::agent::Agent;
 use airlok_core::agent::INTERRUPTED_MARKER;
 use airlok_core::config::{ModelConfig, ProviderName};
-use airlok_core::redact::{RedactionMap, Redactor, SecretRedactor};
+use airlok_core::redact::{Class, Entry, RedactionMap, Redactor, SecretRedactor};
 use airlok_core::repl::{Backend, Line, Repl, Switch};
+use airlok_core::safety::Decision;
 use airlok_core::tools::READ_ONLY_TOOLS;
 use airlok_core::{Interrupt, SessionStore};
 use airlok_llm::{ContentBlock, Request};
@@ -392,6 +393,7 @@ async fn a_bang_command_runs_here_and_the_next_turn_sees_it() {
 /// rebuild after AIRLOK.md changes.
 struct Reloading(&'static str);
 
+#[async_trait::async_trait]
 impl Backend for Reloading {
     fn fresh_redactor(&mut self) -> Box<dyn Redactor> {
         Box::new(SecretRedactor::new())
@@ -401,8 +403,12 @@ impl Backend for Reloading {
         Err("not in this test".into())
     }
 
-    fn context(&mut self) -> Option<String> {
-        Some(self.0.to_string())
+    fn context(&mut self) -> Option<airlok_core::context::ContextBlock> {
+        Some(airlok_core::context::ContextBlock {
+            text: self.0.to_string(),
+            instruction_files: Vec::new(),
+            instruction_bytes: 0,
+        })
     }
 }
 
@@ -740,6 +746,547 @@ async fn an_unknown_effort_is_questioned_rather_than_taken() {
         Some("enormous"),
         "the typed value is offered first, so Enter on it is a choice"
     );
+}
+
+#[tokio::test]
+async fn diff_shows_only_what_this_session_wrote() {
+    let dir = TempDir::new("repl-diff");
+    // One file that existed before the session, one the session creates,
+    // and one it never touches.
+    std::fs::write(dir.path().join("kept.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(dir.path().join("untouched.txt"), "not mine\n").unwrap();
+
+    let provider = MockProvider::scripted(vec![
+        tool_call(
+            "toolu_1",
+            "write_file",
+            json!({"path": "kept.txt", "content": "one\nTWO\n"}),
+        ),
+        tool_call(
+            "toolu_2",
+            "write_file",
+            json!({"path": "fresh.txt", "content": "brand new\n"}),
+        ),
+        reply("done"),
+    ]);
+    let mut agent = agent(provider, dir.path());
+    agent.config_mut().safety.confirm_writes = false;
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["change things", "/diff"]);
+    let mut out = RecordingOutput::default();
+    let session = {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await
+    };
+
+    let paths: Vec<&str> = session.writes.iter().map(|w| w.path.as_str()).collect();
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    assert!(paths.iter().any(|p| p.ends_with("kept.txt")), "{paths:?}");
+    assert!(paths.iter().any(|p| p.ends_with("fresh.txt")), "{paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.ends_with("untouched.txt")),
+        "a file airlok never wrote is not in the session: {paths:?}"
+    );
+
+    let existed: Vec<bool> = session.writes.iter().map(|w| w.existed).collect();
+    assert_eq!(existed, vec![true, false], "{:?}", session.writes);
+
+    let shown = out.statuses().join("\n");
+    assert!(shown.contains("kept.txt"), "{shown}");
+    assert!(shown.contains("TWO"), "the change is in the diff: {shown}");
+    assert!(
+        !shown.contains("not mine"),
+        "nothing from an untouched file: {shown}"
+    );
+}
+
+#[tokio::test]
+async fn diff_says_so_when_nothing_was_written() {
+    let dir = TempDir::new("repl-diff-empty");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider, dir.path());
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["/diff"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    assert!(
+        out.statuses()
+            .iter()
+            .any(|l| l == "airlok has not written anything this session"),
+        "{:?}",
+        out.statuses()
+    );
+}
+
+#[tokio::test]
+async fn init_proposes_a_diff_and_writes_nothing_until_approved() {
+    let dir = TempDir::new("repl-init");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "- always run the linter\n").unwrap();
+    let path = dir.path().join("AIRLOK.md");
+
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider, dir.path());
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["/init", "/init"]);
+    let mut out = RecordingOutput::default();
+    out.decisions.push_back(Decision::Reject);
+    out.decisions.push_back(Decision::Approve);
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let proposals: Vec<&Shown> = out
+        .events
+        .iter()
+        .filter(|e| matches!(e, Shown::ConfirmWrite { .. }))
+        .collect();
+    assert_eq!(proposals.len(), 2, "both asked: {:?}", out.events);
+    assert!(
+        out.statuses().iter().any(|l| l == "left AIRLOK.md alone"),
+        "the rejected one wrote nothing: {:?}",
+        out.statuses()
+    );
+
+    let written = std::fs::read_to_string(&path).expect("the approved one wrote it");
+    assert!(written.contains("cargo test"), "{written}");
+    assert!(
+        written.contains("always run the linter"),
+        "AGENTS.md was carried over: {written}"
+    );
+}
+
+#[tokio::test]
+async fn unallowing_an_entry_makes_the_next_bash_call_ask() {
+    let dir = TempDir::new("repl-permissions-allow");
+    // Two turns, each running the same allow-listed command.
+    let provider = MockProvider::scripted(vec![
+        tool_call("toolu_1", "bash", json!({"command": "echo hi"})),
+        reply("ran it"),
+        tool_call("toolu_2", "bash", json!({"command": "echo hi"})),
+        reply("ran it again"),
+    ]);
+    let mut agent = agent(provider, dir.path());
+    agent.config_mut().safety.confirm_bash = true;
+    agent.config_mut().safety.bash_allowlist = vec!["echo".into()];
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["first", "/permissions unallow echo", "second"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let asked: Vec<&Shown> = out
+        .events
+        .iter()
+        .filter(|e| matches!(e, Shown::ConfirmCommand { .. }))
+        .collect();
+    assert_eq!(
+        asked.len(),
+        1,
+        "allow-listed first, asked after unallow: {:?}",
+        out.events
+    );
+    assert!(
+        out.statuses()
+            .iter()
+            .any(|l| l.contains("no longer") || l.contains("asks before running")),
+        "{:?}",
+        out.statuses()
+    );
+}
+
+#[tokio::test]
+async fn saving_permissions_writes_only_after_approval() {
+    let dir = TempDir::new("repl-permissions-save");
+    let path = dir.path().join("airlok.toml");
+    std::fs::write(&path, "[agent]\n# a comment worth keeping\nmax_turns = 7\n").unwrap();
+
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider, dir.path());
+    agent.config_mut().safety.confirm_bash = false;
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["/permissions save", "/permissions save"]);
+    let mut out = RecordingOutput::default();
+    out.decisions.push_back(Decision::Reject);
+    out.decisions.push_back(Decision::Approve);
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let shown: Vec<&Shown> = out
+        .events
+        .iter()
+        .filter(|e| matches!(e, Shown::ConfirmWrite { .. }))
+        .collect();
+    assert_eq!(shown.len(), 2, "asked both times: {:?}", out.events);
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains("[safety]") && written.contains("confirm_bash = false"),
+        "the approved save landed: {written}"
+    );
+    assert!(
+        written.contains("# a comment worth keeping") && written.contains("max_turns = 7"),
+        "the rest of the file survived: {written}"
+    );
+}
+
+#[tokio::test]
+async fn a_side_question_carries_no_tools_and_leaves_only_a_note() {
+    let dir = TempDir::new("repl-btw");
+    let provider = MockProvider::scripted(vec![reply("first"), reply("beside the point")]);
+    let mut agent = agent(provider.clone(), dir.path());
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["do the task", "/btw what is a placeholder?"]);
+    let mut out = RecordingOutput::default();
+    let session = {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await
+    };
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        !requests[0].tools.is_empty(),
+        "the ordinary turn still offers tools"
+    );
+    assert!(
+        requests[1].tools.is_empty(),
+        "a side question offers none: {:?}",
+        requests[1].tools
+    );
+    assert!(
+        requests[1]
+            .messages
+            .last()
+            .map(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("what is a placeholder?")))
+            })
+            .unwrap_or(false),
+        "the question was asked: {:?}",
+        requests[1].messages.last()
+    );
+
+    // The turn left a user message and a reply; the aside left one note.
+    let notes: Vec<&str> = session
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } if text.starts_with("[asked and answered beside") => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "{:?}", session.messages);
+    assert!(notes[0].contains("what is a placeholder?"), "{}", notes[0]);
+    assert!(
+        !session
+            .messages
+            .iter()
+            .any(|m| text_of(m.content.first().unwrap()).contains("beside the point")),
+        "the answer itself stayed out of history: {:?}",
+        session.messages
+    );
+    assert_eq!(session.turns(), 1, "the aside is not a turn");
+
+    // The answer has to reach the screen, and the renderer has to be
+    // flushed after it: without that a short reply sits in the block
+    // buffer until something else happens to flush it.
+    let printed: String = out
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Shown::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        printed.contains("beside the point"),
+        "the answer was printed: {printed:?}"
+    );
+    let last_text = out
+        .events
+        .iter()
+        .rposition(|e| matches!(e, Shown::Text(_)))
+        .expect("some text was printed");
+    assert!(
+        out.events
+            .iter()
+            .skip(last_text)
+            .any(|e| matches!(e, Shown::EndTurn)),
+        "the renderer is flushed after the answer: {:?}",
+        out.events
+    );
+}
+
+#[tokio::test]
+async fn context_accounting_sums_to_the_total_and_shows_no_values() {
+    const DETECTED: &str = concat!("ghp_", "abcdefabcdefabcdefabcdefabcdef123456");
+
+    let dir = TempDir::new("repl-context");
+    let provider = MockProvider::scripted(vec![reply("done")]);
+    let mut agent = agent(provider, dir.path());
+    let mut session = agent.new_session();
+    session.redactions.insert(
+        "<<SECRET_1>>".into(),
+        Entry {
+            value: DETECTED.into(),
+            kind: "github token".into(),
+            class: Class::Rehydrate,
+        },
+    );
+    let mut lines = ScriptedLines::typed(&["write something", "/context"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let statuses = out.statuses();
+    let text = statuses.join("\n");
+    assert!(
+        !text.contains(DETECTED),
+        "no value reaches /context: {text}"
+    );
+
+    let header = statuses
+        .iter()
+        .find(|l| l.starts_with("context: about "))
+        .unwrap_or_else(|| panic!("{statuses:?}"));
+    let total: u64 = header
+        .split_whitespace()
+        .nth(2)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{header}"));
+
+    // Each row ends in `<tokens> (<share>%)`.
+    let row_total: u64 = statuses
+        .iter()
+        .filter(|l| {
+            [
+                "system prompt",
+                "context block",
+                "history",
+                "tool results",
+                "tool schemas",
+            ]
+            .iter()
+            .any(|label| l.starts_with(&format!("  {label}")))
+        })
+        .map(|l| {
+            let before_share = l.rsplit_once(" (").expect("a share").0;
+            before_share
+                .split_whitespace()
+                .next_back()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("{l}"))
+        })
+        .sum();
+    assert_eq!(row_total, total, "the parts add up: {statuses:?}");
+    assert!(
+        statuses.iter().any(|l| l.starts_with("compaction at ")),
+        "{statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn status_names_things_without_showing_any_value() {
+    // Split so the literals are not themselves a detectable secret here.
+    const DETECTED: &str = concat!("ghp_", "0123456789abcdefghijklmnopqrstuvwxyz");
+    const PROVIDER_KEY: &str = concat!("sk-", "provider-key-value-9876543210");
+
+    let dir = TempDir::new("repl-status");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider, dir.path());
+    let mut session = agent.new_session();
+    session.redactions.insert(
+        "<<SECRET_1>>".into(),
+        Entry {
+            value: DETECTED.into(),
+            kind: "github token".into(),
+            class: Class::Rehydrate,
+        },
+    );
+    session.redactions.insert(
+        "<<SECRET_2>>".into(),
+        Entry {
+            value: PROVIDER_KEY.into(),
+            kind: "the provider API key".into(),
+            class: Class::RedactOnly,
+        },
+    );
+
+    let backend = TestBackend {
+        config_files: vec!["user: /tmp/airlok/config.toml (found)".into()],
+        key_source: Some("the environment variable AIRLOK_TEST_KEY".into()),
+        ..TestBackend::default()
+    };
+    let mut lines = ScriptedLines::typed(&["/status"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(backend),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let text = out.statuses().join("\n");
+    assert!(
+        !text.contains(DETECTED),
+        "a detected secret must never be printed: {text}"
+    );
+    assert!(
+        !text.contains(PROVIDER_KEY),
+        "the provider key must never be printed: {text}"
+    );
+    assert!(
+        text.contains("redactions: 1 rehydrate, 1 redact-only"),
+        "{text}"
+    );
+    assert!(
+        text.contains("AIRLOK_TEST_KEY"),
+        "the key's source is named: {text}"
+    );
+    assert!(
+        text.contains("user: /tmp/airlok/config.toml (found)"),
+        "the config files in effect are listed: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_goal_reaches_the_request_and_the_footer() {
+    let dir = TempDir::new("repl-goal");
+    let provider = MockProvider::scripted(vec![reply("working on it")]);
+    let mut agent = agent(provider.clone(), dir.path());
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["/goal ship 0.9.0", "do the thing"]);
+    let mut out = RecordingOutput::default();
+    let session = {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await
+    };
+
+    assert_eq!(session.goal.as_deref(), Some("ship 0.9.0"));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(
+        requests[0].system.contains("ship 0.9.0"),
+        "the goal is in the system prompt: {}",
+        requests[0].system
+    );
+    let statuses = out.statuses();
+    assert!(
+        statuses
+            .iter()
+            .any(|line| line.contains("goal: ship 0.9.0")),
+        "{statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_goal_can_be_shown_and_cleared() {
+    let dir = TempDir::new("repl-goal-clear");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider, dir.path());
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&[
+        "/goal",
+        "/goal keep it green",
+        "/goal",
+        "/goal clear",
+        "/goal",
+    ]);
+    let mut out = RecordingOutput::default();
+    let session = {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await
+    };
+
+    assert_eq!(session.goal, None, "cleared");
+    let statuses = out.statuses();
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|l| l.starts_with("no goal set"))
+            .count(),
+        2,
+        "before it was set and after it was cleared: {statuses:?}"
+    );
+    assert!(statuses.iter().any(|l| l == "goal cleared"), "{statuses:?}");
 }
 
 #[tokio::test]

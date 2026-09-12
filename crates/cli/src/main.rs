@@ -106,6 +106,23 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Mcp { action }) => return mcp_command(action, &config, &sources).await,
         Some(Command::Sessions { action }) => return sessions_command(action, &store()?, &cwd),
+        Some(Command::Doctor) => {
+            let checks = doctor_checks(
+                &config,
+                &config_file_lines(&sources),
+                &config.provider.model,
+            )
+            .await;
+            for check in &checks {
+                println!("{}", check.line());
+            }
+            let failed = checks.iter().filter(|c| !c.ok).count();
+            if failed > 0 {
+                eprintln!("{failed} check(s) failed");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         None => {}
     }
     let prompt = args.prompt.clone();
@@ -153,6 +170,8 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .filter_map(|(id, m)| m.reasoning_effort.clone().map(|e| (id.clone(), e)))
         .collect();
+    // Named here, while the config is still in scope, and never resolved.
+    let key_source = config.key_source().to_string();
     if let Some(session) = &resumed {
         if session.provider != config.provider.name.as_str() {
             notes.push(format!("session last used {}", session.provider));
@@ -176,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
     let tools = ToolRegistry::defaults(&cwd, config.agent.bash_timeout);
 
     let mut agent =
-        Agent::new(provider, tools, Box::new(redactor), config).with_context(context.text);
+        Agent::new(provider, tools, Box::new(redactor), config).with_context_block(&context);
     agent.set_plan_mode(args.plan);
     let mut session = match resumed {
         Some(mut session) => {
@@ -215,6 +234,8 @@ async fn main() -> anyhow::Result<()> {
                 user_instructions,
                 notes,
                 file_efforts,
+                config_files: config_file_lines(&sources),
+                key_source,
             },
             &mut out,
         )
@@ -258,6 +279,11 @@ struct ReplSetup {
     /// `reasoning_effort` per model as the config files gave it, before a
     /// resumed session could override it. `/effort` reports which it is.
     file_efforts: std::collections::BTreeMap<String, String>,
+    /// Which configuration files could apply and whether each was found,
+    /// for `/status`. Paths only, never anything read from them.
+    config_files: Vec<String>,
+    /// Where the key comes from, named and not resolved.
+    key_source: String,
 }
 
 /// The interactive session. Ctrl-C during a turn cancels it; at the
@@ -321,6 +347,8 @@ async fn run_repl(
         user_instructions: setup.user_instructions,
         session_models: None,
         file_efforts: setup.file_efforts,
+        config_files: setup.config_files,
+        key_source: setup.key_source,
     };
     let mut repl = Repl {
         agent: &mut agent,
@@ -409,6 +437,10 @@ struct CliBackend {
     startup: ProviderConfig,
     config: Config,
     key: String,
+    /// For `/status`: which configuration files could apply, and where the
+    /// key comes from. Neither carries a value.
+    config_files: Vec<String>,
+    key_source: String,
     /// `~/.config/airlok/AIRLOK.md`, for rebuilding the context block.
     user_instructions: Option<PathBuf>,
     /// Model ids read from saved sessions, kept per provider because
@@ -438,6 +470,7 @@ impl CliBackend {
     }
 }
 
+#[async_trait::async_trait]
 impl Backend for CliBackend {
     fn fresh_redactor(&mut self) -> Box<dyn Redactor> {
         Box::new(SecretRedactor::new().with_known(KEY_LABEL, &self.key, Class::RedactOnly))
@@ -481,6 +514,18 @@ impl Backend for CliBackend {
         self.file_efforts.get(model).cloned()
     }
 
+    fn config_files(&mut self) -> Vec<String> {
+        self.config_files.clone()
+    }
+
+    fn key_source(&mut self) -> Option<String> {
+        Some(self.key_source.clone())
+    }
+
+    async fn doctor(&mut self, model: &str) -> Vec<airlok_core::repl::Check> {
+        doctor_checks(&self.config, &self.config_files, model).await
+    }
+
     fn known_models(&mut self, provider: ProviderName) -> Vec<String> {
         // Once per provider: this runs before every prompt, and listing
         // sessions reads and parses all of them.
@@ -494,15 +539,12 @@ impl Backend for CliBackend {
         models
     }
 
-    fn context(&mut self) -> Option<String> {
-        Some(
-            context::build(&ContextInput {
-                cwd: &self.config.cwd,
-                user_instructions: self.user_instructions.as_deref(),
-                max_bytes: self.config.context.max_bytes,
-            })
-            .text,
-        )
+    fn context(&mut self) -> Option<airlok_core::context::ContextBlock> {
+        Some(context::build(&ContextInput {
+            cwd: &self.config.cwd,
+            user_instructions: self.user_instructions.as_deref(),
+            max_bytes: self.config.context.max_bytes,
+        }))
     }
 }
 
@@ -935,6 +977,170 @@ fn config_init(path: Option<&Path>) -> anyhow::Result<()> {
 }
 
 /// Prints the merged configuration. The key itself is never read here.
+/// Every `/doctor` check. Talking to the provider and the MCP servers
+/// happens here, where the key and the transports live; nothing it reads
+/// is ever put in a `Check`, only where it looked.
+async fn doctor_checks(
+    config: &Config,
+    files: &[String],
+    model: &str,
+) -> Vec<airlok_core::repl::Check> {
+    use airlok_core::repl::Check;
+    use futures::StreamExt;
+
+    let mut checks = Vec::new();
+    checks.push(Check::pass(
+        "config",
+        if files.is_empty() {
+            "built-in defaults only".to_string()
+        } else {
+            files.join("; ")
+        },
+    ));
+
+    let key = config.resolve_key();
+    match &key {
+        Ok(_) => checks.push(Check::pass(
+            "provider key",
+            format!("resolved from {}", config.key_source()),
+        )),
+        Err(e) => checks.push(Check::fail(
+            "provider key",
+            format!("{e}, looking at {}", config.key_source()),
+        )),
+    }
+
+    match key {
+        Err(_) => checks.push(Check::fail(
+            "provider request",
+            "not attempted: no key to send".to_string(),
+        )),
+        Ok(key) => {
+            let provider = build_provider(config, key);
+            let request = airlok_llm::Request {
+                model: model.to_string(),
+                max_tokens: 16,
+                system: String::new(),
+                messages: vec![airlok_llm::Message::user_text("ping")],
+                tools: Vec::new(),
+                reasoning_effort: config
+                    .models
+                    .get(model)
+                    .and_then(|m| m.reasoning_effort.clone()),
+            };
+            let mut stream = provider.stream(request);
+            let mut failure = None;
+            while let Some(event) = stream.next().await {
+                if let Err(e) = event {
+                    failure = Some(e.to_string());
+                    break;
+                }
+            }
+            checks.push(match failure {
+                None => Check::pass(
+                    "provider request",
+                    format!("{} answered for {model}", config.provider.name.as_str()),
+                ),
+                Some(why) => Check::fail("provider request", why),
+            });
+        }
+    }
+
+    if config.mcp.is_empty() {
+        checks.push(Check::pass("mcp servers", "none configured".to_string()));
+    } else {
+        let choices = airlok_core::mcp::project::load(&config.cwd);
+        let (_, statuses) = airlok_core::mcp::connect_all(&config.mcp, &config.cwd, &choices).await;
+        for status in statuses {
+            let ok = matches!(status.state, airlok_core::mcp::State::Ready { .. });
+            let name = format!("mcp {}", status.server);
+            checks.push(if ok {
+                Check::pass(&name, status.line())
+            } else {
+                Check::fail(&name, status.line())
+            });
+        }
+    }
+
+    checks.push(match airlok_core::context::branch(&config.cwd) {
+        Some(branch) => Check::pass("git", format!("on {branch}")),
+        None => Check::fail(
+            "git",
+            "not a git repository, or git is not installed".to_string(),
+        ),
+    });
+
+    let terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    checks.push(Check::pass(
+        "terminal",
+        if terminal {
+            format!(
+                "a terminal, {} columns, colour {}",
+                {
+                    crate::render::measure();
+                    crate::render::terminal_columns().load(std::sync::atomic::Ordering::Relaxed)
+                },
+                if std::env::var_os("NO_COLOR").is_some() {
+                    "off (NO_COLOR)"
+                } else {
+                    "on"
+                }
+            )
+        } else {
+            "not a terminal: plain output, no confirmations".to_string()
+        },
+    ));
+
+    checks.push(match SessionStore::default_root() {
+        Some(root) => match std::fs::create_dir_all(&root) {
+            Ok(()) => Check::pass("session storage", format!("writable at {}", root.display())),
+            Err(e) => Check::fail("session storage", format!("{}: {e}", root.display())),
+        },
+        None => Check::fail(
+            "session storage",
+            "cannot locate the data directory: set XDG_DATA_HOME or HOME".to_string(),
+        ),
+    });
+
+    let trust = airlok_core::mcp::trust::path_for(&config.cwd);
+    let trust_dir = trust.parent().unwrap_or(&config.cwd).to_path_buf();
+    checks.push(match std::fs::create_dir_all(&trust_dir) {
+        Ok(()) => Check::pass(
+            "mcp trust storage",
+            format!("writable at {}", trust_dir.display()),
+        ),
+        Err(e) => Check::fail("mcp trust storage", format!("{}: {e}", trust_dir.display())),
+    });
+
+    checks
+}
+
+/// One line per configuration file that could apply, in the same words
+/// `airlok config show` uses. Paths and whether they were found, nothing
+/// read from inside them.
+fn config_file_lines(sources: &Sources) -> Vec<String> {
+    let describe = |label: &str, layer: &Option<config::Layer>| {
+        layer.as_ref().map(|layer| {
+            format!(
+                "{label}: {} ({})",
+                layer.path.display(),
+                if layer.found { "found" } else { "missing" }
+            )
+        })
+    };
+    let mut lines: Vec<String> = [
+        describe("user", &sources.user),
+        describe("project", &sources.project),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for problem in &sources.mcp_problems {
+        lines.push(format!("mcp problem: {problem}"));
+    }
+    lines
+}
+
 fn config_show(config: &Config, sources: &Sources) -> anyhow::Result<()> {
     let describe = |layer: &Option<config::Layer>| match layer {
         Some(layer) => format!(

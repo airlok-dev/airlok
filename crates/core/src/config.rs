@@ -17,6 +17,52 @@ use serde::{Deserialize, Serialize};
 pub const USER_CONFIG_RELATIVE: &str = "airlok/config.toml";
 pub const PROJECT_CONFIG_NAME: &str = "airlok.toml";
 
+/// `text` with its `[safety]` section replaced by `safety`, or the section
+/// appended when it has none. Only that block is rewritten, so comments
+/// and settings elsewhere in the file survive; comments inside the block
+/// do not.
+pub fn with_safety_section(text: &str, safety: &SafetyConfig) -> Result<String, String> {
+    let section = SafetySection {
+        confirm_writes: Some(safety.confirm_writes),
+        confirm_bash: Some(safety.confirm_bash),
+        confirm_mcp: Some(safety.confirm_mcp),
+        bash_allowlist: Some(safety.bash_allowlist.clone()),
+        bash_denylist: Some(safety.bash_denylist.clone()),
+    };
+    let body = toml::to_string(&section).map_err(|e| e.to_string())?;
+    let block = format!("[safety]\n{body}");
+
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().position(|line| line.trim() == "[safety]");
+    let Some(start) = start else {
+        let mut out = text.trim_end().to_string();
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&block);
+        return Ok(out);
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .map(|at| start + 1 + at)
+        .unwrap_or(lines.len());
+    let mut out = String::new();
+    for line in &lines[..start] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&block);
+    if end < lines.len() {
+        out.push('\n');
+        for line in &lines[end..] {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read {path}: {source}")]

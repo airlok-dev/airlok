@@ -14,9 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 airlok-core.workspace = true
+async-trait.workspace = true
 airlok-llm.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+futures.workspace = true
 ignore.workspace = true
 libc.workspace = true
 rustyline.workspace = true

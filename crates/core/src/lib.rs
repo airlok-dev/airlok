@@ -44,6 +44,13 @@ pub trait Output: Send {
     }
     /// The turn's text is complete; flush anything held back.
     fn end_turn(&mut self) {}
+    /// A unified diff to show, already complete. The default prints it as
+    /// plain lines; a terminal renders and pages it the way it does for a
+    /// write confirmation.
+    fn diff(&mut self, path: &str, unified: &str) {
+        self.status(path);
+        unified.lines().for_each(|line| self.status(line));
+    }
     /// Ask the user before a write or a command. Only called when the
     /// configuration says to confirm.
     fn confirm(&mut self, request: &Confirmation<'_>) -> Decision;

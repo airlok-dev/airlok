@@ -14,6 +14,7 @@ use crate::agent::{fmt_tokens, redaction_lines, Agent};
 use crate::config::{ProviderConfig, ProviderName};
 use crate::context::INSTRUCTION_FILES;
 use crate::redact::{RedactionMap, Redactor};
+use crate::safety::{Confirmation, Decision};
 use crate::session::{Session, SessionStore};
 use crate::tools::{truncate_output, Bash, Tool};
 use crate::{CoreError, Interrupt, Output};
@@ -40,8 +41,45 @@ pub trait LineSource {
     fn set_candidates(&mut self, _candidates: Candidates) {}
 }
 
+/// One `/doctor` check: what was tried, whether it worked, and a line
+/// saying where it looked. Never carries a value it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Check {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+impl Check {
+    pub fn pass(name: &str, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            ok: true,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn fail(name: &str, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            ok: false,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn line(&self) -> String {
+        format!(
+            "{} {:<22} {}",
+            if self.ok { "pass" } else { "FAIL" },
+            self.name,
+            self.detail
+        )
+    }
+}
+
 /// What the REPL needs from the binary, which owns key resolution and
 /// provider construction.
+#[async_trait::async_trait]
 pub trait Backend: Send {
     /// A redactor for a fresh session, knowing the current provider key.
     fn fresh_redactor(&mut self) -> Box<dyn Redactor>;
@@ -54,7 +92,7 @@ pub trait Backend: Send {
 
     /// The context block rebuilt from disk, after `#` changed AIRLOK.md.
     /// `None` keeps the current block.
-    fn context(&mut self) -> Option<String> {
+    fn context(&mut self) -> Option<crate::context::ContextBlock> {
         None
     }
 
@@ -74,6 +112,25 @@ pub trait Backend: Send {
     /// session override. `None` when the files say nothing about it.
     fn startup_effort(&mut self, _model: &str) -> Option<String> {
         None
+    }
+
+    /// One line per configuration file that could apply, saying whether it
+    /// was found. Never carries a key or any value read from one.
+    fn config_files(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Where the provider key comes from, named but never resolved.
+    fn key_source(&mut self) -> Option<String> {
+        None
+    }
+
+    /// Runs the `/doctor` checks against `model`, which is the model in
+    /// use now rather than the one the run started on. Talking to the
+    /// provider and to the MCP servers is the binary's job.
+    async fn doctor(&mut self, model: &str) -> Vec<Check> {
+        let _ = model;
+        Vec::new()
     }
 }
 
@@ -113,6 +170,42 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/redactions",
         "what was redacted before leaving this machine",
     ),
+    (
+        "/status",
+        "version, provider, session, config files, MCP servers, redaction counts",
+    ),
+    (
+        "/context",
+        "where the context window is going, and how near compaction is",
+    ),
+    (
+        "/btw",
+        "ask a side question; the answer is printed and stays out of the task",
+    ),
+    (
+        "/permissions",
+        "what airlok asks about; set one with /permissions <name> <value>, or save",
+    ),
+    (
+        "/init",
+        "propose an AIRLOK.md for this repository, as a diff to approve",
+    ),
+    (
+        "/copy",
+        "copy the last reply to the clipboard; /copy 2 for the one before, /copy code",
+    ),
+    (
+        "/diff",
+        "what airlok changed on disk this session; /diff <path> for one file",
+    ),
+    (
+        "/doctor",
+        "check config, key, provider, MCP servers, git, terminal and storage",
+    ),
+    (
+        "/goal",
+        "show the session goal, set it with /goal <statement>, or /goal clear",
+    ),
     ("/clear", "start a new session; the current one stays saved"),
     ("/exit", "save and quit; Ctrl-D does the same"),
 ];
@@ -149,6 +242,115 @@ pub fn resolve_command(name: &str) -> Resolved {
 
 /// How many ids to print when there is no terminal to pick with.
 const MENU_CHOICES: usize = 10;
+
+/// The body of the last fenced code block in `text`, without its fences.
+fn fenced_block(text: &str) -> Option<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            match current.take() {
+                Some(body) => blocks.push(body.join("\n")),
+                None => current = Some(Vec::new()),
+            }
+            continue;
+        }
+        if let Some(body) = current.as_mut() {
+            body.push(line);
+        }
+    }
+    blocks.pop()
+}
+
+/// Hands `text` to whichever clipboard program this system has. Says so
+/// plainly when it has none, rather than looking like it worked.
+fn to_clipboard(text: &str) -> Result<&'static str, String> {
+    to_clipboard_with(CLIPBOARD_PROGRAMS, text)
+}
+
+/// The clipboard programs tried, in order, on the systems airlok runs on.
+const CLIPBOARD_PROGRAMS: &[(&str, &[&str])] = &[
+    ("pbcopy", &[]),
+    ("wl-copy", &[]),
+    ("xclip", &["-selection", "clipboard"]),
+    ("xsel", &["--clipboard", "--input"]),
+];
+
+fn to_clipboard_with(
+    programs: &[(&'static str, &'static [&'static str])],
+    text: &str,
+) -> Result<&'static str, String> {
+    let mut tried = Vec::new();
+    for (program, args) in programs {
+        let mut child = match std::process::Command::new(program)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => {
+                tried.push(*program);
+                continue;
+            }
+        };
+        let wrote = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| format!("{program} took no input"))
+            .and_then(|stdin| stdin.write_all(text.as_bytes()).map_err(|e| e.to_string()));
+        if let Err(e) = wrote {
+            return Err(format!("{program} failed: {e}"));
+        }
+        return match child.wait() {
+            Ok(status) if status.success() => Ok(program),
+            Ok(status) => Err(format!("{program} exited with {status}")),
+            Err(e) => Err(format!("{program} failed: {e}")),
+        };
+    }
+    Err(format!(
+        "no clipboard program found; tried {}",
+        tried.join(", ")
+    ))
+}
+
+/// The settings `/permissions` can change, for Tab and for the error.
+pub const PERMISSION_NAMES: &[&str] = &[
+    "confirm_writes",
+    "confirm_bash",
+    "confirm_mcp",
+    "allow",
+    "unallow",
+    "deny",
+    "undeny",
+];
+
+/// `part` as a percentage of `whole`, and 0 when there is no whole.
+fn share(part: u64, whole: u64) -> u64 {
+    (part * 100).checked_div(whole).unwrap_or(0)
+}
+
+/// A twenty-cell bar for a percentage.
+fn bar(percent: u64) -> String {
+    const CELLS: u64 = 20;
+    let filled = (percent * CELLS / 100).min(CELLS) as usize;
+    format!(
+        "{}{}",
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(CELLS as usize - filled)
+    )
+}
+
+/// The first line of `text`, cut to `width` columns with an ellipsis.
+fn first_line(text: &str, width: usize) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= width {
+        return line.to_string();
+    }
+    let kept: String = line.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}\u{2026}")
+}
 
 /// The known ids closest to `typed`, nearest first, and only ones close
 /// enough to be worth naming.
@@ -263,6 +465,20 @@ impl Repl<'_> {
             ],
         );
         candidates.insert("effort", self.effort_choices());
+        candidates.insert("goal", vec!["clear".to_string()]);
+        candidates.insert("copy", vec!["code".to_string()]);
+        candidates.insert(
+            "diff",
+            session.writes.iter().map(|w| w.path.clone()).collect(),
+        );
+        candidates.insert(
+            "permissions",
+            PERMISSION_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .chain(std::iter::once("save".to_string()))
+                .collect(),
+        );
         candidates
     }
 
@@ -334,8 +550,15 @@ impl Repl<'_> {
         let percent = (session.usage.context_tokens * 100)
             .checked_div(config.provider.context_window)
             .unwrap_or(0);
+        let goal = session
+            .goal
+            .as_deref()
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+            .map(|g| format!(" · goal: {}", first_line(g, 40)))
+            .unwrap_or_default();
         format!(
-            "{} · context {percent}% · session {}",
+            "{} · context {percent}% · session {}{goal}",
             config.provider.model, session.id
         )
     }
@@ -483,6 +706,61 @@ impl Repl<'_> {
             "mcp" => self.enable_mcp(arg, out).await,
             "plan" => self.toggle_plan(out),
             "go" => self.go(session, out).await,
+            "goal" if arg.is_empty() => match session.goal.as_deref() {
+                Some(goal) => {
+                    out.status(&format!("goal: {goal}"));
+                    out.status("/goal <statement> replaces it, /goal clear removes it");
+                }
+                None => out.status("no goal set; /goal <statement> sets one"),
+            },
+            "goal" if arg.trim() == "clear" => {
+                session.goal = None;
+                out.status("goal cleared");
+                self.save(session, out);
+            }
+            "goal" => {
+                session.goal = Some(arg.trim().to_string());
+                out.status(&format!("goal: {}", arg.trim()));
+                self.save(session, out);
+            }
+            "status" => self.status(session, out),
+            "context" => self.context_report(session, out),
+            "permissions" => self.permissions(arg, session, out),
+            "init" => self.init(session, out),
+            "copy" => self.copy(arg, session, out),
+            "diff" => self.diff_command(arg, session, out),
+            "doctor" => {
+                let model = session.model.clone();
+                let checks = self.backend.doctor(&model).await;
+                if checks.is_empty() {
+                    out.status("no checks to run from here");
+                }
+                for check in &checks {
+                    out.status(&check.line());
+                }
+                let failed = checks.iter().filter(|c| !c.ok).count();
+                out.status(&if failed == 0 {
+                    "everything airlok needs is working".to_string()
+                } else {
+                    format!("{failed} check(s) failed")
+                });
+            }
+            "btw" if arg.is_empty() => {
+                out.status("/btw <question> answers beside the task, without joining it")
+            }
+            "btw" => {
+                let interrupt = self.interrupt.clone();
+                // Bracketed like a turn: the renderer holds text back until
+                // end_turn, and without it a short answer sits in the
+                // buffer until something else flushes it.
+                out.begin_turn();
+                let asked = self.agent.aside(session, arg, out, &interrupt).await;
+                out.end_turn();
+                match asked {
+                    Ok(_) => self.save(session, out),
+                    Err(e) => out.status(&format!("the side question failed: {e}")),
+                }
+            }
             "exit" => return Flow::Exit,
             other => unreachable!("/{other} is in COMMANDS but not handled"),
         }
@@ -579,8 +857,8 @@ impl Repl<'_> {
             out.status(&format!("cannot write {}: {e}", path.display()));
             return;
         }
-        if let Some(context) = self.backend.context() {
-            self.agent.set_context(context);
+        if let Some(block) = self.backend.context() {
+            self.agent.set_context_block(&block);
         }
         // AIRLOK.md takes precedence, so a new one hides the fallbacks.
         let hidden = INSTRUCTION_FILES[1..]
@@ -696,6 +974,430 @@ impl Repl<'_> {
         self.save(session, out);
     }
 
+    /// What airlok changed on disk this session: each recorded file diffed
+    /// from what was there before its first write, against what is there
+    /// now. A path whose original was too large to keep says so rather
+    /// than showing a misleading diff.
+    fn diff_command(&mut self, arg: &str, session: &Session, out: &mut dyn Output) {
+        if session.writes.is_empty() {
+            out.status("airlok has not written anything this session");
+            return;
+        }
+        let arg = arg.trim();
+        let wanted: Vec<&crate::session::WriteRecord> = if arg.is_empty() {
+            session.writes.iter().collect()
+        } else {
+            let joined = self.agent.config().cwd.join(arg).display().to_string();
+            session
+                .writes
+                .iter()
+                .filter(|w| w.path == arg || w.path == joined || w.path.ends_with(arg))
+                .collect()
+        };
+        if wanted.is_empty() {
+            out.status(&format!("{arg} was not written this session"));
+            return;
+        }
+        for record in wanted {
+            let current = std::fs::read_to_string(&record.path).unwrap_or_default();
+            match &record.original {
+                None => out.status(&format!(
+                    "{}: changed, original too large to show",
+                    record.path
+                )),
+                Some(original) if original == &current => {
+                    out.status(&format!("{}: back to how it started", record.path))
+                }
+                Some(original) => {
+                    let diff = crate::tools::unified_diff(&record.path, original, &current);
+                    out.diff(&record.path, &diff);
+                }
+            }
+        }
+    }
+
+    /// Puts a reply on the clipboard: the last one, the Nth from last, or
+    /// the last fenced code block.
+    fn copy(&mut self, arg: &str, session: &Session, out: &mut dyn Output) {
+        let replies: Vec<String> = session
+            .messages
+            .iter()
+            .filter(|m| m.role == airlok_llm::Role::Assistant)
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        airlok_llm::ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|text| !text.trim().is_empty())
+            .collect();
+
+        let arg = arg.trim();
+        let (what, text) = if arg == "code" {
+            match replies.iter().rev().find_map(|reply| fenced_block(reply)) {
+                Some(block) => ("the last code block".to_string(), block),
+                None => return out.status("no fenced code block in this session"),
+            }
+        } else {
+            let nth = if arg.is_empty() {
+                1
+            } else {
+                match arg.parse::<usize>() {
+                    Ok(n) if n >= 1 => n,
+                    _ => return out.status("/copy takes a number from the end, or `code`"),
+                }
+            };
+            match replies
+                .len()
+                .checked_sub(nth)
+                .and_then(|at| replies.get(at))
+            {
+                Some(text) => (
+                    if nth == 1 {
+                        "the last reply".to_string()
+                    } else {
+                        format!("reply {nth} from the end")
+                    },
+                    text.clone(),
+                ),
+                None => {
+                    return out.status(&format!(
+                        "there are only {} replies in this session",
+                        replies.len()
+                    ))
+                }
+            }
+        };
+
+        match to_clipboard(&text) {
+            Ok(program) => out.status(&format!(
+                "copied {what} ({} characters) with {program}",
+                text.chars().count()
+            )),
+            Err(why) => out.status(&why),
+        }
+    }
+
+    /// Proposes an AIRLOK.md built from the repository, as a diff. Nothing
+    /// is written until the user approves it, and an existing file is only
+    /// ever replaced through that same diff.
+    fn init(&mut self, session: &mut Session, out: &mut dyn Output) {
+        let cwd = self.agent.config().cwd.clone();
+        let path = cwd.join(INSTRUCTION_FILES[0]);
+        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        let proposed = crate::context::starter(&cwd);
+        if proposed == current {
+            out.status(&format!("{} already says this", path.display()));
+            return;
+        }
+        let diff = crate::tools::unified_diff(&path.display().to_string(), &current, &proposed);
+        match out.confirm(&Confirmation::Write {
+            path: &path,
+            diff: &diff,
+        }) {
+            Decision::Approve | Decision::ApproveAll | Decision::SaveAll => {
+                match std::fs::write(&path, &proposed) {
+                    Ok(()) => {
+                        out.status(&format!(
+                            "wrote {}{}",
+                            path.display(),
+                            if current.is_empty() {
+                                ""
+                            } else {
+                                " (replaced)"
+                            }
+                        ));
+                        if let Some(block) = self.backend.context() {
+                            self.agent.set_context_block(&block);
+                        }
+                        self.save(session, out);
+                    }
+                    Err(e) => out.status(&format!("cannot write {}: {e}", path.display())),
+                }
+            }
+            Decision::Reject | Decision::Quit => out.status("left AIRLOK.md alone"),
+        }
+    }
+
+    /// Shows what airlok asks about, changes one setting for the session,
+    /// or writes the session's settings to the project config after asking.
+    fn permissions(&mut self, arg: &str, session: &mut Session, out: &mut dyn Output) {
+        let mut words = arg.split_whitespace();
+        let Some(name) = words.next() else {
+            return self.show_permissions(out);
+        };
+        if name == "save" {
+            return self.save_permissions(session, out);
+        }
+        let value = words.collect::<Vec<_>>().join(" ");
+        if value.is_empty() {
+            out.status(&format!("/permissions {name} <value> sets it"));
+            return;
+        }
+        let safety = &mut self.agent.config_mut().safety;
+        let flag = |value: &str| match value {
+            "on" | "true" | "yes" => Some(true),
+            "off" | "false" | "no" => Some(false),
+            _ => None,
+        };
+        match name {
+            "confirm_writes" | "confirm_bash" | "confirm_mcp" => match flag(&value) {
+                Some(on) => {
+                    match name {
+                        "confirm_writes" => safety.confirm_writes = on,
+                        "confirm_bash" => safety.confirm_bash = on,
+                        _ => safety.confirm_mcp = on,
+                    }
+                    out.status(&format!(
+                        "{name} {} for the rest of this session",
+                        if on { "on" } else { "off" }
+                    ));
+                }
+                None => out.status(&format!("{name} takes on or off, not {value}")),
+            },
+            "allow" => {
+                if !safety.bash_allowlist.iter().any(|e| e == &value) {
+                    safety.bash_allowlist.push(value.clone());
+                }
+                out.status(&format!("commands starting `{value}` run without asking"));
+            }
+            "deny" => {
+                if !safety.bash_denylist.iter().any(|e| e == &value) {
+                    safety.bash_denylist.push(value.clone());
+                }
+                out.status(&format!("`{value}` is refused"));
+            }
+            "unallow" => {
+                let before = safety.bash_allowlist.len();
+                safety.bash_allowlist.retain(|e| e != &value);
+                out.status(&if safety.bash_allowlist.len() == before {
+                    format!("`{value}` was not on the allow list")
+                } else {
+                    format!("`{value}` now asks before running")
+                });
+            }
+            // Emptying the deny list silently is exactly what this must
+            // not do, so removing an entry says what it did.
+            "undeny" => {
+                let before = safety.bash_denylist.len();
+                safety.bash_denylist.retain(|e| e != &value);
+                out.status(&if safety.bash_denylist.len() == before {
+                    format!("`{value}` was not on the deny list")
+                } else {
+                    format!("`{value}` is no longer refused; it asks instead")
+                });
+            }
+            other => out.status(&format!(
+                "unknown setting {other}; one of {}",
+                PERMISSION_NAMES.join(", ")
+            )),
+        }
+    }
+
+    fn show_permissions(&mut self, out: &mut dyn Output) {
+        let safety = &self.agent.config().safety;
+        let onoff = |on: bool| if on { "on" } else { "off" };
+        out.status(&format!(
+            "confirm_writes {} · confirm_bash {} · confirm_mcp {}",
+            onoff(safety.confirm_writes),
+            onoff(safety.confirm_bash),
+            onoff(safety.confirm_mcp)
+        ));
+        out.status(&if safety.bash_allowlist.is_empty() {
+            "allow list: empty, so every command asks".to_string()
+        } else {
+            format!("allow list: {}", safety.bash_allowlist.join(", "))
+        });
+        out.status(&if safety.bash_denylist.is_empty() {
+            "deny list: empty".to_string()
+        } else {
+            format!("deny list: {}", safety.bash_denylist.join(", "))
+        });
+        let cwd = self.agent.config().cwd.clone();
+        let trust = crate::mcp::trust::load(&cwd);
+        let lines = trust.lines();
+        if lines.is_empty() {
+            out.status("mcp trust: nothing saved past this run");
+        } else {
+            for line in lines {
+                out.status(&format!("mcp trust: {line}"));
+            }
+        }
+        out.status("/permissions <name> <value> changes one, /permissions save writes them");
+    }
+
+    /// Writes the session's safety settings into the project config, after
+    /// showing exactly what would change and asking.
+    fn save_permissions(&mut self, session: &mut Session, out: &mut dyn Output) {
+        let cwd = self.agent.config().cwd.clone();
+        let path = cwd.join(crate::config::PROJECT_CONFIG_NAME);
+        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        let safety = self.agent.config().safety.clone();
+        let updated = match crate::config::with_safety_section(&current, &safety) {
+            Ok(text) => text,
+            Err(e) => {
+                out.status(&format!("cannot update {}: {e}", path.display()));
+                return;
+            }
+        };
+        if updated == current {
+            out.status(&format!("{} already says this", path.display()));
+            return;
+        }
+        let diff = crate::tools::unified_diff(&path.display().to_string(), &current, &updated);
+        match out.confirm(&Confirmation::Write {
+            path: &path,
+            diff: &diff,
+        }) {
+            Decision::Approve | Decision::ApproveAll | Decision::SaveAll => {
+                match std::fs::write(&path, &updated) {
+                    Ok(()) => {
+                        out.status(&format!("wrote {}", path.display()));
+                        self.save(session, out);
+                    }
+                    Err(e) => out.status(&format!("cannot write {}: {e}", path.display())),
+                }
+            }
+            Decision::Reject | Decision::Quit => out.status("left the project config alone"),
+        }
+    }
+
+    /// Where the context window is going, part by part. The parts are
+    /// counted the way the request estimator counts them, and the total is
+    /// their sum, so the breakdown always adds up to what is reported.
+    fn context_report(&mut self, session: &Session, out: &mut dyn Output) {
+        let parts = self.agent.context_parts(session);
+        let config = self.agent.config();
+        let window = config.provider.context_window;
+        let threshold = config.agent.compact_threshold(window);
+
+        let tokens = |bytes: usize| (bytes / 4) as u64;
+        let rows = [
+            ("system prompt", tokens(parts.system)),
+            ("context block", tokens(parts.context_block)),
+            ("history", tokens(parts.history)),
+            ("tool results", tokens(parts.tool_results)),
+            ("tool schemas", tokens(parts.tool_schemas)),
+        ];
+        let total: u64 = rows.iter().map(|(_, t)| *t).sum();
+
+        out.status(&format!(
+            "context: about {total} tokens of {window} ({}% of the window)",
+            share(total, window)
+        ));
+        for (label, count) in rows {
+            out.status(&format!(
+                "  {label:<14} {} {count:>7} ({}%)",
+                bar(share(count, total)),
+                share(count, total)
+            ));
+        }
+        if parts.instructions > 0 {
+            out.status(&format!(
+                "  of the block, {} tokens are instruction files",
+                tokens(parts.instructions)
+            ));
+        }
+        if session.usage.context_tokens > 0 {
+            out.status(&format!(
+                "  the last request measured {} tokens{}",
+                session.usage.context_tokens,
+                if session.usage.estimated {
+                    " (estimated)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        out.status(&format!(
+            "compaction at {threshold} tokens: {}",
+            if total >= threshold {
+                "due on the next turn".to_string()
+            } else {
+                format!("about {} tokens away", threshold - total)
+            }
+        ));
+    }
+
+    /// One screen of what this session is: names, counts and where things
+    /// came from, and no values from anywhere.
+    fn status(&mut self, session: &Session, out: &mut dyn Output) {
+        let config = self.agent.config();
+        let effort = config
+            .models
+            .get(&session.model)
+            .and_then(|m| m.reasoning_effort.as_deref())
+            .unwrap_or("the provider's default")
+            .to_string();
+        let cwd = config.cwd.clone();
+        let servers: Vec<(String, String, bool)> = config
+            .mcp
+            .iter()
+            .map(|server| {
+                (
+                    server.name.clone(),
+                    server.scope.as_str().to_string(),
+                    self.agent.mcp_connected(&server.name),
+                )
+            })
+            .collect();
+
+        out.status(&format!("airlok {}", env!("CARGO_PKG_VERSION")));
+        out.status(&format!(
+            "provider {} · model {} · effort {effort}",
+            session.provider, session.model
+        ));
+        out.status(&format!(
+            "session {} · {} turn(s){}",
+            session.id,
+            session.turns(),
+            if session.interrupted {
+                " · last turn interrupted"
+            } else {
+                ""
+            }
+        ));
+        match crate::context::branch(&cwd) {
+            Some(branch) => out.status(&format!("cwd {} · branch {branch}", cwd.display())),
+            None => out.status(&format!("cwd {} · not a git repository", cwd.display())),
+        }
+        if let Some(source) = self.backend.key_source() {
+            out.status(&format!("api key from {source}"));
+        }
+        for line in self.backend.config_files() {
+            out.status(&format!("config {line}"));
+        }
+        if servers.is_empty() {
+            out.status("mcp: no servers configured");
+        } else {
+            for (name, scope, connected) in servers {
+                out.status(&format!(
+                    "mcp {name} [{scope}]: {}",
+                    if connected {
+                        "connected this run"
+                    } else {
+                        "not started"
+                    }
+                ));
+            }
+        }
+        let mut rehydrate = 0usize;
+        let mut redact_only = 0usize;
+        for entry in session.redactions.values() {
+            match entry.class {
+                crate::redact::Class::Rehydrate => rehydrate += 1,
+                crate::redact::Class::RedactOnly => redact_only += 1,
+            }
+        }
+        out.status(&format!(
+            "redactions: {rehydrate} rehydrate, {redact_only} redact-only"
+        ));
+    }
+
     fn switch_provider(&mut self, arg: &str, session: &mut Session, out: &mut dyn Output) {
         let name = match arg.to_ascii_lowercase().as_str() {
             "anthropic" => ProviderName::Anthropic,
@@ -790,6 +1492,33 @@ pub fn cost_lines(session: &Session, context_window: u64) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_clipboard_program_is_reported_rather_than_silently_doing_nothing() {
+        let err = to_clipboard_with(&[("airlok-no-such-clipboard", &[])], "hello").unwrap_err();
+        assert!(err.contains("no clipboard program found"), "{err}");
+        assert!(err.contains("airlok-no-such-clipboard"), "{err}");
+    }
+
+    #[test]
+    fn the_last_fenced_block_is_what_copy_code_takes() {
+        let reply = "first\n\n```sh\nls -l\n```\n\nthen\n\n```rust\nfn main() {}\n```\n";
+        assert_eq!(fenced_block(reply).unwrap(), "fn main() {}");
+        assert_eq!(fenced_block("no fences here"), None);
+    }
+
+    #[test]
+    fn a_check_reads_as_pass_or_fail_on_its_own() {
+        let good = Check::pass("git", "on main");
+        let bad = Check::fail("provider key", "unset");
+        assert!(good.line().starts_with("pass git"), "{}", good.line());
+        assert!(
+            bad.line().starts_with("FAIL provider key"),
+            "{}",
+            bad.line()
+        );
+        assert!(good.ok && !bad.ok);
+    }
+
     use super::*;
 
     #[test]
