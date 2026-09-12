@@ -481,6 +481,26 @@ impl McpServer {
         }
     }
 
+    /// What the server can reach, when that can be told: the first
+    /// argument naming a directory that exists, or the url for an http
+    /// server. Shown in `airlok mcp list` and in the confirmation, so a
+    /// path outside the project is visible before a call runs.
+    pub fn root(&self) -> Option<String> {
+        if self.transport == McpTransport::Http {
+            return self.url.clone();
+        }
+        self.args
+            .iter()
+            .map(PathBuf::from)
+            .find(|arg| arg.is_dir())
+            .map(|dir| {
+                dir.canonicalize()
+                    .unwrap_or(dir)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+    }
+
     /// The child process environment, running each `env_cmd` once. The
     /// values are secrets: never log them.
     pub fn resolved_env(&self) -> Result<BTreeMap<String, String>, ConfigError> {

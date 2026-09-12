@@ -107,6 +107,17 @@ impl Renderer {
             Renderer::Rich(rich) => rich.finish(),
         }
     }
+
+    /// Flushes only what is complete, for printing something of airlok's
+    /// own in the middle of a turn: a tool call, a note. A line still
+    /// arriving keeps its block open, so a bullet is never cut from its
+    /// text by a tool call landing between them.
+    pub fn interrupt(&mut self) -> String {
+        match self {
+            Renderer::Plain => String::new(),
+            Renderer::Rich(rich) => rich.interrupt(),
+        }
+    }
 }
 
 impl Rich {
@@ -118,6 +129,20 @@ impl Rich {
             out.push_str(&self.line(line.trim_end_matches('\n')));
         }
         out
+    }
+
+    /// [`Renderer::interrupt`]: the block is flushed only when nothing is
+    /// still arriving in it. Code and tables are held until they close,
+    /// as they are anyway.
+    fn interrupt(&mut self) -> String {
+        if !self.pending.is_empty() || !matches!(self.block, Block::Prose(_)) {
+            return String::new();
+        }
+        let Block::Prose(lines) = std::mem::replace(&mut self.block, Block::Prose(Vec::new()))
+        else {
+            unreachable!("checked just above")
+        };
+        self.prose(&lines)
     }
 
     fn finish(&mut self) -> String {
@@ -530,6 +555,68 @@ mod tests {
         assert!(text.contains("\u{2022} short item that continues on a second source line"));
     }
 
+    /// A tool call or a note printing between two chunks of one line: the
+    /// shape that split a bold label from its text in 0.6.0.
+    fn interrupted() -> String {
+        let mut renderer = Renderer::rich(60);
+        let mut out = String::new();
+        out.push_str(&renderer.push("Here is what I found.\n\n- **Overview:**"));
+        out.push_str(&renderer.interrupt());
+        out.push_str(&renderer.push(" the repo is a Rust workspace of three crates.\n"));
+        out.push_str(&renderer.interrupt());
+        out.push_str(&renderer.push("- **Next:** run the tests.\n"));
+        out.push_str(&renderer.finish());
+        out
+    }
+
+    #[test]
+    fn golden_interrupted_render() {
+        assert_eq!(
+            interrupted(),
+            include_str!("../tests/golden/interrupted.ansi")
+        );
+    }
+
+    #[test]
+    fn a_note_in_the_middle_of_a_line_does_not_cut_the_block() {
+        let text = strip_ansi(&interrupted());
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("\u{2022} Overview: the repo is a Rust workspace")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.trim() == "\u{2022} Overview:"),
+            "the label was left alone on its line: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("\u{2022} Next: run the tests")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_interrupt_between_blocks_flushes_what_is_complete() {
+        let mut renderer = Renderer::rich(60);
+        assert_eq!(renderer.push("A complete paragraph.\n"), "");
+        assert_eq!(strip_ansi(&renderer.interrupt()), "A complete paragraph.\n");
+        // Nothing is left to print at the end of the turn.
+        assert_eq!(renderer.finish(), "");
+    }
+
+    #[test]
+    fn an_interrupt_holds_an_unclosed_code_block() {
+        let mut renderer = Renderer::rich(60);
+        assert_eq!(renderer.push("```rust\nlet x = 1;\n"), "");
+        assert_eq!(renderer.interrupt(), "", "the fence has not closed");
+        let out = strip_ansi(&renderer.push("```\n"));
+        assert!(out.contains("let x = 1;"), "{out:?}");
+    }
+
     /// Rewrites the golden files. Run with
     /// `cargo test -p airlok --bin airlok -- --ignored dump_golden` after
     /// checking the new render by eye.
@@ -539,5 +626,6 @@ mod tests {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
         std::fs::write(format!("{dir}/sample.ansi"), render_all(&[SAMPLE])).unwrap();
         std::fs::write(format!("{dir}/stream.ansi"), render_all(&[STREAM])).unwrap();
+        std::fs::write(format!("{dir}/interrupted.ansi"), interrupted()).unwrap();
     }
 }

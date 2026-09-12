@@ -178,6 +178,7 @@ pub enum Shown {
         server: String,
         tool: String,
         arguments: String,
+        paths: Vec<String>,
     },
     Status(String),
     EndTurn,
@@ -268,10 +269,13 @@ impl Output for RecordingOutput {
                 server,
                 tool,
                 arguments,
+                paths,
+                ..
             } => Shown::ConfirmMcp {
                 server: server.to_string(),
                 tool: tool.to_string(),
                 arguments: arguments.to_string(),
+                paths: paths.to_vec(),
             },
         });
         self.decisions.pop_front().unwrap_or(Decision::Approve)

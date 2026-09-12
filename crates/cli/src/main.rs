@@ -416,7 +416,10 @@ async fn mcp_command(action: Option<McpAction>, config: &Config) -> anyhow::Resu
     }
     let result = match action.unwrap_or(McpAction::List) {
         McpAction::List => {
-            for status in airlok_core::mcp::connect_all(&config.mcp).await.1 {
+            for status in airlok_core::mcp::connect_all(&config.mcp, &config.cwd)
+                .await
+                .1
+            {
                 println!("{}", status.line());
             }
             Ok(())
@@ -446,7 +449,7 @@ async fn mcp_call(
         .ok_or_else(|| anyhow!("no MCP server called {server} in the config"))?;
     let arguments: serde_json::Value =
         serde_json::from_str(arguments).context("the arguments must be a JSON object")?;
-    let connection = airlok_core::mcp::connect(configured)
+    let connection = airlok_core::mcp::connect(configured, &config.cwd)
         .await
         .map_err(|why| anyhow!("{server}: {why}"))?;
     let called = connection
@@ -458,13 +461,23 @@ async fn mcp_call(
     match called.plan(&arguments).await? {
         Plan::Denied { why } => bail!("{why}"),
         Plan::McpCall {
-            tool, arguments, ..
+            tool,
+            arguments,
+            root,
+            paths,
+            ..
         } if config.safety.confirm_mcp => {
             let mut terminal = Terminal::open().context(
                 "a confirmation is needed but no terminal is available. \
                  Set trust = allow for this server, or pass --yes",
             )?;
-            terminal.show_lines(&arguments.lines().map(str::to_string).collect::<Vec<_>>());
+            terminal.show_lines(&output::mcp_lines(
+                server,
+                &tool,
+                &arguments,
+                root.as_deref(),
+                &paths,
+            ));
             if terminal.ask(&format!("Call `{tool}` on `{server}`?")) != Decision::Approve {
                 bail!("not called");
             }

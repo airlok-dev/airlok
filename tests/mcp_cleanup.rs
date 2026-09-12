@@ -36,7 +36,7 @@ async fn a_stdio_child_is_killed_on_the_way_out() {
     let file = ConfigFile::parse(&text, Path::new("test.toml")).unwrap();
     let config = Config::resolve(file, std::env::temp_dir());
 
-    let connection = mcp::connect(&config.mcp[0]).await.unwrap();
+    let connection = mcp::connect(&config.mcp[0], &config.cwd).await.unwrap();
     let pid = connection.child.expect("a stdio server runs a child");
     assert!(running(pid), "the server should be running");
 
