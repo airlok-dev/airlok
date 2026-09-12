@@ -86,6 +86,25 @@ pub fn for_display(input: &str, map: &RedactionMap, show_secrets: bool) -> Strin
     out
 }
 
+/// Puts placeholders back in place of the values they stand for. The
+/// inverse of [`Redactor::rehydrate`], for a destination that must not
+/// see the secrets: an MCP server, by default. Longer values go first, so
+/// one value that contains another cannot be half-replaced.
+pub fn dehydrate(input: &str, map: &RedactionMap) -> String {
+    let mut entries: Vec<(&String, &Entry)> = map
+        .iter()
+        .filter(|(_, entry)| entry.class == Class::Rehydrate)
+        .collect();
+    entries.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.value.len()));
+    let mut out = input.to_string();
+    for (placeholder, entry) in entries {
+        if !entry.value.is_empty() && out.contains(&entry.value) {
+            out = out.replace(&entry.value, placeholder);
+        }
+    }
+    out
+}
+
 /// First four characters and the length, for example `sk-a… (49 chars)`.
 pub fn mask(value: &str) -> String {
     let shown: String = value.chars().take(4).collect();
@@ -162,6 +181,19 @@ mod tests {
             Plain.rehydrate(text, &map()),
             "a <<SECRET_1>> b sk-ant-api03-xyz c"
         );
+    }
+
+    #[test]
+    fn dehydrate_is_the_inverse_of_rehydrate() {
+        let map = map();
+        let plain = "a <<SECRET_1>> b sk-ant-api03-xyz c";
+        assert_eq!(dehydrate(plain, &map), "a <<SECRET_1>> b <<SECRET_2>> c");
+        // Round trip: what the model sent, restored and put back.
+        let restored = Plain.rehydrate("<<SECRET_2>>", &map);
+        assert_eq!(dehydrate(&restored, &map), "<<SECRET_2>>");
+        // A redact-only value is not in play: it is never restored, so it
+        // cannot appear in text to put back.
+        assert_eq!(dehydrate("0123456789abcdef", &map), "0123456789abcdef");
     }
 
     #[test]

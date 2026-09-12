@@ -7,6 +7,7 @@ pub mod agent;
 pub mod config;
 pub mod context;
 pub mod interrupt;
+pub mod mcp;
 pub mod redact;
 pub mod repl;
 pub mod safety;

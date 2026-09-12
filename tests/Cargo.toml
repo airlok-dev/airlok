@@ -9,6 +9,10 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "mock-mcp-server"
+path = "bin/mock_mcp_server.rs"
+
 [[test]]
 name = "agent_loop"
 path = "agent_loop.rs"
@@ -52,6 +56,14 @@ path = "repl.rs"
 [[test]]
 name = "plan_mode"
 path = "plan_mode.rs"
+
+[[test]]
+name = "mcp"
+path = "mcp.rs"
+
+[[test]]
+name = "mcp_cleanup"
+path = "mcp_cleanup.rs"
 
 [dependencies]
 airlok-core.workspace = true

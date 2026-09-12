@@ -18,16 +18,16 @@ use airlok_core::context::{self, ContextInput};
 use airlok_core::redact::{Class, RedactionMap, Redactor, SecretRedactor};
 use airlok_core::repl::{Backend, Repl, Switch};
 use airlok_core::session::Summary;
-use airlok_core::tools::ToolRegistry;
+use airlok_core::tools::{truncate_output, Plan, Tool, ToolRegistry};
 use airlok_core::CoreError;
-use airlok_core::{Agent, Config, Interrupt, Output, RunReport, SessionStore};
+use airlok_core::{Agent, Config, Decision, Interrupt, Output, RunReport, SessionStore};
 use airlok_llm::openai::Auth;
 use airlok_llm::{Anthropic, OpenAi, Provider};
 use anyhow::{anyhow, bail, Context};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use args::{Args, Command, ConfigAction, SessionsAction};
+use args::{Args, Command, ConfigAction, McpAction, SessionsAction};
 use keys::Keys;
 use output::Stdout;
 use terminal::Terminal;
@@ -98,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
             print!("{redacted}");
             return Ok(());
         }
+        Some(Command::Mcp { action }) => return mcp_command(action, &config).await,
         Some(Command::Sessions { action }) => return sessions_command(action, &store()?, &cwd),
         None => {}
     }
@@ -260,6 +261,7 @@ async fn run_repl(
     tokio::spawn(async move {
         if sigterm.recv().await.is_some() {
             keys::restore();
+            airlok_core::mcp::kill_children();
             std::process::exit(143);
         }
     });
@@ -404,6 +406,73 @@ impl Backend for CliBackend {
             .text,
         )
     }
+}
+
+/// `airlok mcp`: what the servers offer, and a way to call one tool
+/// without a model. The gates are the same as in a run.
+async fn mcp_command(action: Option<McpAction>, config: &Config) -> anyhow::Result<()> {
+    if config.mcp.is_empty() {
+        bail!("no MCP servers configured. Add an [[mcp]] block to the config; airlok config show says where it is");
+    }
+    let result = match action.unwrap_or(McpAction::List) {
+        McpAction::List => {
+            for status in airlok_core::mcp::connect_all(&config.mcp).await.1 {
+                println!("{}", status.line());
+            }
+            Ok(())
+        }
+        McpAction::Call {
+            server,
+            tool,
+            arguments,
+        } => mcp_call(config, &server, &tool, &arguments).await,
+    };
+    // Nothing owns the clients past this point, so make sure no child
+    // outlives the command.
+    airlok_core::mcp::kill_children();
+    result
+}
+
+async fn mcp_call(
+    config: &Config,
+    server: &str,
+    tool: &str,
+    arguments: &str,
+) -> anyhow::Result<()> {
+    let configured = config
+        .mcp
+        .iter()
+        .find(|candidate| candidate.name == server)
+        .ok_or_else(|| anyhow!("no MCP server called {server} in the config"))?;
+    let arguments: serde_json::Value =
+        serde_json::from_str(arguments).context("the arguments must be a JSON object")?;
+    let connection = airlok_core::mcp::connect(configured)
+        .await
+        .map_err(|why| anyhow!("{server}: {why}"))?;
+    let called = connection
+        .tools
+        .into_iter()
+        .find(|candidate| candidate.tool() == tool)
+        .ok_or_else(|| anyhow!("{server} offers no tool called {tool}"))?;
+
+    match called.plan(&arguments).await? {
+        Plan::Denied { why } => bail!("{why}"),
+        Plan::McpCall {
+            tool, arguments, ..
+        } if config.safety.confirm_mcp => {
+            let mut terminal = Terminal::open().context(
+                "a confirmation is needed but no terminal is available. \
+                 Set trust = allow for this server, or pass --yes",
+            )?;
+            terminal.show_lines(&arguments.lines().map(str::to_string).collect::<Vec<_>>());
+            if terminal.ask(&format!("Call `{tool}` on `{server}`?")) != Decision::Approve {
+                bail!("not called");
+            }
+        }
+        _ => {}
+    }
+    println!("{}", truncate_output(called.execute(arguments).await?));
+    Ok(())
 }
 
 fn store() -> anyhow::Result<SessionStore> {

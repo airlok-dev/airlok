@@ -35,6 +35,7 @@ airlok config init                             # write a commented config to the
 airlok config show                             # print the effective config and the key source
 airlok context                                 # print the context block sent with the system prompt, after redaction
 airlok redactions                              # list what the redactor detects and how each kind is treated
+airlok mcp list                                # the configured MCP servers, whether they answer, and their tools
 ```
 
 Every `write_file` and `edit_file` call shows a diff with line numbers, three lines of context, +/- gutters, and syntax highlighting, and asks `Apply? [y]es / [n]o / [a]ll / [q]uit`. A diff longer than 40 lines stops at `... N more lines, [v] to view all`; `v` prints the rest and asks again. Every `bash` call that is not on the allow list shows the command and asks the same way. `y` applies this one, `n` sends a rejection back to the model so it can adapt, `a` approves the rest of that kind for the run, and `q` aborts the run with a non-zero exit. Prompts are read from the terminal, not stdin, so piped input still works; without a terminal, pass `--yes` or turn the confirmations off in the config.
@@ -71,6 +72,7 @@ A cancelled turn keeps the text streamed so far in the history, marked as interr
 |---|---|
 | `/help` | list the commands |
 | `/model [<id>]` | show the model, or use `<id>` for the rest of the session; not validated, the provider rejects a bad id on the next turn |
+| `/mcp` | list the MCP servers and their tools; `/mcp <name>` enables a disabled one for this session |
 | `/plan` | turn plan mode on or off |
 | `/go` | carry out the plan from plan mode, back in normal mode |
 | `/provider [<name>]` | show the provider, or switch to `anthropic` or `openai` if a key is available for it; says which key is missing otherwise |
@@ -110,6 +112,49 @@ Long sessions are compacted. Once the last request used more than `compact_at` (
 | `bash(command)` | unless allow-listed | Run a shell command in the working directory. |
 
 Tool results over 50 KiB are cut with a marker telling the model to page with `read_file`'s `offset` and `limit`.
+
+## MCP servers
+
+airlok can offer the model tools from external [MCP](https://modelcontextprotocol.io) servers. They are configured with `[[mcp]]` blocks, which merge across the user and project files like every other setting:
+
+```toml
+[[mcp]]
+name = "files"                  # its tools reach the model as files__<tool>
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# env = { NODE_ENV = "production" }
+# env_cmd = { TOKEN = "op read op://vault/item/token" }   # stdout is the value
+
+[[mcp]]
+name = "docs"
+transport = "http"
+url = "https://example.com/mcp"
+headers = { Accept = "application/json" }
+header_cmd = { Authorization = "printf 'Bearer %s' $(cat ~/.docs-token)" }
+tools = ["search"]              # or "all", the default
+trust = "prompt"                # "prompt" (default), "allow", "deny"
+rehydrate = false               # the default
+timeout_secs = 30               # starting the server, and every call
+enabled = true
+```
+
+`env_cmd` and `header_cmd` take their values from a command's stdout, the way `api_key_cmd` does, so a token never sits in the file. `airlok config show` prints the command, never what it produced.
+
+Servers start on the first turn that can use them, not when airlok starts. One that fails to start prints a line and is skipped, and the run continues without it. Tools are named `<server>__<tool>`; a built-in keeps its name if a server ever claims one.
+
+`trust` decides the gate. The default, `prompt`, shows the server, the tool, and the arguments, and asks with the same `[y]es / [n]o / [a]ll / [q]uit` prompt as a shell command, where `a` approves that one server for the rest of the run. `allow` never asks. `deny` keeps a server's tools from the model, while `airlok mcp list` still shows them.
+
+`rehydrate` decides what the server receives. By default airlok sends placeholders: a secret found in your files leaves as `<<SECRET_1>>` rather than as the value, because an MCP server is a third party in the same way the model is, and the confirmation prompt shows you exactly what will be sent. Set `rehydrate = true` for a server that genuinely needs the value. The provider API key is refused either way, as it is for every tool.
+
+A server is untrusted input. Its tool descriptions and its results reach the model inside markers saying they are data from that server, so a description reading "ignore previous instructions" is quoted text and nothing more. Nothing a server sends changes the deny list, the confirmations, or anything else about how airlok behaves.
+
+| Command | What it does |
+|---|---|
+| `airlok mcp list` | every configured server, whether it answers, and the tools it offers |
+| `airlok mcp call <server> <tool> '<json>'` | call one tool with the same gates, for debugging |
+| `/mcp` | in a session, the same list; `/mcp <name>` enables a disabled server for this session |
+
+Plan mode offers no MCP tools, just as it offers no write tools, and it starts no servers.
 
 ## Context and AIRLOK.md
 
