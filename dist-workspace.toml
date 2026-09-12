@@ -21,3 +21,4 @@ install-updater = false
 tap = "airlok-dev/homebrew-tap"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew", "./publish-npm"]
+post-announce-jobs = ["./notify-site"]
