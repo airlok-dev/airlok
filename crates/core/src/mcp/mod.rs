@@ -25,6 +25,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, info, warn};
 
 use crate::config::{McpServer, McpTransport, McpTrust};
@@ -183,11 +184,26 @@ async fn start(server: &McpServer) -> Result<(Client, Option<u32>), String> {
                 .ok_or("transport is stdio but no command is set")?;
             let env = server.resolved_env().map_err(|e| e.to_string())?;
             let args = server.args.clone();
-            let process =
-                TokioChildProcess::new(tokio::process::Command::new(&command).configure(|child| {
+            // A server's stderr is its own diagnostics, not airlok's
+            // output. Inheriting it prints a server's startup chatter over
+            // the session, so it goes to the debug log instead.
+            let (process, stderr) = TokioChildProcess::builder(
+                tokio::process::Command::new(&command).configure(|child| {
                     child.args(&args).envs(&env);
-                }))
-                .map_err(|e| format!("cannot run `{command}`: {e}"))?;
+                }),
+            )
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot run `{command}`: {e}"))?;
+            if let Some(stderr) = stderr {
+                let name = server.name.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        debug!(server = %name, "stderr: {line}");
+                    }
+                });
+            }
             let child = process.id();
             if let Some(pid) = child {
                 remember_child(pid);
