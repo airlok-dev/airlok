@@ -30,6 +30,11 @@ pub struct ContextBlock {
     pub instruction_files: Vec<PathBuf>,
 }
 
+/// The current git branch of `cwd`, when it is in a repository at all.
+pub fn branch(cwd: &Path) -> Option<String> {
+    GitInfo::detect(cwd).map(|git| git.branch)
+}
+
 pub fn build(input: &ContextInput<'_>) -> ContextBlock {
     let git = GitInfo::detect(input.cwd);
     let root = git

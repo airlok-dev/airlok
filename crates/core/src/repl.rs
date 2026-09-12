@@ -75,6 +75,17 @@ pub trait Backend: Send {
     fn startup_effort(&mut self, _model: &str) -> Option<String> {
         None
     }
+
+    /// One line per configuration file that could apply, saying whether it
+    /// was found. Never carries a key or any value read from one.
+    fn config_files(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Where the provider key comes from, named but never resolved.
+    fn key_source(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// A provider ready to take over the session.
@@ -112,6 +123,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (
         "/redactions",
         "what was redacted before leaving this machine",
+    ),
+    (
+        "/status",
+        "version, provider, session, config files, MCP servers, redaction counts",
     ),
     (
         "/goal",
@@ -522,6 +537,7 @@ impl Repl<'_> {
                 out.status(&format!("goal: {}", arg.trim()));
                 self.save(session, out);
             }
+            "status" => self.status(session, out),
             "exit" => return Flow::Exit,
             other => unreachable!("/{other} is in COMMANDS but not handled"),
         }
@@ -733,6 +749,81 @@ impl Repl<'_> {
             "reasoning effort {value} for {model} for the rest of this session"
         ));
         self.save(session, out);
+    }
+
+    /// One screen of what this session is: names, counts and where things
+    /// came from, and no values from anywhere.
+    fn status(&mut self, session: &Session, out: &mut dyn Output) {
+        let config = self.agent.config();
+        let effort = config
+            .models
+            .get(&session.model)
+            .and_then(|m| m.reasoning_effort.as_deref())
+            .unwrap_or("the provider's default")
+            .to_string();
+        let cwd = config.cwd.clone();
+        let servers: Vec<(String, String, bool)> = config
+            .mcp
+            .iter()
+            .map(|server| {
+                (
+                    server.name.clone(),
+                    server.scope.as_str().to_string(),
+                    self.agent.mcp_connected(&server.name),
+                )
+            })
+            .collect();
+
+        out.status(&format!("airlok {}", env!("CARGO_PKG_VERSION")));
+        out.status(&format!(
+            "provider {} · model {} · effort {effort}",
+            session.provider, session.model
+        ));
+        out.status(&format!(
+            "session {} · {} turn(s){}",
+            session.id,
+            session.turns(),
+            if session.interrupted {
+                " · last turn interrupted"
+            } else {
+                ""
+            }
+        ));
+        match crate::context::branch(&cwd) {
+            Some(branch) => out.status(&format!("cwd {} · branch {branch}", cwd.display())),
+            None => out.status(&format!("cwd {} · not a git repository", cwd.display())),
+        }
+        if let Some(source) = self.backend.key_source() {
+            out.status(&format!("api key from {source}"));
+        }
+        for line in self.backend.config_files() {
+            out.status(&format!("config {line}"));
+        }
+        if servers.is_empty() {
+            out.status("mcp: no servers configured");
+        } else {
+            for (name, scope, connected) in servers {
+                out.status(&format!(
+                    "mcp {name} [{scope}]: {}",
+                    if connected {
+                        "connected this run"
+                    } else {
+                        "not started"
+                    }
+                ));
+            }
+        }
+        let mut rehydrate = 0usize;
+        let mut redact_only = 0usize;
+        for entry in session.redactions.values() {
+            match entry.class {
+                crate::redact::Class::Rehydrate => rehydrate += 1,
+                crate::redact::Class::RedactOnly => redact_only += 1,
+            }
+        }
+        out.status(&format!(
+            "redactions: {rehydrate} rehydrate, {redact_only} redact-only"
+        ));
     }
 
     fn switch_provider(&mut self, arg: &str, session: &mut Session, out: &mut dyn Output) {

@@ -181,6 +181,12 @@ impl Agent {
 
     /// Forgets that a server was started, so the next [`Agent::start_mcp`]
     /// tries it again. For `/mcp <name>` enabling a disabled server.
+    /// Whether `server` has been connected in this run. Reading it starts
+    /// nothing, which is what lets `/status` report without side effects.
+    pub fn mcp_connected(&self, server: &str) -> bool {
+        self.mcp_started.contains(server)
+    }
+
     pub fn forget_mcp(&mut self, server: &str) {
         self.mcp_started.remove(server);
         self.tools.remove_prefixed(&mcp::server_prefix(server));

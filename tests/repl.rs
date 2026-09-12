@@ -3,7 +3,7 @@ use std::time::Duration;
 use airlok_core::agent::Agent;
 use airlok_core::agent::INTERRUPTED_MARKER;
 use airlok_core::config::{ModelConfig, ProviderName};
-use airlok_core::redact::{RedactionMap, Redactor, SecretRedactor};
+use airlok_core::redact::{Class, Entry, RedactionMap, Redactor, SecretRedactor};
 use airlok_core::repl::{Backend, Line, Repl, Switch};
 use airlok_core::tools::READ_ONLY_TOOLS;
 use airlok_core::{Interrupt, SessionStore};
@@ -739,6 +739,74 @@ async fn an_unknown_effort_is_questioned_rather_than_taken() {
         questions[0].1.first().map(String::as_str),
         Some("enormous"),
         "the typed value is offered first, so Enter on it is a choice"
+    );
+}
+
+#[tokio::test]
+async fn status_names_things_without_showing_any_value() {
+    // Split so the literals are not themselves a detectable secret here.
+    const DETECTED: &str = concat!("ghp_", "0123456789abcdefghijklmnopqrstuvwxyz");
+    const PROVIDER_KEY: &str = concat!("sk-", "provider-key-value-9876543210");
+
+    let dir = TempDir::new("repl-status");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider, dir.path());
+    let mut session = agent.new_session();
+    session.redactions.insert(
+        "<<SECRET_1>>".into(),
+        Entry {
+            value: DETECTED.into(),
+            kind: "github token".into(),
+            class: Class::Rehydrate,
+        },
+    );
+    session.redactions.insert(
+        "<<SECRET_2>>".into(),
+        Entry {
+            value: PROVIDER_KEY.into(),
+            kind: "the provider API key".into(),
+            class: Class::RedactOnly,
+        },
+    );
+
+    let backend = TestBackend {
+        config_files: vec!["user: /tmp/airlok/config.toml (found)".into()],
+        key_source: Some("the environment variable AIRLOK_TEST_KEY".into()),
+        ..TestBackend::default()
+    };
+    let mut lines = ScriptedLines::typed(&["/status"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(backend),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let text = out.statuses().join("\n");
+    assert!(
+        !text.contains(DETECTED),
+        "a detected secret must never be printed: {text}"
+    );
+    assert!(
+        !text.contains(PROVIDER_KEY),
+        "the provider key must never be printed: {text}"
+    );
+    assert!(
+        text.contains("redactions: 1 rehydrate, 1 redact-only"),
+        "{text}"
+    );
+    assert!(
+        text.contains("AIRLOK_TEST_KEY"),
+        "the key's source is named: {text}"
+    );
+    assert!(
+        text.contains("user: /tmp/airlok/config.toml (found)"),
+        "the config files in effect are listed: {text}"
     );
 }
 

@@ -153,6 +153,8 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .filter_map(|(id, m)| m.reasoning_effort.clone().map(|e| (id.clone(), e)))
         .collect();
+    // Named here, while the config is still in scope, and never resolved.
+    let key_source = config.key_source().to_string();
     if let Some(session) = &resumed {
         if session.provider != config.provider.name.as_str() {
             notes.push(format!("session last used {}", session.provider));
@@ -215,6 +217,8 @@ async fn main() -> anyhow::Result<()> {
                 user_instructions,
                 notes,
                 file_efforts,
+                config_files: config_file_lines(&sources),
+                key_source,
             },
             &mut out,
         )
@@ -258,6 +262,11 @@ struct ReplSetup {
     /// `reasoning_effort` per model as the config files gave it, before a
     /// resumed session could override it. `/effort` reports which it is.
     file_efforts: std::collections::BTreeMap<String, String>,
+    /// Which configuration files could apply and whether each was found,
+    /// for `/status`. Paths only, never anything read from them.
+    config_files: Vec<String>,
+    /// Where the key comes from, named and not resolved.
+    key_source: String,
 }
 
 /// The interactive session. Ctrl-C during a turn cancels it; at the
@@ -321,6 +330,8 @@ async fn run_repl(
         user_instructions: setup.user_instructions,
         session_models: None,
         file_efforts: setup.file_efforts,
+        config_files: setup.config_files,
+        key_source: setup.key_source,
     };
     let mut repl = Repl {
         agent: &mut agent,
@@ -409,6 +420,10 @@ struct CliBackend {
     startup: ProviderConfig,
     config: Config,
     key: String,
+    /// For `/status`: which configuration files could apply, and where the
+    /// key comes from. Neither carries a value.
+    config_files: Vec<String>,
+    key_source: String,
     /// `~/.config/airlok/AIRLOK.md`, for rebuilding the context block.
     user_instructions: Option<PathBuf>,
     /// Model ids read from saved sessions, kept per provider because
@@ -479,6 +494,14 @@ impl Backend for CliBackend {
 
     fn startup_effort(&mut self, model: &str) -> Option<String> {
         self.file_efforts.get(model).cloned()
+    }
+
+    fn config_files(&mut self) -> Vec<String> {
+        self.config_files.clone()
+    }
+
+    fn key_source(&mut self) -> Option<String> {
+        Some(self.key_source.clone())
     }
 
     fn known_models(&mut self, provider: ProviderName) -> Vec<String> {
@@ -935,6 +958,32 @@ fn config_init(path: Option<&Path>) -> anyhow::Result<()> {
 }
 
 /// Prints the merged configuration. The key itself is never read here.
+/// One line per configuration file that could apply, in the same words
+/// `airlok config show` uses. Paths and whether they were found, nothing
+/// read from inside them.
+fn config_file_lines(sources: &Sources) -> Vec<String> {
+    let describe = |label: &str, layer: &Option<config::Layer>| {
+        layer.as_ref().map(|layer| {
+            format!(
+                "{label}: {} ({})",
+                layer.path.display(),
+                if layer.found { "found" } else { "missing" }
+            )
+        })
+    };
+    let mut lines: Vec<String> = [
+        describe("user", &sources.user),
+        describe("project", &sources.project),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for problem in &sources.mcp_problems {
+        lines.push(format!("mcp problem: {problem}"));
+    }
+    lines
+}
+
 fn config_show(config: &Config, sources: &Sources) -> anyhow::Result<()> {
     let describe = |layer: &Option<config::Layer>| match layer {
         Some(layer) => format!(
