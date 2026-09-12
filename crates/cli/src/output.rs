@@ -230,6 +230,18 @@ impl Output for Stdout {
                     terminal.ask_paged("Apply?", rest)
                 }
                 Confirmation::Command { command } => terminal.ask(&format!("Run `{command}`?")),
+                Confirmation::McpProject { servers } => {
+                    let mut lines = vec![
+                        "This project's .mcp.json asks to start MCP servers in this repository."
+                            .to_string(),
+                        "They came with the checkout, so nothing has run yet.".to_string(),
+                    ];
+                    for (name, command) in *servers {
+                        lines.push(format!("  {name}: {command}"));
+                    }
+                    terminal.show_lines(&lines);
+                    terminal.ask("Let this repository start them?")
+                }
                 Confirmation::Mcp {
                     server,
                     tool,

@@ -147,6 +147,16 @@ pub enum McpAction {
         #[arg(long, value_enum)]
         scope: Option<ScopeArg>,
     },
+    /// Write a server from a JSON entry, as other tools accept it
+    AddJson {
+        name: String,
+        /// The entry object, for example '{"command":"npx","args":["-y","pkg"]}'
+        json: String,
+        #[arg(long, value_enum, default_value = "local")]
+        scope: ScopeArg,
+    },
+    /// Forget whether this repository's own .mcp.json servers may start
+    ResetProjectChoices,
     /// Approvals remembered past a run
     Trust {
         #[command(subcommand)]
