@@ -106,11 +106,23 @@ impl Status {
     }
 }
 
+/// At most this many tool names on one line. A gateway can offer dozens,
+/// and the line is there to say what a server is, not to inventory it.
+const SHOWN_TOOLS: usize = 8;
+
 fn list(tools: &[String]) -> String {
     if tools.is_empty() {
         return "no tools".to_string();
     }
-    tools.join(", ")
+    if tools.len() <= SHOWN_TOOLS {
+        return tools.join(", ");
+    }
+    format!(
+        "{} tools: {}, and {} more",
+        tools.len(),
+        tools[..SHOWN_TOOLS].join(", "),
+        tools.len() - SHOWN_TOOLS
+    )
 }
 
 /// Starts every enabled server and returns the tools to offer the model,
@@ -570,6 +582,22 @@ mod tests {
             "mcp__files__read_text_file"
         );
         assert_eq!(server_prefix("files"), "mcp__files__");
+    }
+
+    #[test]
+    fn a_long_tool_list_is_summarised_rather_than_printed_whole() {
+        let few: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(list(&few), "a, b");
+        assert_eq!(list(&[]), "no tools");
+
+        let many: Vec<String> = (0..82).map(|n| format!("tool_{n}")).collect();
+        let line = list(&many);
+        assert!(line.starts_with("82 tools: tool_0, "), "{line}");
+        assert!(line.ends_with(", and 74 more"), "{line}");
+        assert!(
+            !line.contains("tool_9"),
+            "only the first few are named: {line}"
+        );
     }
 
     #[test]
