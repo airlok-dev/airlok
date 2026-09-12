@@ -19,7 +19,7 @@ pub enum Step {
     /// Still choosing.
     Continue,
     Chosen(String),
-    /// Esc, or a 0x03 byte: nothing changes.
+    /// Esc, or Ctrl-C: nothing changes.
     Cancelled,
 }
 
@@ -203,9 +203,8 @@ impl Escape {
             }
             (Escape::Idle, b'\r' | b'\n') => Key::Enter,
             (Escape::Idle, 0x7f | 0x08) => Key::Backspace,
-            // A 0x03 byte leaves the list the way Esc does. A terminal
-            // does not send one: cbreak keeps ISIG on, so ctrl-c raises
-            // SIGINT and the list stays up until Esc.
+            // Ctrl-C leaves the list the way Esc does: the picker clears
+            // ISIG while it is up, so this arrives as a byte.
             (Escape::Idle, 0x03) => Key::Escape,
             (Escape::Idle, byte) if byte >= 0x20 => Key::Char(char::from(byte)),
             _ => Key::None,
@@ -419,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_cancels_and_so_does_a_ctrl_c_byte() {
+    fn esc_cancels_and_so_does_ctrl_c() {
         let mut picker = Picker::new(&choices());
         let mut escape = Escape::default();
         assert_eq!(

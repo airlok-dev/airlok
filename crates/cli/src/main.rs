@@ -145,6 +145,14 @@ async fn main() -> anyhow::Result<()> {
     // Notes for the REPL's startup line; a one-shot run prints them on
     // stderr instead.
     let mut notes = Vec::new();
+    // What the config files say, read before a resumed session can change
+    // it: /effort reports whether the effort in force came from the config
+    // or from the session.
+    let file_efforts: std::collections::BTreeMap<String, String> = config
+        .models
+        .iter()
+        .filter_map(|(id, m)| m.reasoning_effort.clone().map(|e| (id.clone(), e)))
+        .collect();
     if let Some(session) = &resumed {
         if session.provider != config.provider.name.as_str() {
             notes.push(format!("session last used {}", session.provider));
@@ -202,9 +210,12 @@ async fn main() -> anyhow::Result<()> {
             agent,
             session,
             &store,
-            key,
-            user_instructions,
-            notes,
+            ReplSetup {
+                key,
+                user_instructions,
+                notes,
+                file_efforts,
+            },
             &mut out,
         )
         .await;
@@ -239,15 +250,23 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a REPL run needs beyond the agent, its session and the store.
+struct ReplSetup {
+    key: String,
+    user_instructions: Option<PathBuf>,
+    notes: Vec<String>,
+    /// `reasoning_effort` per model as the config files gave it, before a
+    /// resumed session could override it. `/effort` reports which it is.
+    file_efforts: std::collections::BTreeMap<String, String>,
+}
+
 /// The interactive session. Ctrl-C during a turn cancels it; at the
 /// prompt, rustyline reports it and the loop stays up.
 async fn run_repl(
     mut agent: Agent,
     session: airlok_core::Session,
     store: &SessionStore,
-    key: String,
-    user_instructions: Option<PathBuf>,
-    notes: Vec<String>,
+    setup: ReplSetup,
     out: &mut Stdout,
 ) -> anyhow::Result<()> {
     let interrupt = Interrupt::new();
@@ -285,13 +304,14 @@ async fn run_repl(
     }
     let mut lines = repl::Readline::new(agent.config().cwd.clone(), typed)
         .context("cannot start line editing")?;
-    out.status(&startup_line(agent.config(), &notes));
+    out.status(&startup_line(agent.config(), &setup.notes));
     let backend = CliBackend {
         startup: agent.config().provider.clone(),
         config: agent.config().clone(),
-        key,
-        user_instructions,
+        key: setup.key,
+        user_instructions: setup.user_instructions,
         session_models: None,
+        file_efforts: setup.file_efforts,
     };
     let mut repl = Repl {
         agent: &mut agent,
@@ -338,6 +358,21 @@ fn restore_session_model(
     session: &airlok_core::Session,
     model_flag: bool,
 ) -> Option<String> {
+    // /effort recorded the session's own reasoning effort in its config,
+    // and a resume keeps it: the session's value wins over the file for
+    // the model it continues on.
+    if let Some(effort) = session
+        .config
+        .models
+        .get(&session.model)
+        .and_then(|m| m.reasoning_effort.clone())
+    {
+        config
+            .models
+            .entry(session.model.clone())
+            .or_default()
+            .reasoning_effort = Some(effort);
+    }
     if session.provider != config.provider.name.as_str() {
         Some(format!(
             "note: the session last used {} ({}); continuing with {} ({}). /provider switches.",
@@ -370,6 +405,9 @@ struct CliBackend {
     /// Model ids read from saved sessions, kept per provider because
     /// listing them parses every session file on disk.
     session_models: Option<(ProviderName, Vec<String>)>,
+    /// `reasoning_effort` per model as the config files gave it, before
+    /// any session override was restored.
+    file_efforts: std::collections::BTreeMap<String, String>,
 }
 
 impl CliBackend {
@@ -428,6 +466,10 @@ impl Backend for CliBackend {
 
     fn choose(&mut self, title: &str, choices: &[String]) -> Option<String> {
         picker::ask(title, choices)
+    }
+
+    fn startup_effort(&mut self, model: &str) -> Option<String> {
+        self.file_efforts.get(model).cloned()
     }
 
     fn known_models(&mut self, provider: ProviderName) -> Vec<String> {
@@ -916,7 +958,37 @@ fn print_redactions(report: &RunReport) {
 
 #[cfg(test)]
 mod tests {
-    use super::{openai_base_url, parse_age};
+    use super::{openai_base_url, parse_age, restore_session_model};
+
+    /// /effort records the effort in the session, and a resume continues
+    /// on it rather than on whatever the config file now says.
+    #[test]
+    fn a_resume_keeps_the_reasoning_effort_the_session_used() {
+        use airlok_core::config::{Config, ModelSection};
+
+        let cwd = std::path::PathBuf::from("/tmp/airlok-resume-effort");
+        let mut config = Config::new(cwd.clone());
+        config.provider.model = "gpt-6-astra".into();
+        let mut session = airlok_core::Session::new(&cwd, &config);
+        session.model = "gpt-6-astra".into();
+        session.config.models.insert(
+            "gpt-6-astra".into(),
+            ModelSection {
+                reasoning_effort: Some("none".into()),
+            },
+        );
+
+        restore_session_model(&mut config, &session, false);
+
+        assert_eq!(
+            config
+                .models
+                .get("gpt-6-astra")
+                .and_then(|m| m.reasoning_effort.as_deref()),
+            Some("none"),
+            "the session's own effort came back"
+        );
+    }
 
     #[test]
     fn ages_parse_in_days_hours_minutes_seconds() {

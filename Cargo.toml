@@ -3,15 +3,15 @@ resolver = "2"
 members = ["crates/cli", "crates/core", "crates/llm", "tests"]
 
 [workspace.package]
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/airlok-dev/airlok"
 homepage = "https://airlok.dev"
 
 [workspace.dependencies]
-airlok-core = { path = "crates/core", version = "0.8.1" }
-airlok-llm = { path = "crates/llm", version = "0.8.1" }
+airlok-core = { path = "crates/core", version = "0.8.2" }
+airlok-llm = { path = "crates/llm", version = "0.8.2" }
 
 anyhow = "1.0.98"
 async-trait = "0.1.88"

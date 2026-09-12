@@ -59,7 +59,9 @@ While a turn runs, a status line below the output shows a spinner, what airlok i
 | Ctrl-D | save and quit |
 | Ctrl-R | search this run's history; Up and Down step through it |
 
-The models airlok offers are the one in use, any named in `[models."<id>"]`, the ones used earlier in this run, and the ones saved sessions here used on this provider. Tab completes from that list after `/model `, and from the two provider names after `/provider `. Switching to an id from that list is taken as given; anything else is read back with the nearest known ids and a question, since a model id that only fails on the next turn is a poor way to learn it was a typo.
+The models airlok offers are the one in use, any named in `[models."<id>"]`, the ones used earlier in this run, and the ones saved sessions here used on this provider. Tab completes from that list after `/model `, from the two provider names after `/provider `, and from the efforts the provider accepts after `/effort `. Switching to an id from that list is taken as given; anything else is read back with the nearest known ids and a question, since a model id that only fails on the next turn is a poor way to learn it was a typo.
+
+Reasoning effort is per model. `[models."<id>"] reasoning_effort` is the default, `/effort` reports which of those you are on, and `/effort <value>` overrides it for the session and is saved with it, so `--resume` continues on the same effort rather than the config's. Only the openai provider sends it.
 
 A provider that refuses a request is reported as a sentence naming the likely cause: a model or deployment that does not exist, a key the provider rejected, rate limiting, or a request longer than the model's context. The raw body goes to the debug log, so `-v` still has it, and the session stays open either way.
 
@@ -75,7 +77,8 @@ A cancelled turn keeps the text streamed so far in the history, marked as interr
 | Command | What it does |
 |---|---|
 | `/help` | list the commands |
-| `/model [<id>]` | with no id, pick from the models airlok knows here: arrows, type to filter, Enter, Esc. With an id, switch to it; an id airlok has not seen is questioned rather than taken |
+| `/model [<id>]` | with no id, pick from the models airlok knows here: arrows, type to filter, Enter to take one, Esc or Ctrl-C to leave it alone. With an id, switch to it; an id airlok has not seen is questioned rather than taken |
+| `/effort [<value>]` | the reasoning effort in force for this model and where it came from; with a value, use it for the rest of the session. openai only |
 | `/mcp` | list the MCP servers and their tools; `/mcp <name>` enables a disabled one for this session |
 | `/plan` | turn plan mode on or off |
 | `/go` | carry out the plan from plan mode, back in normal mode |

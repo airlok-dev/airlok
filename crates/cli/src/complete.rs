@@ -17,7 +17,8 @@ use rustyline::{Context, Helper};
 
 /// Rows of the menu under the line: enough for every command, so a bare
 /// `/` lists them all.
-const MENU_ROWS: usize = 12;
+/// At least as many as there are commands, so a bare `/` lists them all.
+const MENU_ROWS: usize = 16;
 /// Paths offered for one `@`.
 const PATH_MATCHES: usize = 10;
 /// Entries read from the working directory for `@`, at most.
