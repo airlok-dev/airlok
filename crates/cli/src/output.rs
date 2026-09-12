@@ -237,30 +237,7 @@ impl Output for Stdout {
                     root,
                     paths,
                 } => {
-                    let colour = std::env::var_os("NO_COLOR").is_none();
-                    let dim = |text: String| match colour {
-                        true => format!("\x1b[2m{text}\x1b[0m"),
-                        false => text,
-                    };
-                    let mut lines = vec![dim(format!(
-                        "mcp {server} · {tool} · arguments as they will be sent"
-                    ))];
-                    if let Some(root) = root {
-                        lines.push(dim(format!("serving {root}")));
-                    }
-                    // Plain, not dim: a place outside the project is the
-                    // thing most worth seeing before answering.
-                    let here = std::env::current_dir().unwrap_or_default();
-                    for path in *paths {
-                        let outside = !std::path::Path::new(path).starts_with(&here);
-                        let note = if outside {
-                            "  (outside this project)"
-                        } else {
-                            ""
-                        };
-                        lines.push(format!("{path}{note}"));
-                    }
-                    lines.extend(arguments.lines().map(str::to_string));
+                    let lines = mcp_lines(server, tool, arguments, *root, paths);
                     let (page, rest) = lines.split_at(lines.len().min(diff::PAGE));
                     terminal.show_lines(page);
                     if !rest.is_empty() {
@@ -275,6 +252,43 @@ impl Output for Stdout {
         }
         decision
     }
+}
+
+/// The lines shown before an MCP call is confirmed: what the server can
+/// reach, the place each argument names with anything outside the project
+/// marked, and the arguments as they will be sent. `airlok mcp call` shows
+/// the same lines, so both ways of asking ask the same question.
+pub fn mcp_lines(
+    server: &str,
+    tool: &str,
+    arguments: &str,
+    root: Option<&str>,
+    paths: &[String],
+) -> Vec<String> {
+    let dim = |text: String| match std::env::var_os("NO_COLOR").is_none() {
+        true => format!("\x1b[2m{text}\x1b[0m"),
+        false => text,
+    };
+    let mut lines = vec![dim(format!(
+        "mcp {server} · {tool} · arguments as they will be sent"
+    ))];
+    if let Some(root) = root {
+        lines.push(dim(format!("serving {root}")));
+    }
+    // Plain, not dim: a place outside the project is the thing most worth
+    // seeing before answering.
+    let here = std::env::current_dir().unwrap_or_default();
+    for path in paths {
+        let outside = !std::path::Path::new(path).starts_with(&here);
+        let note = if outside {
+            "  (outside this project)"
+        } else {
+            ""
+        };
+        lines.push(format!("{path}{note}"));
+    }
+    lines.extend(arguments.lines().map(str::to_string));
+    lines
 }
 
 /// The thread that runs during a turn. It redraws the status line and,
@@ -323,6 +337,34 @@ fn lock(screen: &Mutex<Screen>) -> MutexGuard<'_, Screen> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_prompt_marks_a_place_outside_the_project() {
+        let here = std::env::current_dir().unwrap();
+        let inside = here.join("README.md").to_string_lossy().into_owned();
+        let lines = mcp_lines(
+            "files",
+            "read_text_file",
+            "{}",
+            Some("/srv/docs"),
+            &[inside.clone(), "/etc/hosts".to_string()],
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("serving /srv/docs"), "{joined}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&inside) && !line.contains("outside")),
+            "{joined}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("/etc/hosts") && line.contains("(outside this project)")),
+            "{joined}"
+        );
+    }
+
     use crate::status::tests::{strip_frames, Sink};
 
     #[test]

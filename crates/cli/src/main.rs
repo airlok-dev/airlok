@@ -471,13 +471,13 @@ async fn mcp_call(
                 "a confirmation is needed but no terminal is available. \
                  Set trust = allow for this server, or pass --yes",
             )?;
-            let mut shown: Vec<String> = Vec::new();
-            if let Some(root) = root {
-                shown.push(format!("serving {root}"));
-            }
-            shown.extend(paths);
-            shown.extend(arguments.lines().map(str::to_string));
-            terminal.show_lines(&shown);
+            terminal.show_lines(&output::mcp_lines(
+                server,
+                &tool,
+                &arguments,
+                root.as_deref(),
+                &paths,
+            ));
             if terminal.ask(&format!("Call `{tool}` on `{server}`?")) != Decision::Approve {
                 bail!("not called");
             }
