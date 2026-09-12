@@ -12,7 +12,8 @@
 //! whenever each fits alone, leaving the label or the bullet on a line of
 //! its own.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -28,9 +29,39 @@ pub enum Renderer {
     Rich(Box<Rich>),
 }
 
+/// Narrowest and widest the renderer will wrap to, whatever the terminal
+/// reports.
+pub const MIN_WIDTH: usize = 40;
+pub const MAX_WIDTH: usize = 120;
+
+fn clamp(columns: usize) -> usize {
+    columns.clamp(MIN_WIDTH, MAX_WIDTH)
+}
+
+fn measured() -> usize {
+    termimad::crossterm::terminal::size()
+        .map(|(columns, _)| usize::from(columns))
+        .unwrap_or(80)
+}
+
+/// The cell every tracking renderer reads its width from.
+pub fn terminal_width() -> Arc<AtomicUsize> {
+    static CELL: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+    CELL.get_or_init(|| Arc::new(AtomicUsize::new(clamp(measured()))))
+        .clone()
+}
+
+/// Re-reads the terminal size into that cell. Called at the start of each
+/// turn and from the SIGWINCH handler, so wrapping follows the window
+/// instead of whatever it was when the run started.
+pub fn measure() {
+    terminal_width().store(clamp(measured()), Ordering::Relaxed);
+}
+
 pub struct Rich {
     skin: MadSkin,
-    width: usize,
+    /// Read for every block, so a resize lands on the next one.
+    width: Arc<AtomicUsize>,
     /// The incomplete last line of the current chunk.
     pending: String,
     block: Block,
@@ -65,24 +96,30 @@ pub fn highlighting() -> &'static Highlighting {
 }
 
 impl Renderer {
-    /// Rich when stdout is a terminal and NO_COLOR is unset.
+    /// Rich when stdout is a terminal and NO_COLOR is unset, tracking the
+    /// terminal's width rather than the width it had at startup.
     pub fn for_stdout() -> Self {
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
-            let width = termimad::crossterm::terminal::size()
-                .map(|(w, _)| w as usize)
-                .unwrap_or(80)
-                .clamp(40, 120);
-            Self::rich(width)
+            measure();
+            Self::tracking(terminal_width())
         } else {
             Self::Plain
         }
     }
 
+    /// A renderer fixed at `width`: a cell nothing updates. Tests and the
+    /// goldens use this, since their output must not move with the window.
+    #[cfg(test)]
     pub fn rich(width: usize) -> Self {
+        Self::tracking(Arc::new(AtomicUsize::new(width)))
+    }
+
+    /// A renderer that re-reads `cell` for every block.
+    pub fn tracking(cell: Arc<AtomicUsize>) -> Self {
         Renderer::Rich(Box::new(Rich {
             skin: MadSkin::default_dark(),
-            width,
+            width: cell,
             pending: String::new(),
             block: Block::Prose(Vec::new()),
         }))
@@ -234,19 +271,24 @@ impl Rich {
         text.lines = std::mem::take(&mut text.lines)
             .into_iter()
             .flat_map(|line| match line {
-                FmtLine::Normal(fc) => wrap(fc, self.width, &self.skin)
+                FmtLine::Normal(fc) => wrap(fc, self.width.load(Ordering::Relaxed), &self.skin)
                     .into_iter()
                     .map(FmtLine::Normal)
                     .collect(),
                 other => vec![other],
             })
             .collect();
-        text.width = Some(self.width);
+        text.width = Some(self.width.load(Ordering::Relaxed));
         text.to_string()
     }
 
     fn table(&self, lines: &[String]) -> String {
-        FmtText::from(&self.skin, &lines.join("\n"), Some(self.width)).to_string()
+        FmtText::from(
+            &self.skin,
+            &lines.join("\n"),
+            Some(self.width.load(Ordering::Relaxed)),
+        )
+        .to_string()
     }
 
     fn code(&self, lang: &str, lines: &[String]) -> String {
@@ -533,6 +575,56 @@ mod tests {
                 assert_eq!(render_all(&[a, b]), whole, "split at byte {cut}");
             }
         }
+    }
+
+    #[test]
+    fn a_width_change_between_turns_lands_on_the_next_block() {
+        let cell = Arc::new(AtomicUsize::new(100));
+        let render = |renderer: &mut Renderer| {
+            let mut out = String::new();
+            out.push_str(&renderer.push(STREAM));
+            out.push_str(&renderer.finish());
+            strip_ansi(&out)
+        };
+
+        let mut renderer = Renderer::tracking(cell.clone());
+        let wide = render(&mut renderer);
+        assert!(
+            wide.lines().all(|line| line.chars().count() <= 100),
+            "nothing wider than the terminal was"
+        );
+
+        cell.store(60, Ordering::Relaxed);
+        let mut renderer = Renderer::tracking(cell.clone());
+        let narrow = render(&mut renderer);
+        assert!(
+            narrow.lines().all(|line| line.chars().count() <= 60),
+            "the next turn wrapped to the new width"
+        );
+        assert_ne!(wide, narrow, "the change actually reached the output");
+    }
+
+    #[test]
+    fn a_resize_mid_turn_lands_on_the_next_block() {
+        // 200 clamps to MAX_WIDTH; the window then becomes 90.
+        let cell = Arc::new(AtomicUsize::new(clamp(200)));
+        let mut renderer = Renderer::tracking(cell.clone());
+        let mut out = String::new();
+        out.push_str(&renderer.push("A first paragraph that is long enough to wrap somewhere near the right hand edge of a wide terminal.\n\n"));
+        cell.store(clamp(90), Ordering::Relaxed);
+        out.push_str(&renderer.push(STREAM));
+        out.push_str(&renderer.finish());
+
+        let text = strip_ansi(&out);
+        let after: Vec<&str> = text
+            .lines()
+            .skip_while(|line| !line.contains("airlok keeps"))
+            .collect();
+        assert!(!after.is_empty(), "{text:?}");
+        assert!(
+            after.iter().all(|line| line.chars().count() <= 90),
+            "blocks after the resize fit the terminal: {after:?}"
+        );
     }
 
     #[test]

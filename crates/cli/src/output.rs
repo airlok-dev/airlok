@@ -158,6 +158,8 @@ impl Output for Stdout {
     }
 
     fn begin_turn(&mut self) {
+        // The window may have changed since the last turn.
+        crate::render::measure();
         self.screen().begin();
         self.start_ticker();
     }
