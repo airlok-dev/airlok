@@ -144,8 +144,7 @@ impl Agent {
     /// tries it again. For `/mcp <name>` enabling a disabled server.
     pub fn forget_mcp(&mut self, server: &str) {
         self.mcp_started.remove(server);
-        self.tools
-            .remove_prefixed(&format!("{server}{}", mcp::SEPARATOR));
+        self.tools.remove_prefixed(&mcp::server_prefix(server));
     }
 
     /// Sets the context block built by [`crate::context::build`].
@@ -782,7 +781,7 @@ impl Agent {
                     diff: &diff,
                 }) {
                     Decision::Approve => Gate::Proceed,
-                    Decision::ApproveAll => {
+                    Decision::ApproveAll | Decision::SaveAll => {
                         approved.writes = true;
                         Gate::Proceed
                     }
@@ -804,8 +803,16 @@ impl Agent {
                 arguments,
                 root,
                 paths,
+                fingerprint,
             } => {
-                if !safety.confirm_mcp || approved.covers_mcp(&server, &tool, &paths) {
+                // An approval saved on an earlier run counts, as long as
+                // it named these places and the server is still the same
+                // program.
+                let saved = mcp::trust::load(&self.config.cwd);
+                if !safety.confirm_mcp
+                    || approved.covers_mcp(&server, &tool, &paths)
+                    || saved.covers(&server, &tool, &paths, &fingerprint)
+                {
                     return Ok(Gate::Proceed);
                 }
                 match out.confirm(&Confirmation::Mcp {
@@ -816,6 +823,19 @@ impl Agent {
                     paths: &paths,
                 }) {
                     Decision::Approve => Gate::Proceed,
+                    Decision::SaveAll => {
+                        let mut saved = saved;
+                        saved.remember(&server, &tool, &paths, &fingerprint);
+                        match mcp::trust::save(&self.config.cwd, &saved) {
+                            Ok(()) => out.status(&format!(
+                                "remembered: `{tool}` on `{server}` for {}",
+                                places(&paths)
+                            )),
+                            Err(e) => out.status(&format!("could not remember the approval: {e}")),
+                        }
+                        approved.mcp.insert((server, tool), paths);
+                        Gate::Proceed
+                    }
                     Decision::ApproveAll => {
                         // "All" covers this tool on this server, for the
                         // places this call named and nowhere else.
@@ -842,7 +862,7 @@ impl Agent {
                     }
                     match out.confirm(&Confirmation::Command { command: &command }) {
                         Decision::Approve => Gate::Proceed,
-                        Decision::ApproveAll => {
+                        Decision::ApproveAll | Decision::SaveAll => {
                             approved.bash = true;
                             Gate::Proceed
                         }
@@ -857,6 +877,14 @@ impl Agent {
         };
         Ok(gate)
     }
+}
+
+/// The places an approval covers, for the line confirming it was saved.
+fn places(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return "calls naming no path".to_string();
+    }
+    paths.join(", ")
 }
 
 /// The result sent back when a call would write or run a redact-only value.

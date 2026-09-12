@@ -75,6 +75,9 @@ pub enum Plan {
         arguments: String,
         root: Option<String>,
         paths: Vec<String>,
+        /// The server's definition when this call was planned, so a saved
+        /// approval cannot carry over to a different program.
+        fingerprint: String,
     },
     /// The configuration forbids this call outright.
     Denied { why: String },

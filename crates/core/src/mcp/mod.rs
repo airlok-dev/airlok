@@ -14,6 +14,9 @@
 //! default. `RedactOnly` values, such as the provider key, are refused in
 //! tool arguments everywhere, this included.
 
+pub mod json;
+pub mod trust;
+
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,16 +32,24 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, info, warn};
 
-use crate::config::{McpServer, McpTransport, McpTrust};
+use crate::config::{McpScope, McpServer, McpTransport, McpTrust};
 use crate::tools::{Plan, Tool, ToolError};
 
-/// Between the server name and the tool's own name. Two underscores,
-/// because no built-in name contains them.
+/// Every tool from a server is named `mcp__<server>__<tool>`, the
+/// convention the other clients use. Built-ins keep their plain names and
+/// win a clash.
+pub const PREFIX: &str = "mcp__";
+/// Between the server name and the tool's own name.
 pub const SEPARATOR: &str = "__";
 
 /// The full name the model sees for one of a server's tools.
 pub fn tool_name(server: &str, tool: &str) -> String {
-    format!("{server}{SEPARATOR}{tool}")
+    format!("{PREFIX}{server}{SEPARATOR}{tool}")
+}
+
+/// What every tool from `server` starts with.
+pub fn server_prefix(server: &str) -> String {
+    format!("{PREFIX}{server}{SEPARATOR}")
 }
 
 /// What happened to one configured server, for `airlok mcp list` and for
@@ -46,6 +57,8 @@ pub fn tool_name(server: &str, tool: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     pub server: String,
+    /// Which file defined it.
+    pub scope: McpScope,
     /// What the server can reach: the directory it serves, or its url.
     pub root: Option<String>,
     pub state: State,
@@ -68,8 +81,13 @@ impl Status {
     pub fn line(&self) -> String {
         match &self.state {
             State::Ready { tools } => match &self.root {
-                Some(root) => format!("{} (serving {root}): {}", self.server, list(tools)),
-                None => format!("{}: {}", self.server, list(tools)),
+                Some(root) => format!(
+                    "{} [{}] (serving {root}): {}",
+                    self.server,
+                    self.scope.as_str(),
+                    list(tools)
+                ),
+                None => format!("{} [{}]: {}", self.server, self.scope.as_str(), list(tools)),
             },
             State::Denied { tools } => {
                 format!(
@@ -105,6 +123,7 @@ pub async fn connect_all(servers: &[McpServer], cwd: &Path) -> (Vec<Box<dyn Tool
         if !server.enabled {
             statuses.push(Status {
                 server: server.name.clone(),
+                scope: server.scope,
                 root: server.root(),
                 state: State::Disabled,
             });
@@ -127,6 +146,7 @@ pub async fn connect_all(servers: &[McpServer], cwd: &Path) -> (Vec<Box<dyn Tool
                 };
                 statuses.push(Status {
                     server: server.name.clone(),
+                    scope: server.scope,
                     root: server.root(),
                     state,
                 });
@@ -135,6 +155,7 @@ pub async fn connect_all(servers: &[McpServer], cwd: &Path) -> (Vec<Box<dyn Tool
                 warn!(server = %server.name, %why, "mcp server unavailable");
                 statuses.push(Status {
                     server: server.name.clone(),
+                    scope: server.scope,
                     root: server.root(),
                     state: State::Failed { why },
                 });
@@ -178,6 +199,7 @@ pub async fn connect(server: &McpServer, cwd: &Path) -> Result<Connection, Strin
             timeout: server.timeout,
             root: server.root(),
             cwd: cwd.to_path_buf(),
+            fingerprint: trust::fingerprint(server),
             client: client.clone(),
         })
         .collect();
@@ -289,6 +311,8 @@ pub struct McpTool {
     /// Where airlok is working, for resolving a relative path when the
     /// server does not say what it serves.
     cwd: PathBuf,
+    /// The server's definition, for matching a saved approval.
+    fingerprint: String,
     client: Arc<Client>,
 }
 
@@ -357,6 +381,7 @@ impl Tool for McpTool {
                 arguments: pretty(input),
                 root: self.root.clone(),
                 paths: paths_of(&self.base(), input),
+                fingerprint: self.fingerprint.clone(),
             },
         })
     }
@@ -542,8 +567,9 @@ mod tests {
     fn tools_are_namespaced_by_server() {
         assert_eq!(
             tool_name("files", "read_text_file"),
-            "files__read_text_file"
+            "mcp__files__read_text_file"
         );
+        assert_eq!(server_prefix("files"), "mcp__files__");
     }
 
     #[test]

@@ -139,6 +139,42 @@ pub struct McpSection {
     pub rehydrate: Option<bool>,
 }
 
+/// Where a server's definition came from. Later scopes win, and a
+/// `[[mcp]]` block in a TOML config wins over all of them, since it is the
+/// airlok-specific layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum McpScope {
+    /// `~/.config/airlok/mcp.json`
+    User,
+    /// `./.mcp.json`, meant to be committed and shared
+    Project,
+    /// `./.airlok/mcp.json`, personal and gitignored
+    Local,
+    /// An `[[mcp]]` block in `config.toml` or `airlok.toml`
+    Toml,
+}
+
+impl McpScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            McpScope::User => "user",
+            McpScope::Project => "project",
+            McpScope::Local => "local",
+            McpScope::Toml => "toml",
+        }
+    }
+
+    /// The scopes a `--scope` flag accepts, in precedence order.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "user" => Some(McpScope::User),
+            "project" => Some(McpScope::Project),
+            "local" => Some(McpScope::Local),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum McpTransport {
@@ -432,6 +468,8 @@ pub struct McpServer {
     /// Whether `Rehydrate` secrets are restored in arguments. Off by
     /// default, so a server is sent placeholders.
     pub rehydrate: bool,
+    /// Which file it came from, for `airlok mcp list` and `mcp get`.
+    pub scope: McpScope,
 }
 
 pub const DEFAULT_MCP_TIMEOUT_SECS: u64 = 30;
@@ -459,6 +497,7 @@ impl McpServer {
             tools: section.tools.unwrap_or(McpTools::All),
             trust: section.trust.unwrap_or(McpTrust::Prompt),
             rehydrate: section.rehydrate.unwrap_or(false),
+            scope: McpScope::Toml,
         }
     }
 
@@ -617,6 +656,10 @@ pub struct Layer {
 pub struct Sources {
     pub user: Option<Layer>,
     pub project: Option<Layer>,
+    /// One line per `mcp.json` problem: a file that will not parse, or a
+    /// `${VAR}` with nothing to put in it. The server is left out and the
+    /// line is shown, rather than airlok refusing to start.
+    pub mcp_problems: Vec<String>,
 }
 
 /// Where the API key comes from. Displayable without revealing the key.
@@ -665,7 +708,13 @@ impl Config {
             }
         }
         merged = merged.layer(overrides.as_layer());
-        Ok((Self::resolve(merged, cwd), sources))
+        let mut config = Self::resolve(merged, cwd);
+        // The JSON scopes, then the TOML blocks over them: `[[mcp]]` is
+        // the airlok-specific layer, so it wins a name clash.
+        let (servers, problems) = crate::mcp::json::load(user.and_then(Path::parent), &config.cwd);
+        sources.mcp_problems = problems;
+        config.mcp = crate::mcp::json::merge(servers, std::mem::take(&mut config.mcp));
+        Ok((config, sources))
     }
 
     pub fn resolve(file: ConfigFile, cwd: PathBuf) -> Self {
