@@ -107,7 +107,12 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Mcp { action }) => return mcp_command(action, &config, &sources).await,
         Some(Command::Sessions { action }) => return sessions_command(action, &store()?, &cwd),
         Some(Command::Doctor) => {
-            let checks = doctor_checks(&config, &config_file_lines(&sources)).await;
+            let checks = doctor_checks(
+                &config,
+                &config_file_lines(&sources),
+                &config.provider.model,
+            )
+            .await;
             for check in &checks {
                 println!("{}", check.line());
             }
@@ -517,8 +522,8 @@ impl Backend for CliBackend {
         Some(self.key_source.clone())
     }
 
-    async fn doctor(&mut self) -> Vec<airlok_core::repl::Check> {
-        doctor_checks(&self.config, &self.config_files).await
+    async fn doctor(&mut self, model: &str) -> Vec<airlok_core::repl::Check> {
+        doctor_checks(&self.config, &self.config_files, model).await
     }
 
     fn known_models(&mut self, provider: ProviderName) -> Vec<String> {
@@ -975,7 +980,11 @@ fn config_init(path: Option<&Path>) -> anyhow::Result<()> {
 /// Every `/doctor` check. Talking to the provider and the MCP servers
 /// happens here, where the key and the transports live; nothing it reads
 /// is ever put in a `Check`, only where it looked.
-async fn doctor_checks(config: &Config, files: &[String]) -> Vec<airlok_core::repl::Check> {
+async fn doctor_checks(
+    config: &Config,
+    files: &[String],
+    model: &str,
+) -> Vec<airlok_core::repl::Check> {
     use airlok_core::repl::Check;
     use futures::StreamExt;
 
@@ -1009,14 +1018,14 @@ async fn doctor_checks(config: &Config, files: &[String]) -> Vec<airlok_core::re
         Ok(key) => {
             let provider = build_provider(config, key);
             let request = airlok_llm::Request {
-                model: config.provider.model.clone(),
+                model: model.to_string(),
                 max_tokens: 16,
                 system: String::new(),
                 messages: vec![airlok_llm::Message::user_text("ping")],
                 tools: Vec::new(),
                 reasoning_effort: config
                     .models
-                    .get(&config.provider.model)
+                    .get(model)
                     .and_then(|m| m.reasoning_effort.clone()),
             };
             let mut stream = provider.stream(request);
@@ -1030,11 +1039,7 @@ async fn doctor_checks(config: &Config, files: &[String]) -> Vec<airlok_core::re
             checks.push(match failure {
                 None => Check::pass(
                     "provider request",
-                    format!(
-                        "{} answered for {}",
-                        config.provider.name.as_str(),
-                        config.provider.model
-                    ),
+                    format!("{} answered for {model}", config.provider.name.as_str()),
                 ),
                 Some(why) => Check::fail("provider request", why),
             });

@@ -125,9 +125,11 @@ pub trait Backend: Send {
         None
     }
 
-    /// Runs the `/doctor` checks. Talking to the provider and to the MCP
-    /// servers is the binary's job, so this lives here.
-    async fn doctor(&mut self) -> Vec<Check> {
+    /// Runs the `/doctor` checks against `model`, which is the model in
+    /// use now rather than the one the run started on. Talking to the
+    /// provider and to the MCP servers is the binary's job.
+    async fn doctor(&mut self, model: &str) -> Vec<Check> {
+        let _ = model;
         Vec::new()
     }
 }
@@ -728,7 +730,8 @@ impl Repl<'_> {
             "copy" => self.copy(arg, session, out),
             "diff" => self.diff_command(arg, session, out),
             "doctor" => {
-                let checks = self.backend.doctor().await;
+                let model = session.model.clone();
+                let checks = self.backend.doctor(&model).await;
                 if checks.is_empty() {
                     out.status("no checks to run from here");
                 }
