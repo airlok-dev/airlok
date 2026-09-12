@@ -44,10 +44,20 @@ fn measured() -> usize {
         .unwrap_or(80)
 }
 
-/// The cell every tracking renderer reads its width from.
+/// The cell every tracking renderer reads its width from, clamped.
 pub fn terminal_width() -> Arc<AtomicUsize> {
     static CELL: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
     CELL.get_or_init(|| Arc::new(AtomicUsize::new(clamp(measured()))))
+        .clone()
+}
+
+/// The terminal's actual columns, unclamped. Output that has to fit the
+/// window rather than the wrapped text reads this: the status line cuts
+/// itself to it, and a clamped width would cut to the wrong place on a
+/// terminal outside 40..=120.
+pub fn terminal_columns() -> Arc<AtomicUsize> {
+    static CELL: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+    CELL.get_or_init(|| Arc::new(AtomicUsize::new(measured())))
         .clone()
 }
 
@@ -55,7 +65,9 @@ pub fn terminal_width() -> Arc<AtomicUsize> {
 /// turn and from the SIGWINCH handler, so wrapping follows the window
 /// instead of whatever it was when the run started.
 pub fn measure() {
-    terminal_width().store(clamp(measured()), Ordering::Relaxed);
+    let columns = measured();
+    terminal_width().store(clamp(columns), Ordering::Relaxed);
+    terminal_columns().store(columns, Ordering::Relaxed);
 }
 
 pub struct Rich {

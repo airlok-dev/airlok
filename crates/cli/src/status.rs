@@ -8,6 +8,8 @@
 //! terminal, `NO_COLOR` set, or `-v`) writes exactly what it is given.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use airlok_core::agent::fmt_tokens;
@@ -22,7 +24,9 @@ pub const CLEAR: &str = "\r\x1b[2K";
 pub struct Screen {
     out: Box<dyn Write + Send>,
     enabled: bool,
-    width: usize,
+    /// The terminal's columns, read for every frame so the status line
+    /// keeps fitting a window that was resized.
+    columns: Arc<AtomicUsize>,
     /// The turn in progress, while there is one.
     status: Option<Status>,
     /// A frame is on screen and must be erased before anything else is
@@ -40,11 +44,11 @@ struct Status {
 }
 
 impl Screen {
-    pub fn new(out: Box<dyn Write + Send>, enabled: bool, width: usize) -> Self {
+    pub fn new(out: Box<dyn Write + Send>, enabled: bool, columns: Arc<AtomicUsize>) -> Self {
         Self {
             out,
             enabled,
-            width,
+            columns,
             status: None,
             drawn: false,
             at_line_start: true,
@@ -130,7 +134,10 @@ impl Screen {
             return;
         }
         if let Some(status) = &self.status {
-            let line = status.render(status.started.elapsed(), self.width);
+            let line = status.render(
+                status.started.elapsed(),
+                self.columns.load(Ordering::Relaxed),
+            );
             let _ = self.out.write_all(line.as_bytes());
             self.drawn = true;
         }
@@ -263,7 +270,11 @@ pub mod tests {
     #[test]
     fn a_disabled_screen_writes_only_what_it_is_given() {
         let sink = Sink::default();
-        let mut screen = Screen::new(Box::new(sink.clone()), false, 80);
+        let mut screen = Screen::new(
+            Box::new(sink.clone()),
+            false,
+            Arc::new(AtomicUsize::new(80)),
+        );
         screen.begin();
         screen.set_action("reading src/main.rs");
         screen.tick();
@@ -283,7 +294,11 @@ pub mod tests {
             .map(|i| format!("line {i} of the model's reply, with a few words\n"))
             .collect();
         let sink = Sink::default();
-        let screen = Arc::new(Mutex::new(Screen::new(Box::new(sink.clone()), true, 60)));
+        let screen = Arc::new(Mutex::new(Screen::new(
+            Box::new(sink.clone()),
+            true,
+            Arc::new(AtomicUsize::new(60)),
+        )));
         screen.lock().unwrap().begin();
         let ticker = {
             let screen = screen.clone();
@@ -307,6 +322,69 @@ pub mod tests {
         let (plain, frames) = strip_frames(&sink.contents());
         assert_eq!(plain, text);
         assert!(frames > 40, "a frame after each line at least: {frames}");
+    }
+
+    /// The visible text of the last frame in `out`, escapes and carriage
+    /// returns resolved.
+    fn last_frame(out: &str) -> String {
+        let plain = regex_lite_strip(out);
+        plain
+            .split('\r')
+            .rfind(|part| !part.trim().is_empty())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Drops CSI sequences without pulling in a regex crate.
+    fn regex_lite_strip(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_status_line_follows_a_resize() {
+        let sink = Sink::default();
+        let columns = Arc::new(AtomicUsize::new(200));
+        let mut screen = Screen::new(Box::new(sink.clone()), true, columns.clone());
+        screen.begin();
+        // Long enough that the width is what decides where it is cut.
+        screen.set_action(&action(
+            "bash",
+            "cargo test --workspace --all-targets -- --nocapture --test-threads 1",
+        ));
+
+        screen.tick();
+        let wide = last_frame(&sink.contents());
+        let before = sink.contents().len();
+
+        columns.store(40, Ordering::Relaxed);
+        screen.tick();
+        let narrow = last_frame(&sink.contents()[before..]);
+        screen.end();
+
+        assert!(
+            wide.chars().count() <= 200 && wide.chars().count() > 40,
+            "the wide frame used the wide terminal: {wide:?}"
+        );
+        assert!(
+            narrow.chars().count() <= 40,
+            "the frame after the resize fits the new width: {narrow:?}"
+        );
+        assert_ne!(wide, narrow, "the resize reached the status line");
     }
 
     #[test]

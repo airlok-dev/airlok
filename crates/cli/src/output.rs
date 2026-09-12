@@ -3,7 +3,7 @@
 //! [`Screen`], plus confirmations on the terminal.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -42,15 +42,13 @@ pub struct Stdout {
 
 impl Stdout {
     pub fn new(terminal: Option<Terminal>, verbose: bool) -> Self {
-        let width = termimad::crossterm::terminal::size()
-            .map(|(w, _)| usize::from(w))
-            .unwrap_or(80);
+        crate::render::measure();
         Self::with(
             Renderer::for_stdout(),
             terminal,
             verbose,
             Box::new(std::io::stdout()),
-            width,
+            crate::render::terminal_columns(),
         )
     }
 
@@ -62,7 +60,7 @@ impl Stdout {
         terminal: Option<Terminal>,
         verbose: bool,
         out: Box<dyn Write + Send>,
-        width: usize,
+        columns: Arc<AtomicUsize>,
     ) -> Self {
         let status_line = renderer.is_rich() && !verbose;
         Self {
@@ -70,7 +68,7 @@ impl Stdout {
             terminal,
             mid_line: false,
             collapsed: 0,
-            screen: Arc::new(Mutex::new(Screen::new(out, status_line, width))),
+            screen: Arc::new(Mutex::new(Screen::new(out, status_line, columns))),
             ticker: None,
             keys: None,
         }
@@ -386,7 +384,13 @@ mod tests {
     #[test]
     fn without_a_terminal_a_turn_prints_no_status_output() {
         let sink = Sink::default();
-        let mut out = Stdout::with(Renderer::Plain, None, false, Box::new(sink.clone()), 80);
+        let mut out = Stdout::with(
+            Renderer::Plain,
+            None,
+            false,
+            Box::new(sink.clone()),
+            Arc::new(AtomicUsize::new(80)),
+        );
         out.begin_turn();
         out.thinking();
         out.tokens(120);
@@ -411,7 +415,13 @@ mod tests {
         const REPLY: &str = "Here is **the plan**:\n\n- read the config\n- change `main.rs`\n\nThen run the tests.\n";
         let run = |ticks: bool| {
             let sink = Sink::default();
-            let mut out = Stdout::with(Renderer::rich(60), None, false, Box::new(sink.clone()), 60);
+            let mut out = Stdout::with(
+                Renderer::rich(60),
+                None,
+                false,
+                Box::new(sink.clone()),
+                Arc::new(AtomicUsize::new(60)),
+            );
             out.begin_turn();
             out.tool_call("read_file", "src/main.rs");
             out.tool_call("grep", "fn main");
@@ -452,7 +462,13 @@ mod tests {
         let before = mode(fd);
         let interrupt = Interrupt::new();
         let sink = Sink::default();
-        let mut out = Stdout::with(Renderer::Plain, None, false, Box::new(sink.clone()), 80);
+        let mut out = Stdout::with(
+            Renderer::Plain,
+            None,
+            false,
+            Box::new(sink.clone()),
+            Arc::new(AtomicUsize::new(80)),
+        );
         out.watch_keys(Keys::new(terminal, interrupt.clone(), Arc::default()));
         let dir = TempDir::new("esc");
         let provider = MockProvider::scripted(vec![partial("The answer is")]);
