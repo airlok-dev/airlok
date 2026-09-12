@@ -356,6 +356,79 @@ async fn trust_allow_never_asks_and_deny_offers_nothing() {
     );
 }
 
+fn prompts(out: &RecordingOutput) -> Vec<(String, Vec<String>)> {
+    out.events
+        .iter()
+        .filter_map(|event| match event {
+            Shown::ConfirmMcp { tool, paths, .. } => Some((tool.clone(), paths.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn approving_all_does_not_cover_a_call_that_reaches_somewhere_else() {
+    let dir = TempDir::new("mcp-approve-all");
+    // Three calls, one `a` on the first. The second names a place outside
+    // what was approved, and the third a different file again.
+    let provider = MockProvider::scripted(vec![
+        tool_call("call-1", "mock__echo", json!({ "path": "notes/a.md" })),
+        tool_call("call-2", "mock__echo", json!({ "path": "/etc/passwd" })),
+        tool_call("call-3", "mock__echo", json!({ "path": "notes/b.md" })),
+        reply("done"),
+    ]);
+    let mut agent = agent_configured(
+        provider.clone(),
+        with_server(dir.path(), ""),
+        SecretRedactor::new(),
+    );
+    let mut out = RecordingOutput::answering(vec![Decision::ApproveAll]);
+
+    agent.run("read them", &mut out).await.unwrap();
+
+    let asked = prompts(&out);
+    assert_eq!(asked.len(), 3, "each place must be asked about: {asked:?}");
+    // The prompt shows the resolved place, not the spelling.
+    assert!(asked[0].1[0].ends_with("/notes/a.md"), "{asked:?}");
+    assert_eq!(asked[1].1, ["/etc/passwd"], "{asked:?}");
+    assert!(asked[2].1[0].ends_with("/notes/b.md"), "{asked:?}");
+}
+
+#[tokio::test]
+async fn approving_all_covers_the_same_place_again_but_not_another_tool() {
+    let dir = TempDir::new("mcp-approve-scope");
+    let provider = MockProvider::scripted(vec![
+        tool_call("call-1", "mock__echo", json!({ "path": "notes/a.md" })),
+        // The same place, spelled differently: already approved.
+        tool_call(
+            "call-2",
+            "mock__echo",
+            json!({ "path": "./notes/../notes/a.md" }),
+        ),
+        // Another tool on the same server: not approved.
+        tool_call("call-3", "mock__helpful", json!({})),
+        reply("done"),
+    ]);
+    let mut agent = agent_configured(
+        provider.clone(),
+        with_server(dir.path(), ""),
+        SecretRedactor::new(),
+    );
+    let mut out = RecordingOutput::answering(vec![Decision::ApproveAll]);
+
+    agent.run("read it twice", &mut out).await.unwrap();
+
+    let asked = prompts(&out);
+    assert_eq!(
+        asked
+            .iter()
+            .map(|(tool, _)| tool.as_str())
+            .collect::<Vec<_>>(),
+        ["echo", "helpful"],
+        "{asked:?}"
+    );
+}
+
 #[tokio::test]
 async fn plan_mode_offers_no_mcp_tools_and_starts_no_server() {
     let dir = TempDir::new("mcp-plan");
