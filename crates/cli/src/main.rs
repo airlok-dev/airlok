@@ -964,11 +964,19 @@ mod tests {
     /// on it rather than on whatever the config file now says.
     #[test]
     fn a_resume_keeps_the_reasoning_effort_the_session_used() {
-        use airlok_core::config::{Config, ModelSection};
+        use airlok_core::config::{Config, ModelConfig, ModelSection};
 
         let cwd = std::path::PathBuf::from("/tmp/airlok-resume-effort");
         let mut config = Config::new(cwd.clone());
         config.provider.model = "gpt-6-astra".into();
+        // The config files say "low" for this model; the session says
+        // "none", and the session is what the resume must continue on.
+        config.models.insert(
+            "gpt-6-astra".into(),
+            ModelConfig {
+                reasoning_effort: Some("low".into()),
+            },
+        );
         let mut session = airlok_core::Session::new(&cwd, &config);
         session.model = "gpt-6-astra".into();
         session.config.models.insert(
@@ -986,7 +994,7 @@ mod tests {
                 .get("gpt-6-astra")
                 .and_then(|m| m.reasoning_effort.as_deref()),
             Some("none"),
-            "the session's own effort came back"
+            "the session's own effort won over the config file"
         );
     }
 

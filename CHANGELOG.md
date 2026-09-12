@@ -6,7 +6,7 @@ All notable changes to airlok. The format follows Keep a Changelog; versions fol
 
 ### Added
 
-- `/effort` shows the reasoning effort in force for the model in use and where it came from: the per-model config, this session, or the provider's own default. `/effort <value>` sets it for the rest of the session, using the same picker and the same did-you-mean question as `/model`, offering what the provider accepts (`none`, `minimal`, `low`, `medium`, `high`). The value is recorded in the session, so `--resume` keeps it, and on resume the session's value wins over the config file for the model it continues on. Only the openai provider sends a reasoning effort, so on anthropic the command says so rather than offering a list.
+- `/effort` shows the reasoning effort in force for the model in use and where it came from: the per-model config, this session, or the provider's own default. `/effort <value>` sets it for the rest of the session, using the same picker and the same did-you-mean question as `/model`, offering what the provider accepts (`none`, `minimal`, `low`, `medium`, `high`). The value is recorded in the session, so `--resume` keeps it, and on resume the session's value wins over the config file for the model the session last used. Only the openai provider sends a reasoning effort, so on anthropic the command says so rather than offering a list.
 - Tab completes `/effort` arguments, alongside `/model` and `/provider`.
 
 ### Changed
