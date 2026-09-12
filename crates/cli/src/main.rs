@@ -106,6 +106,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Mcp { action }) => return mcp_command(action, &config, &sources).await,
         Some(Command::Sessions { action }) => return sessions_command(action, &store()?, &cwd),
+        Some(Command::Doctor) => {
+            let checks = doctor_checks(&config, &config_file_lines(&sources)).await;
+            for check in &checks {
+                println!("{}", check.line());
+            }
+            let failed = checks.iter().filter(|c| !c.ok).count();
+            if failed > 0 {
+                eprintln!("{failed} check(s) failed");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         None => {}
     }
     let prompt = args.prompt.clone();
@@ -453,6 +465,7 @@ impl CliBackend {
     }
 }
 
+#[async_trait::async_trait]
 impl Backend for CliBackend {
     fn fresh_redactor(&mut self) -> Box<dyn Redactor> {
         Box::new(SecretRedactor::new().with_known(KEY_LABEL, &self.key, Class::RedactOnly))
@@ -502,6 +515,10 @@ impl Backend for CliBackend {
 
     fn key_source(&mut self) -> Option<String> {
         Some(self.key_source.clone())
+    }
+
+    async fn doctor(&mut self) -> Vec<airlok_core::repl::Check> {
+        doctor_checks(&self.config, &self.config_files).await
     }
 
     fn known_models(&mut self, provider: ProviderName) -> Vec<String> {
@@ -955,6 +972,144 @@ fn config_init(path: Option<&Path>) -> anyhow::Result<()> {
 }
 
 /// Prints the merged configuration. The key itself is never read here.
+/// Every `/doctor` check. Talking to the provider and the MCP servers
+/// happens here, where the key and the transports live; nothing it reads
+/// is ever put in a `Check`, only where it looked.
+async fn doctor_checks(config: &Config, files: &[String]) -> Vec<airlok_core::repl::Check> {
+    use airlok_core::repl::Check;
+    use futures::StreamExt;
+
+    let mut checks = Vec::new();
+    checks.push(Check::pass(
+        "config",
+        if files.is_empty() {
+            "built-in defaults only".to_string()
+        } else {
+            files.join("; ")
+        },
+    ));
+
+    let key = config.resolve_key();
+    match &key {
+        Ok(_) => checks.push(Check::pass(
+            "provider key",
+            format!("resolved from {}", config.key_source()),
+        )),
+        Err(e) => checks.push(Check::fail(
+            "provider key",
+            format!("{e}, looking at {}", config.key_source()),
+        )),
+    }
+
+    match key {
+        Err(_) => checks.push(Check::fail(
+            "provider request",
+            "not attempted: no key to send".to_string(),
+        )),
+        Ok(key) => {
+            let provider = build_provider(config, key);
+            let request = airlok_llm::Request {
+                model: config.provider.model.clone(),
+                max_tokens: 16,
+                system: String::new(),
+                messages: vec![airlok_llm::Message::user_text("ping")],
+                tools: Vec::new(),
+                reasoning_effort: config
+                    .models
+                    .get(&config.provider.model)
+                    .and_then(|m| m.reasoning_effort.clone()),
+            };
+            let mut stream = provider.stream(request);
+            let mut failure = None;
+            while let Some(event) = stream.next().await {
+                if let Err(e) = event {
+                    failure = Some(e.to_string());
+                    break;
+                }
+            }
+            checks.push(match failure {
+                None => Check::pass(
+                    "provider request",
+                    format!(
+                        "{} answered for {}",
+                        config.provider.name.as_str(),
+                        config.provider.model
+                    ),
+                ),
+                Some(why) => Check::fail("provider request", why),
+            });
+        }
+    }
+
+    if config.mcp.is_empty() {
+        checks.push(Check::pass("mcp servers", "none configured".to_string()));
+    } else {
+        let choices = airlok_core::mcp::project::load(&config.cwd);
+        let (_, statuses) = airlok_core::mcp::connect_all(&config.mcp, &config.cwd, &choices).await;
+        for status in statuses {
+            let ok = matches!(status.state, airlok_core::mcp::State::Ready { .. });
+            let name = format!("mcp {}", status.server);
+            checks.push(if ok {
+                Check::pass(&name, status.line())
+            } else {
+                Check::fail(&name, status.line())
+            });
+        }
+    }
+
+    checks.push(match airlok_core::context::branch(&config.cwd) {
+        Some(branch) => Check::pass("git", format!("on {branch}")),
+        None => Check::fail(
+            "git",
+            "not a git repository, or git is not installed".to_string(),
+        ),
+    });
+
+    let terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    checks.push(Check::pass(
+        "terminal",
+        if terminal {
+            format!(
+                "a terminal, {} columns, colour {}",
+                {
+                    crate::render::measure();
+                    crate::render::terminal_columns().load(std::sync::atomic::Ordering::Relaxed)
+                },
+                if std::env::var_os("NO_COLOR").is_some() {
+                    "off (NO_COLOR)"
+                } else {
+                    "on"
+                }
+            )
+        } else {
+            "not a terminal: plain output, no confirmations".to_string()
+        },
+    ));
+
+    checks.push(match SessionStore::default_root() {
+        Some(root) => match std::fs::create_dir_all(&root) {
+            Ok(()) => Check::pass("session storage", format!("writable at {}", root.display())),
+            Err(e) => Check::fail("session storage", format!("{}: {e}", root.display())),
+        },
+        None => Check::fail(
+            "session storage",
+            "cannot locate the data directory: set XDG_DATA_HOME or HOME".to_string(),
+        ),
+    });
+
+    let trust = airlok_core::mcp::trust::path_for(&config.cwd);
+    let trust_dir = trust.parent().unwrap_or(&config.cwd).to_path_buf();
+    checks.push(match std::fs::create_dir_all(&trust_dir) {
+        Ok(()) => Check::pass(
+            "mcp trust storage",
+            format!("writable at {}", trust_dir.display()),
+        ),
+        Err(e) => Check::fail("mcp trust storage", format!("{}: {e}", trust_dir.display())),
+    });
+
+    checks
+}
+
 /// One line per configuration file that could apply, in the same words
 /// `airlok config show` uses. Paths and whether they were found, nothing
 /// read from inside them.

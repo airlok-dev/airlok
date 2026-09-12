@@ -146,6 +146,7 @@ impl TestBackend {
     }
 }
 
+#[async_trait::async_trait]
 impl Backend for TestBackend {
     fn fresh_redactor(&mut self) -> Box<dyn Redactor> {
         Box::new(SecretRedactor::new())

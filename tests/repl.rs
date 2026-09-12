@@ -393,6 +393,7 @@ async fn a_bang_command_runs_here_and_the_next_turn_sees_it() {
 /// rebuild after AIRLOK.md changes.
 struct Reloading(&'static str);
 
+#[async_trait::async_trait]
 impl Backend for Reloading {
     fn fresh_redactor(&mut self) -> Box<dyn Redactor> {
         Box::new(SecretRedactor::new())

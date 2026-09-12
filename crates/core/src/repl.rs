@@ -41,8 +41,45 @@ pub trait LineSource {
     fn set_candidates(&mut self, _candidates: Candidates) {}
 }
 
+/// One `/doctor` check: what was tried, whether it worked, and a line
+/// saying where it looked. Never carries a value it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Check {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+impl Check {
+    pub fn pass(name: &str, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            ok: true,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn fail(name: &str, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            ok: false,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn line(&self) -> String {
+        format!(
+            "{} {:<22} {}",
+            if self.ok { "pass" } else { "FAIL" },
+            self.name,
+            self.detail
+        )
+    }
+}
+
 /// What the REPL needs from the binary, which owns key resolution and
 /// provider construction.
+#[async_trait::async_trait]
 pub trait Backend: Send {
     /// A redactor for a fresh session, knowing the current provider key.
     fn fresh_redactor(&mut self) -> Box<dyn Redactor>;
@@ -86,6 +123,12 @@ pub trait Backend: Send {
     /// Where the provider key comes from, named but never resolved.
     fn key_source(&mut self) -> Option<String> {
         None
+    }
+
+    /// Runs the `/doctor` checks. Talking to the provider and to the MCP
+    /// servers is the binary's job, so this lives here.
+    async fn doctor(&mut self) -> Vec<Check> {
+        Vec::new()
     }
 }
 
@@ -144,6 +187,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (
         "/init",
         "propose an AIRLOK.md for this repository, as a diff to approve",
+    ),
+    (
+        "/doctor",
+        "check config, key, provider, MCP servers, git, terminal and storage",
     ),
     (
         "/goal",
@@ -593,6 +640,21 @@ impl Repl<'_> {
             "context" => self.context_report(session, out),
             "permissions" => self.permissions(arg, session, out),
             "init" => self.init(session, out),
+            "doctor" => {
+                let checks = self.backend.doctor().await;
+                if checks.is_empty() {
+                    out.status("no checks to run from here");
+                }
+                for check in &checks {
+                    out.status(&check.line());
+                }
+                let failed = checks.iter().filter(|c| !c.ok).count();
+                out.status(&if failed == 0 {
+                    "everything airlok needs is working".to_string()
+                } else {
+                    format!("{failed} check(s) failed")
+                });
+            }
             "btw" if arg.is_empty() => {
                 out.status("/btw <question> answers beside the task, without joining it")
             }
@@ -1226,6 +1288,19 @@ pub fn cost_lines(session: &Session, context_window: u64) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_check_reads_as_pass_or_fail_on_its_own() {
+        let good = Check::pass("git", "on main");
+        let bad = Check::fail("provider key", "unset");
+        assert!(good.line().starts_with("pass git"), "{}", good.line());
+        assert!(
+            bad.line().starts_with("FAIL provider key"),
+            "{}",
+            bad.line()
+        );
+        assert!(good.ok && !bad.ok);
+    }
+
     use super::*;
 
     #[test]
