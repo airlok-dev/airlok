@@ -2,6 +2,18 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.8.1] - 2026-09-12
+
+### Added
+
+- `/model` with no id opens a picker: the models airlok knows here, with arrows, type to filter, Enter to take one and Esc to leave everything alone. The list is the model in use, any named in `[models."<id>"]`, the ones used earlier in the run, and the ones saved sessions used on this provider. `/provider` with no name picks the same way, and `/model <id>` still switches directly.
+- Tab completes a slash command's argument, not only its name. Commands say what their arguments could be, and `/model` and `/provider` are the first two.
+
+### Changed
+
+- Switching to a model id airlok has not seen says so, names the nearest ids it knows, and asks whether to use the typed one anyway. An exact match is still taken as given, and the typed id is always offered first, so pressing Enter never quietly selects a near match. Before this, an unknown id was accepted and the provider rejected it a turn later.
+- A provider that refuses a request is reported as one sentence naming the likely cause and what to change, for a missing model or deployment, a rejected key, rate limiting, and a request longer than the model's context. The raw body moved to the debug log, where `-v` shows it, and the session stays open as before.
+
 ## [0.8.0] - 2026-09-12
 
 ### Changed

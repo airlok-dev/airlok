@@ -52,12 +52,16 @@ While a turn runs, a status line below the output shows a spinner, what airlok i
 |---|---|
 | Enter | send the line |
 | Alt+Enter | start a new line in the same message. Shift+Enter does the same in terminals that send Esc then Enter for it; most send a plain Enter |
-| Tab | take the first `/` command or `@` path on offer; Tab again cycles through the rest |
+| Tab | take the first `/` command, `@` path, or command argument on offer; Tab again cycles through the rest |
 | Right arrow | take the rest of the `/` command shown after the cursor |
 | Esc or Ctrl-C | during a turn, cancel it |
 | Ctrl-C | at the prompt, clear the line; on an empty line it does nothing |
 | Ctrl-D | save and quit |
 | Ctrl-R | search this run's history; Up and Down step through it |
+
+The models airlok offers are the one in use, any named in `[models."<id>"]`, the ones used earlier in this run, and the ones saved sessions here used on this provider. Tab completes from that list after `/model `, and from the two provider names after `/provider `. Switching to an id from that list is taken as given; anything else is read back with the nearest known ids and a question, since a model id that only fails on the next turn is a poor way to learn it was a typo.
+
+A provider that refuses a request is reported as a sentence naming the likely cause: a model or deployment that does not exist, a key the provider rejected, rate limiting, or a request longer than the model's context. The raw body goes to the debug log, so `-v` still has it, and the session stays open either way.
 
 A cancelled turn keeps the text streamed so far in the history, marked as interrupted; tool calls that had not run are dropped, and you get the prompt back. Keys typed while a turn runs are kept and start the next prompt.
 
@@ -71,11 +75,11 @@ A cancelled turn keeps the text streamed so far in the history, marked as interr
 | Command | What it does |
 |---|---|
 | `/help` | list the commands |
-| `/model [<id>]` | show the model, or use `<id>` for the rest of the session; not validated, the provider rejects a bad id on the next turn |
+| `/model [<id>]` | with no id, pick from the models airlok knows here: arrows, type to filter, Enter, Esc. With an id, switch to it; an id airlok has not seen is questioned rather than taken |
 | `/mcp` | list the MCP servers and their tools; `/mcp <name>` enables a disabled one for this session |
 | `/plan` | turn plan mode on or off |
 | `/go` | carry out the plan from plan mode, back in normal mode |
-| `/provider [<name>]` | show the provider, or switch to `anthropic` or `openai` if a key is available for it; says which key is missing otherwise |
+| `/provider [<name>]` | with no name, pick between `anthropic` and `openai`; with one, switch if a key is available for it, and say which key is missing otherwise |
 | `/cost` | tokens used so far, and whether they are estimates |
 | `/compact` | summarise older turns to free context |
 | `/config` | the effective configuration |
