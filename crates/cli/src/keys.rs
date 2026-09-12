@@ -29,6 +29,17 @@ pub struct Cbreak {
 
 impl Cbreak {
     pub fn enter(fd: RawFd) -> std::io::Result<Self> {
+        Self::enter_with(fd, 1, 0)
+    }
+
+    /// Cbreak where a read gives up after a tenth of a second with nothing
+    /// typed. Telling a bare Esc from the start of an arrow key needs a
+    /// read that can time out, and macOS will not poll `/dev/tty`.
+    pub fn enter_polling(fd: RawFd) -> std::io::Result<Self> {
+        Self::enter_with(fd, 0, 1)
+    }
+
+    fn enter_with(fd: RawFd, vmin: u8, vtime: u8) -> std::io::Result<Self> {
         // SAFETY: termios is plain data, filled in by tcgetattr.
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
@@ -36,8 +47,8 @@ impl Cbreak {
         }
         let mut cbreak = saved;
         cbreak.c_lflag &= !(libc::ICANON | libc::ECHO);
-        cbreak.c_cc[libc::VMIN] = 1;
-        cbreak.c_cc[libc::VTIME] = 0;
+        cbreak.c_cc[libc::VMIN] = vmin;
+        cbreak.c_cc[libc::VTIME] = vtime;
         install_panic_hook();
         *SAVED.lock().unwrap_or_else(PoisonError::into_inner) = Some((fd, saved));
         // SAFETY: `cbreak` is a valid termios derived from the current one.

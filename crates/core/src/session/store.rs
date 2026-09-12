@@ -25,6 +25,9 @@ pub struct Summary {
     pub created_at: String,
     pub updated_at: String,
     pub model: String,
+    /// Which provider the session ran on, so a model id can be offered
+    /// only where it means something.
+    pub provider: String,
     pub turns: usize,
     pub first_prompt: Option<String>,
 }
@@ -83,6 +86,7 @@ impl SessionStore {
                     created_at: session.created_at.clone(),
                     updated_at: session.updated_at.clone(),
                     model: session.model.clone(),
+                    provider: session.provider.clone(),
                     turns: session.turns(),
                     first_prompt: session.first_prompt().map(str::to_string),
                 }),

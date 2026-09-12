@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use airlok_core::repl::{Line, LineSource};
+use airlok_core::repl::{Candidates, Line, LineSource};
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{
@@ -70,6 +70,12 @@ impl ConditionalEventHandler for QuietCtrlC {
 }
 
 impl LineSource for Readline {
+    fn set_candidates(&mut self, candidates: Candidates) {
+        if let Some(helper) = self.editor.helper_mut() {
+            helper.set_candidates(candidates);
+        }
+    }
+
     fn read_line(&mut self, prompt: &str) -> Line {
         if let Some(helper) = self.editor.helper_mut() {
             helper.refresh();

@@ -27,8 +27,17 @@ pub enum Line {
     Eof,
 }
 
+/// What the argument to a slash command could be, by command name
+/// without the slash. Refreshed before every prompt, since the answer
+/// depends on the session.
+pub type Candidates = std::collections::BTreeMap<&'static str, Vec<String>>;
+
 pub trait LineSource {
     fn read_line(&mut self, prompt: &str) -> Line;
+
+    /// Offered by Tab after a command that takes an argument. A front end
+    /// that does not complete can ignore them.
+    fn set_candidates(&mut self, _candidates: Candidates) {}
 }
 
 /// What the REPL needs from the binary, which owns key resolution and
@@ -47,6 +56,18 @@ pub trait Backend: Send {
     /// `None` keeps the current block.
     fn context(&mut self) -> Option<String> {
         None
+    }
+
+    /// Asks the user to pick one of `choices`. `None` means cancelled, or
+    /// that this front end cannot ask, in which case the caller falls back
+    /// to printing what it would have offered.
+    fn choose(&mut self, _title: &str, _choices: &[String]) -> Option<String> {
+        None
+    }
+
+    /// Model ids seen in saved sessions for `provider`, newest first.
+    fn known_models(&mut self, _provider: ProviderName) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -116,6 +137,36 @@ pub fn resolve_command(name: &str) -> Resolved {
     Resolved::Unknown { closest }
 }
 
+/// How many ids to print when there is no terminal to pick with.
+const MENU_CHOICES: usize = 10;
+
+/// The known ids closest to `typed`, nearest first, and only ones close
+/// enough to be worth naming.
+pub fn nearest(typed: &str, known: &[String]) -> Vec<String> {
+    let mut scored: Vec<(usize, &String)> = known
+        .iter()
+        .map(|id| (edit_distance(typed, id), id))
+        .filter(|(distance, id)| *distance <= id.len().max(typed.len()) / 2)
+        .collect();
+    scored.sort_by_key(|(distance, id)| (*distance, (*id).clone()));
+    scored
+        .into_iter()
+        .take(3)
+        .map(|(_, id)| id.clone())
+        .collect()
+}
+
+/// What the id is offered as, with the typed one first so Enter on it is
+/// a deliberate choice rather than a fuzzy match being taken for one.
+fn once_then(typed: &str, near: &[String], known: &[String]) -> Vec<String> {
+    let mut choices = vec![typed.to_string()];
+    choices.extend(near.iter().cloned());
+    choices.extend(known.iter().cloned());
+    let mut seen = std::collections::HashSet::new();
+    choices.retain(|id| seen.insert(id.clone()));
+    choices
+}
+
 /// Levenshtein distance, for suggesting the closest command.
 fn edit_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
@@ -143,6 +194,8 @@ pub struct Repl<'a> {
     pub interrupt: Interrupt,
     /// Builds redactors for `/clear` and providers for `/provider`.
     pub backend: Box<dyn Backend + 'a>,
+    /// Model ids used in this run, most recent first, for the picker.
+    pub used: Vec<String>,
 }
 
 #[derive(PartialEq)]
@@ -162,6 +215,7 @@ impl Repl<'_> {
     ) -> Session {
         loop {
             let prompt = self.prompt_text();
+            lines.set_candidates(self.candidates(&session));
             match lines.read_line(&prompt) {
                 Line::Eof => break,
                 // Ctrl-C at the prompt does nothing; Ctrl-D or /exit quits.
@@ -184,6 +238,38 @@ impl Repl<'_> {
         }
         self.save(&session, out);
         session
+    }
+
+    /// What Tab offers after each command that takes an argument, and
+    /// what the pickers list.
+    fn candidates(&mut self, session: &Session) -> Candidates {
+        let mut candidates = Candidates::new();
+        candidates.insert("model", self.model_choices(session));
+        candidates.insert(
+            "provider",
+            vec![
+                ProviderName::Anthropic.as_str().to_string(),
+                ProviderName::OpenAi.as_str().to_string(),
+            ],
+        );
+        candidates
+    }
+
+    /// Every model id airlok knows here: the one in use, any named in
+    /// `[models."<id>"]`, the ones used earlier in this run, and the ones
+    /// saved sessions used on this provider. In that order, without
+    /// repeats, because the first is the likeliest.
+    fn model_choices(&mut self, session: &Session) -> Vec<String> {
+        let config = self.agent.config();
+        let provider = config.provider.name;
+        let mut ids = vec![config.provider.model.clone()];
+        ids.extend(self.used.iter().cloned());
+        ids.extend(config.models.keys().cloned());
+        ids.push(session.model.clone());
+        ids.extend(self.backend.known_models(provider));
+        let mut seen = std::collections::HashSet::new();
+        ids.retain(|id| !id.trim().is_empty() && seen.insert(id.clone()));
+        ids
     }
 
     /// `<model> <cwd basename>> `, with `[plan]` before the `>` in plan mode.
@@ -212,7 +298,14 @@ impl Repl<'_> {
             Ok(_) => {}
             Err(CoreError::Aborted) => out.status("aborted"),
             Err(e) => {
-                out.status(&format!("error: {e}"));
+                let config = self.agent.config();
+                // The raw body is long and usually JSON; it goes to the
+                // debug log, and the user gets a sentence.
+                tracing::debug!(error = %e, "turn failed");
+                match e.explain(&config.provider.model, config.provider.name.as_str()) {
+                    Some(line) => out.status(&line),
+                    None => out.status(&format!("error: {e}")),
+                }
                 if let Some(hint) = e.hint(&self.agent.config().provider.model) {
                     hint.lines().for_each(|l| out.status(l));
                 }
@@ -268,18 +361,38 @@ impl Repl<'_> {
                 out.status(&format!(
                     "model {} ({}){effort}",
                     session.model, session.provider
-                ))
+                ));
+                let choices = self.model_choices(session);
+                match self.backend.choose("model", &choices) {
+                    Some(id) => self.set_model(&id, session, out),
+                    // No terminal to pick with, or the user pressed Esc.
+                    None => {
+                        for id in choices.iter().take(MENU_CHOICES) {
+                            out.status(&format!("  {id}"));
+                        }
+                        out.status("/model <id> switches");
+                    }
+                }
             }
             "model" => {
-                self.agent.config_mut().provider.model = arg.to_string();
-                self.record_provider(session);
-                out.status(&format!("model {arg} for the rest of this session"));
-                self.save(session, out);
+                if let Some(id) = self.resolve_model(arg, session, out) {
+                    self.set_model(&id, session, out);
+                }
             }
-            "provider" if arg.is_empty() => out.status(&format!(
-                "provider {} (model {}); switch with /provider anthropic|openai",
-                session.provider, session.model
-            )),
+            "provider" if arg.is_empty() => {
+                out.status(&format!(
+                    "provider {} (model {})",
+                    session.provider, session.model
+                ));
+                let choices = vec![
+                    ProviderName::Anthropic.as_str().to_string(),
+                    ProviderName::OpenAi.as_str().to_string(),
+                ];
+                match self.backend.choose("provider", &choices) {
+                    Some(name) => self.switch_provider(&name, session, out),
+                    None => out.status("switch with /provider anthropic|openai"),
+                }
+            }
             "provider" => self.switch_provider(arg, session, out),
             "help" => {
                 for (name, what) in COMMANDS {
@@ -441,6 +554,52 @@ impl Repl<'_> {
             }
             None => "added to ./AIRLOK.md".to_string(),
         });
+    }
+
+    /// Takes the id, records it, and says so.
+    fn set_model(&mut self, id: &str, session: &mut Session, out: &mut dyn Output) {
+        // The model being left is remembered too, so the id airlok started
+        // on is still on offer after a switch.
+        let leaving = self.agent.config().provider.model.clone();
+        self.agent.config_mut().provider.model = id.to_string();
+        for name in [leaving, id.to_string()] {
+            self.used.retain(|used| *used != name);
+            self.used.insert(0, name);
+        }
+        self.record_provider(session);
+        out.status(&format!("model {id} for the rest of this session"));
+        self.save(session, out);
+    }
+
+    /// The id to switch to, having checked it against the ones airlok
+    /// knows. An exact match is taken as given. Anything else is offered
+    /// with the nearest known ids and a question, rather than accepted
+    /// silently and failing a turn later.
+    fn resolve_model(
+        &mut self,
+        arg: &str,
+        session: &Session,
+        out: &mut dyn Output,
+    ) -> Option<String> {
+        let known = self.model_choices(session);
+        if known.iter().any(|id| id == arg) {
+            return Some(arg.to_string());
+        }
+        let near: Vec<String> = nearest(arg, &known);
+        out.status(&format!("{arg} is not a model airlok has seen here"));
+        if !near.is_empty() {
+            out.status(&format!("did you mean: {}", near.join(", ")));
+        }
+        match self.backend.choose(
+            &format!("use {arg} anyway, or pick one airlok knows"),
+            &once_then(arg, &near, &known),
+        ) {
+            Some(chosen) => Some(chosen),
+            None => {
+                out.status("left the model alone");
+                None
+            }
+        }
     }
 
     fn switch_provider(&mut self, arg: &str, session: &mut Session, out: &mut dyn Output) {

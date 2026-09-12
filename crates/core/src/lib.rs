@@ -50,6 +50,41 @@ pub trait Output: Send {
 }
 
 impl CoreError {
+    /// One sentence for the failures a user can act on, naming the likely
+    /// cause and what to change. `None` when the error is better shown as
+    /// it is. The raw body is never in here: it goes to the debug log, so
+    /// `-v` still has it.
+    pub fn explain(&self, model: &str, provider: &str) -> Option<String> {
+        let CoreError::Llm(airlok_llm::LlmError::Api { status, body }) = self else {
+            return None;
+        };
+        let body_says = |needle: &str| body.to_ascii_lowercase().contains(needle);
+        Some(match status {
+            404 => format!(
+                "{provider} has no model called {model}. On Azure that is the deployment name,                  not the model family. /model lists the ids airlok knows, and `airlok config show`                  says which base_url it is asking."
+            ),
+            401 | 403 => format!(
+                "{provider} rejected the API key. `airlok config show` says where the key comes                  from; check that command or environment variable, and that the key is for this                  base_url."
+            ),
+            429 => format!(
+                "{provider} is rate limiting this key. Wait and send it again, or switch with                  /model or /provider. Azure returns this when a deployment is out of quota as                  well as when it is busy."
+            ),
+            400 if body_says("context length")
+                || body_says("context_length")
+                || body_says("too many tokens")
+                || body_says("maximum context") =>
+            {
+                format!(
+                    "the request was longer than {model} accepts. /compact summarises the older                      turns, /clear starts fresh, and [provider] context_window tells airlok the                      real size so it compacts on its own."
+                )
+            }
+            400 if body_says("deploymentnotfound") => format!(
+                "{provider} has no deployment called {model}. On Azure the model id is the                  deployment name you created."
+            ),
+            _ => return None,
+        })
+    }
+
     /// How to fix this in the config, when a setting can. Today: a provider
     /// that rejects its default `reasoning_effort` for `model`.
     pub fn hint(&self, model: &str) -> Option<String> {

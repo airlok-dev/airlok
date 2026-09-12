@@ -3,6 +3,7 @@ mod complete;
 mod diff;
 mod keys;
 mod output;
+mod picker;
 mod render;
 mod repl;
 mod status;
@@ -290,12 +291,14 @@ async fn run_repl(
         config: agent.config().clone(),
         key,
         user_instructions,
+        session_models: None,
     };
     let mut repl = Repl {
         agent: &mut agent,
         store: Some(store),
         interrupt,
         backend: Box::new(backend),
+        used: Vec::new(),
     };
     let session = repl.run(session, &mut lines, out).await;
     out.finish();
@@ -364,6 +367,28 @@ struct CliBackend {
     key: String,
     /// `~/.config/airlok/AIRLOK.md`, for rebuilding the context block.
     user_instructions: Option<PathBuf>,
+    /// Model ids read from saved sessions, kept per provider because
+    /// listing them parses every session file on disk.
+    session_models: Option<(ProviderName, Vec<String>)>,
+}
+
+impl CliBackend {
+    /// Model ids from saved sessions in this directory that ran on
+    /// `provider`, newest first, since a model id means nothing on the
+    /// other one.
+    fn models_from_sessions(&self, provider: ProviderName) -> Vec<String> {
+        let Ok(store) = store() else {
+            return Vec::new();
+        };
+        let Ok(summaries) = store.list(&self.config.cwd) else {
+            return Vec::new();
+        };
+        summaries
+            .into_iter()
+            .filter(|summary| summary.provider == provider.as_str())
+            .map(|summary| summary.model)
+            .collect()
+    }
 }
 
 impl Backend for CliBackend {
@@ -399,6 +424,23 @@ impl Backend for CliBackend {
             provider,
             redactor: Box::new(redactor),
         })
+    }
+
+    fn choose(&mut self, title: &str, choices: &[String]) -> Option<String> {
+        picker::ask(title, choices)
+    }
+
+    fn known_models(&mut self, provider: ProviderName) -> Vec<String> {
+        // Once per provider: this runs before every prompt, and listing
+        // sessions reads and parses all of them.
+        if let Some((cached, models)) = &self.session_models {
+            if cached.as_str() == provider.as_str() {
+                return models.clone();
+            }
+        }
+        let models = self.models_from_sessions(provider);
+        self.session_models = Some((provider, models.clone()));
+        models
     }
 
     fn context(&mut self) -> Option<String> {
