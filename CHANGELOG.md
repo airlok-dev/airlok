@@ -2,6 +2,14 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.6.1] - 2026-09-12
+
+### Fixed
+
+- Approving an MCP call with `a` covered the whole server for the rest of the run, so a later call to the same server ran without asking, even when it reached a different place. "All" now covers one tool on one server, and only the places that call named: a call naming anything outside them asks again. Paths are resolved before they are compared, so a different spelling of the same place is still covered and `..` cannot step outside an approval.
+- The confirmation now shows what the server can reach and the resolved place each argument names, marking one outside the current project, and `airlok mcp list` shows the same root. A call that reads outside the repository is visible before it runs rather than after.
+- A tool call or a note printed in the middle of a streamed line split the line in two: a bullet's bold label was rendered as a finished bullet and its text as a separate block, which is what `• Overview:` and its text landing on different lines was. Only complete markdown is flushed now, so a line still arriving keeps its block.
+
 ## [0.6.0] - 2026-09-12
 
 ### Added
