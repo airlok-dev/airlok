@@ -280,6 +280,15 @@ async fn run_repl(
             }
         });
     }
+    // A resize mid-turn: the next block wraps to the new width.
+    let mut sigwinch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            .context("cannot listen for window changes")?;
+    tokio::spawn(async move {
+        while sigwinch.recv().await.is_some() {
+            render::measure();
+        }
+    });
     // SIGTERM mid-turn would otherwise leave the terminal in cbreak mode.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("cannot listen for SIGTERM")?;
