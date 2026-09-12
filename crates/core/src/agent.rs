@@ -112,7 +112,8 @@ impl Agent {
             .collect();
         if !pending.is_empty() {
             let cwd = self.config.cwd.clone();
-            let (tools, statuses) = mcp::connect_all(&pending, &cwd).await;
+            let choices = self.approve_project_servers(&pending, out);
+            let (tools, statuses) = mcp::connect_all(&pending, &cwd, &choices).await;
             for tool in tools {
                 // A built-in with the same name keeps it.
                 if let Err(name) = self.tools.add(tool) {
@@ -138,6 +139,44 @@ impl Agent {
                     .cloned()
             })
             .collect()
+    }
+
+    /// Asks once about the project's own servers, if any of them are new
+    /// or have changed since the last answer, and records what was said.
+    /// Nothing from `.mcp.json` starts before this, because that file
+    /// arrives with a clone.
+    fn approve_project_servers(
+        &self,
+        servers: &[McpServer],
+        out: &mut dyn Output,
+    ) -> mcp::project::Choices {
+        let mut choices = mcp::project::load(&self.config.cwd);
+        let asking: Vec<(String, String)> = servers
+            .iter()
+            .filter(|server| server.enabled && mcp::project::undecided(server, &choices))
+            .map(|server| (server.name.clone(), mcp::project::what_runs(server)))
+            .collect();
+        if asking.is_empty() {
+            return choices;
+        }
+        let approved = matches!(
+            out.confirm(&Confirmation::McpProject { servers: &asking }),
+            Decision::Approve | Decision::ApproveAll | Decision::SaveAll
+        );
+        for (name, _) in &asking {
+            if let Some(server) = servers.iter().find(|server| &server.name == name) {
+                choices.record(name, &mcp::trust::fingerprint(server), approved);
+            }
+        }
+        if let Err(e) = mcp::project::save(&self.config.cwd, &choices) {
+            out.status(&format!("could not record the decision: {e}"));
+        }
+        out.status(if approved {
+            "the project's MCP servers may start in this repository"
+        } else {
+            "the project's MCP servers will not start; `airlok mcp reset-project-choices` asks again"
+        });
+        choices
     }
 
     /// Forgets that a server was started, so the next [`Agent::start_mcp`]

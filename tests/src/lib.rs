@@ -174,6 +174,9 @@ pub enum Shown {
     ConfirmCommand {
         command: String,
     },
+    ConfirmMcpProject {
+        servers: Vec<(String, String)>,
+    },
     ConfirmMcp {
         server: String,
         tool: String,
@@ -264,6 +267,9 @@ impl Output for RecordingOutput {
             },
             Confirmation::Command { command } => Shown::ConfirmCommand {
                 command: command.to_string(),
+            },
+            Confirmation::McpProject { servers } => Shown::ConfirmMcpProject {
+                servers: servers.to_vec(),
             },
             Confirmation::Mcp {
                 server,

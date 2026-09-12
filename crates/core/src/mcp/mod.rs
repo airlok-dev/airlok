@@ -15,6 +15,7 @@
 //! tool arguments everywhere, this included.
 
 pub mod json;
+pub mod project;
 pub mod trust;
 
 use std::path::{Component, Path, PathBuf};
@@ -72,6 +73,12 @@ pub enum State {
     Denied { tools: Vec<String> },
     /// `enabled = false`: not started.
     Disabled,
+    /// From the project's `.mcp.json` and not approved for this checkout
+    /// yet, so nothing was started. `command` is what would run.
+    Pending { command: String },
+    /// Asked about and declined. `airlok mcp reset-project-choices` asks
+    /// again.
+    Declined { command: String },
     /// Could not start, or could not list its tools.
     Failed { why: String },
 }
@@ -97,6 +104,16 @@ impl Status {
                 )
             }
             State::Disabled => format!("{}: disabled", self.server),
+            State::Pending { command } => format!(
+                "{} [{}]: not approved for this repository yet, would run: {command}",
+                self.server,
+                self.scope.as_str()
+            ),
+            State::Declined { command } => format!(
+                "{} [{}]: declined, would have run: {command}",
+                self.server,
+                self.scope.as_str()
+            ),
             State::Failed { why } => format!("{}: unavailable, {why}", self.server),
         }
     }
@@ -128,7 +145,11 @@ fn list(tools: &[String]) -> String {
 /// Starts every enabled server and returns the tools to offer the model,
 /// with one [`Status`] per configured server. A server that cannot start
 /// is reported and skipped: the run continues without it.
-pub async fn connect_all(servers: &[McpServer], cwd: &Path) -> (Vec<Box<dyn Tool>>, Vec<Status>) {
+pub async fn connect_all(
+    servers: &[McpServer],
+    cwd: &Path,
+    choices: &project::Choices,
+) -> (Vec<Box<dyn Tool>>, Vec<Status>) {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     let mut statuses = Vec::new();
     for server in servers {
@@ -138,6 +159,24 @@ pub async fn connect_all(servers: &[McpServer], cwd: &Path) -> (Vec<Box<dyn Tool
                 scope: server.scope,
                 root: server.root(),
                 state: State::Disabled,
+            });
+            continue;
+        }
+        // A server from the project's own file starts only once this
+        // checkout has been asked about it. Listing is not approving, so
+        // this is the one place that decides, and it never prompts.
+        if !project::allowed(server, choices) {
+            let command = project::what_runs(server);
+            let state = if project::undecided(server, choices) {
+                State::Pending { command }
+            } else {
+                State::Declined { command }
+            };
+            statuses.push(Status {
+                server: server.name.clone(),
+                scope: server.scope,
+                root: server.root(),
+                state,
             });
             continue;
         }

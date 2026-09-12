@@ -17,7 +17,7 @@ use airlok_core::config::{
     self, KeySource, McpScope, Overrides, ProviderConfig, ProviderName, Sources,
 };
 use airlok_core::context::{self, ContextInput};
-use airlok_core::mcp::{json, trust};
+use airlok_core::mcp::{json, project, trust};
 use airlok_core::redact::{Class, RedactionMap, Redactor, SecretRedactor};
 use airlok_core::repl::{Backend, Repl, Switch};
 use airlok_core::session::Summary;
@@ -429,7 +429,10 @@ async fn mcp_command(
                 println!("no MCP servers configured. `airlok mcp add` writes one, or add an [[mcp]] block to the config");
                 return Ok(());
             }
-            for status in airlok_core::mcp::connect_all(&config.mcp, &config.cwd)
+            // Listing never approves anything: a project server that has
+            // not been asked about is shown as pending and left alone.
+            let choices = project::load(&config.cwd);
+            for status in airlok_core::mcp::connect_all(&config.mcp, &config.cwd, &choices)
                 .await
                 .1
             {
@@ -452,6 +455,8 @@ async fn mcp_command(
         McpAction::Get { name } => mcp_get(config, &name),
         McpAction::Import { path, scope } => mcp_import(config, &path, scope),
         McpAction::Export { scope } => mcp_export(config, scope),
+        McpAction::AddJson { name, json, scope } => mcp_add_json(config, &name, &json, scope),
+        McpAction::ResetProjectChoices => mcp_reset_project_choices(config),
         McpAction::Trust { action } => mcp_trust(config, action),
         McpAction::Call {
             server,
@@ -597,6 +602,37 @@ fn mcp_export(config: &Config, scope: Option<ScopeArg>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `mcp add-json <name> '<json>'`: the entry exactly as another tool
+/// would write it, which is how a server is shared in a message or a
+/// README without spelling out flags.
+fn mcp_add_json(config: &Config, name: &str, text: &str, scope: ScopeArg) -> anyhow::Result<()> {
+    let entry: json::Entry =
+        serde_json::from_str(text).context("the entry must be a JSON object")?;
+    if entry.command.is_none() && entry.url.is_none() {
+        bail!("the entry needs a command or a url");
+    }
+    let path = scope_file(scope.into(), &config.cwd)?;
+    let mut file = json::read(&path).map_err(|e| anyhow!(e))?;
+    let replaced = file.servers.insert(name.to_string(), entry).is_some();
+    json::write(&path, &file).map_err(|e| anyhow!(e))?;
+    println!(
+        "{} {name} in {}",
+        if replaced { "replaced" } else { "added" },
+        path.display()
+    );
+    Ok(())
+}
+
+fn mcp_reset_project_choices(config: &Config) -> anyhow::Result<()> {
+    match project::reset(&config.cwd).map_err(|e| anyhow!(e))? {
+        true => println!(
+            "forgot what this repository answered about its own .mcp.json servers; the next run asks again"
+        ),
+        false => println!("this repository has not answered about its own .mcp.json servers"),
+    }
+    Ok(())
+}
+
 fn mcp_trust(config: &Config, action: TrustAction) -> anyhow::Result<()> {
     match action {
         TrustAction::List => {
@@ -632,6 +668,12 @@ async fn mcp_call(
         .ok_or_else(|| anyhow!("no MCP server called {server} in the config"))?;
     let arguments: serde_json::Value =
         serde_json::from_str(arguments).context("the arguments must be a JSON object")?;
+    if !project::allowed(configured, &project::load(&config.cwd)) {
+        bail!(
+            "{server} comes from this project's .mcp.json and has not been approved here. \
+             Start a session to be asked, or run `airlok mcp reset-project-choices` to be asked again"
+        );
+    }
     let connection = airlok_core::mcp::connect(configured, &config.cwd)
         .await
         .map_err(|why| anyhow!("{server}: {why}"))?;

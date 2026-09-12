@@ -31,6 +31,12 @@ pub enum Confirmation<'a> {
         root: Option<&'a str>,
         paths: &'a [String],
     },
+    /// The project's own `.mcp.json` names servers this checkout has not
+    /// been asked about. Each pair is a server and what it would run, so
+    /// the question is answerable without opening the file.
+    McpProject {
+        servers: &'a [(String, String)],
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -162,6 +162,75 @@ fn add_writes_the_user_scope_and_http_needs_a_url() {
 }
 
 #[test]
+fn listing_a_project_server_shows_it_pending_and_approves_nothing() {
+    let home = TempDir::new("mcp-cli-pending-home");
+    let project = TempDir::new("mcp-cli-pending-project");
+    let (home, project) = (home.path(), project.path());
+    // As it would arrive in a clone.
+    std::fs::write(
+        project.join(".mcp.json"),
+        r#"{ "mcpServers": { "fromclone": { "command": "npx", "args": ["-y", "pkg"] } } }"#,
+    )
+    .unwrap();
+
+    let (out, err, ok) = airlok(home, project, &["mcp", "list"]);
+    assert!(ok, "list failed: {err}");
+    assert!(
+        out.contains("not approved for this repository yet"),
+        "{out}"
+    );
+    assert!(out.contains("npx -y pkg"), "it says what would run: {out}");
+    assert!(
+        !project.join(".airlok/mcp-project.json").exists(),
+        "listing must not record an answer"
+    );
+
+    // And it will not be called behind the gate either.
+    let (_, err, ok) = airlok(home, project, &["mcp", "call", "fromclone", "echo", "{}"]);
+    assert!(!ok);
+    assert!(err.contains("has not been approved here"), "{err}");
+
+    let (out, err, ok) = airlok(home, project, &["mcp", "reset-project-choices"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("has not answered"), "{out}");
+}
+
+#[test]
+fn add_json_writes_an_entry_pasted_as_json() {
+    let home = TempDir::new("mcp-cli-addjson-home");
+    let project = TempDir::new("mcp-cli-addjson-project");
+    let (home, project) = (home.path(), project.path());
+
+    let (out, err, ok) = airlok(
+        home,
+        project,
+        &[
+            "mcp",
+            "add-json",
+            "docs",
+            r#"{"type":"http","url":"https://example.com/mcp","headers":{"Accept":"application/json"}}"#,
+            "--scope",
+            "project",
+        ],
+    );
+    assert!(ok, "add-json failed: {err}");
+    assert!(out.contains("added docs"), "{out}");
+
+    let written = std::fs::read_to_string(project.join(".mcp.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(
+        parsed["mcpServers"]["docs"]["url"],
+        "https://example.com/mcp"
+    );
+    assert_eq!(parsed["mcpServers"]["docs"]["type"], "http");
+
+    // An entry that names neither a command nor a url is a mistake.
+    let (_, err, ok) = airlok(home, project, &["mcp", "add-json", "empty", "{}"]);
+    assert!(!ok);
+    assert!(err.contains("needs a command or a url"), "{err}");
+}
+
+#[test]
 fn trust_list_says_when_nothing_is_remembered() {
     let home = TempDir::new("mcp-cli-trust-home");
     let project = TempDir::new("mcp-cli-trust-project");

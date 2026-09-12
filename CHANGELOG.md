@@ -2,6 +2,18 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.8.0] - 2026-09-12
+
+### Changed
+
+- A server from the project's own `.mcp.json` no longer starts until this checkout has been asked about it. On first sight of one, or of a definition that changed since the last answer, airlok lists the servers and the commands they would run and asks once; the answer is recorded per repository in `.airlok/`, which is gitignored. Until then the server is pending and nothing is started. This is a behaviour change: a project file that used to start servers on the first turn now waits for an answer. Servers from the user file, the local file, or a `[[mcp]]` block are unaffected.
+- `airlok mcp list` shows a pending server and what it would run, and listing never approves anything. `airlok mcp call` refuses a server this repository has not approved.
+
+### Added
+
+- `airlok mcp reset-project-choices` forgets the answer, so the next run asks again.
+- `airlok mcp add-json <name> '<json>'` writes a server from an entry pasted as JSON, which is how one is usually shared.
+
 ## [0.7.0] - 2026-09-12
 
 ### Changed
