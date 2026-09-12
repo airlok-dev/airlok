@@ -142,6 +142,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "what airlok asks about; set one with /permissions <name> <value>, or save",
     ),
     (
+        "/init",
+        "propose an AIRLOK.md for this repository, as a diff to approve",
+    ),
+    (
         "/goal",
         "show the session goal, set it with /goal <statement>, or /goal clear",
     ),
@@ -588,6 +592,7 @@ impl Repl<'_> {
             "status" => self.status(session, out),
             "context" => self.context_report(session, out),
             "permissions" => self.permissions(arg, session, out),
+            "init" => self.init(session, out),
             "btw" if arg.is_empty() => {
                 out.status("/btw <question> answers beside the task, without joining it")
             }
@@ -809,6 +814,47 @@ impl Repl<'_> {
             "reasoning effort {value} for {model} for the rest of this session"
         ));
         self.save(session, out);
+    }
+
+    /// Proposes an AIRLOK.md built from the repository, as a diff. Nothing
+    /// is written until the user approves it, and an existing file is only
+    /// ever replaced through that same diff.
+    fn init(&mut self, session: &mut Session, out: &mut dyn Output) {
+        let cwd = self.agent.config().cwd.clone();
+        let path = cwd.join(INSTRUCTION_FILES[0]);
+        let current = std::fs::read_to_string(&path).unwrap_or_default();
+        let proposed = crate::context::starter(&cwd);
+        if proposed == current {
+            out.status(&format!("{} already says this", path.display()));
+            return;
+        }
+        let diff = crate::tools::unified_diff(&path.display().to_string(), &current, &proposed);
+        match out.confirm(&Confirmation::Write {
+            path: &path,
+            diff: &diff,
+        }) {
+            Decision::Approve | Decision::ApproveAll | Decision::SaveAll => {
+                match std::fs::write(&path, &proposed) {
+                    Ok(()) => {
+                        out.status(&format!(
+                            "wrote {}{}",
+                            path.display(),
+                            if current.is_empty() {
+                                ""
+                            } else {
+                                " (replaced)"
+                            }
+                        ));
+                        if let Some(block) = self.backend.context() {
+                            self.agent.set_context_block(&block);
+                        }
+                        self.save(session, out);
+                    }
+                    Err(e) => out.status(&format!("cannot write {}: {e}", path.display())),
+                }
+            }
+            Decision::Reject | Decision::Quit => out.status("left AIRLOK.md alone"),
+        }
     }
 
     /// Shows what airlok asks about, changes one setting for the session,

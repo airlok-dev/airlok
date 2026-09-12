@@ -748,6 +748,55 @@ async fn an_unknown_effort_is_questioned_rather_than_taken() {
 }
 
 #[tokio::test]
+async fn init_proposes_a_diff_and_writes_nothing_until_approved() {
+    let dir = TempDir::new("repl-init");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "- always run the linter\n").unwrap();
+    let path = dir.path().join("AIRLOK.md");
+
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider, dir.path());
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["/init", "/init"]);
+    let mut out = RecordingOutput::default();
+    out.decisions.push_back(Decision::Reject);
+    out.decisions.push_back(Decision::Approve);
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let proposals: Vec<&Shown> = out
+        .events
+        .iter()
+        .filter(|e| matches!(e, Shown::ConfirmWrite { .. }))
+        .collect();
+    assert_eq!(proposals.len(), 2, "both asked: {:?}", out.events);
+    assert!(
+        out.statuses().iter().any(|l| l == "left AIRLOK.md alone"),
+        "the rejected one wrote nothing: {:?}",
+        out.statuses()
+    );
+
+    let written = std::fs::read_to_string(&path).expect("the approved one wrote it");
+    assert!(written.contains("cargo test"), "{written}");
+    assert!(
+        written.contains("always run the linter"),
+        "AGENTS.md was carried over: {written}"
+    );
+}
+
+#[tokio::test]
 async fn unallowing_an_entry_makes_the_next_bash_call_ask() {
     let dir = TempDir::new("repl-permissions-allow");
     // Two turns, each running the same allow-listed command.

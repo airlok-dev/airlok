@@ -33,6 +33,79 @@ pub struct ContextBlock {
     pub instruction_bytes: usize,
 }
 
+/// A first AIRLOK.md for this repository: what it is, how it builds and
+/// tests, its top-level layout, and anything an existing CLAUDE.md or
+/// AGENTS.md already says. Proposed to the user, never written here.
+pub fn starter(cwd: &Path) -> String {
+    let git = GitInfo::detect(cwd);
+    let root = git
+        .as_ref()
+        .map(|g| g.toplevel.clone())
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "this project".to_string());
+
+    let mut out = format!(
+        "# AIRLOK.md\n\nHow airlok should work in {name}. Edit freely: airlok reads this \
+         file at the start of every session.\n"
+    );
+
+    let commands = build_commands(&root);
+    out.push_str("\n## Build and test\n\n");
+    if commands.is_empty() {
+        out.push_str("- No build system was detected. Add the commands to build and test here.\n");
+    } else {
+        for (what, command) in &commands {
+            out.push_str(&format!("- {what}: `{command}`\n"));
+        }
+    }
+
+    out.push_str("\n## Layout\n\n");
+    out.push_str(tree_section(&root, true).trim_start_matches("\n## Files\n\n"));
+
+    for name in INSTRUCTION_FILES.iter().skip(1) {
+        let path = root.join(name);
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            out.push_str(&format!(
+                "\n## Carried over from {name}\n\n{}\n",
+                body.trim_end()
+            ));
+            break;
+        }
+    }
+    out
+}
+
+/// Conventional build and test commands for whatever marker files are in
+/// `root`. Only what is actually there, so nothing is invented.
+fn build_commands(root: &Path) -> Vec<(&'static str, &'static str)> {
+    let has = |name: &str| root.join(name).exists();
+    let mut out = Vec::new();
+    if has("Cargo.toml") {
+        out.push(("build", "cargo build"));
+        out.push(("test", "cargo test"));
+    }
+    if has("package.json") {
+        out.push(("build", "npm run build"));
+        out.push(("test", "npm test"));
+    }
+    if has("go.mod") {
+        out.push(("build", "go build ./..."));
+        out.push(("test", "go test ./..."));
+    }
+    if has("pyproject.toml") || has("setup.py") {
+        out.push(("test", "pytest"));
+    }
+    if has("justfile") || has("Justfile") {
+        out.push(("tasks", "just --list"));
+    } else if has("Makefile") {
+        out.push(("tasks", "make help"));
+    }
+    out
+}
+
 /// The current git branch of `cwd`, when it is in a repository at all.
 pub fn branch(cwd: &Path) -> Option<String> {
     GitInfo::detect(cwd).map(|git| git.branch)
