@@ -8,8 +8,8 @@
 //! TODO(stage N): subagents.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use airlok_llm::{
     ContentBlock, Message, Provider, Request, Response, StopReason, StreamEvent, ToolSpec,
@@ -49,6 +49,10 @@ pub struct Agent {
     mcp_started: HashSet<String>,
     /// The last thing each of them did, for `/mcp` and `airlok mcp list`.
     mcp_statuses: Vec<mcp::Status>,
+    /// Files written this turn, with what was on disk just before, waiting
+    /// to be recorded in the session. Executing a tool only has `&self`,
+    /// so observations collect here and the turn drains them.
+    observed_writes: Mutex<Vec<(PathBuf, Option<String>)>>,
 }
 
 /// Where the context window goes, in bytes. `instructions` is a share of
@@ -119,6 +123,7 @@ impl Agent {
             plan: None,
             mcp_started: HashSet::new(),
             mcp_statuses: Vec::new(),
+            observed_writes: Mutex::new(Vec::new()),
         }
     }
 
@@ -643,6 +648,14 @@ impl Agent {
             } else {
                 Vec::new()
             };
+            for (path, before) in self
+                .observed_writes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..)
+            {
+                session.record_write(&path, before);
+            }
             session.redactions = map;
             session.messages.push(Message::assistant(response.content));
             session.touch();
@@ -911,43 +924,63 @@ impl Agent {
         out: &mut dyn Output,
         approved: &mut Approved,
     ) -> Result<(String, bool), CoreError> {
-        Ok(match self.gate(tool, input, out, approved).await {
-            Ok(Gate::Proceed) => {
-                info!(tool = %name, "executing");
-                match tool.execute(input.clone()).await {
-                    Ok(output) => (truncate_output(output), false),
-                    Err(e) => {
-                        warn!(tool = %name, error = %e, "tool failed");
-                        (format!("error: {e}"), true)
+        let mut wrote = None;
+        Ok(
+            match self.gate(tool, input, out, approved, &mut wrote).await {
+                Ok(Gate::Proceed) => {
+                    info!(tool = %name, "executing");
+                    // Read before executing: for a path airlok has not touched
+                    // yet, this is the state the session started from.
+                    let before = wrote
+                        .as_ref()
+                        .and_then(|path| std::fs::read_to_string(path).ok());
+                    match tool.execute(input.clone()).await {
+                        Ok(output) => {
+                            if let Some(path) = wrote {
+                                self.observed_writes
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push((path, before));
+                            }
+                            (truncate_output(output), false)
+                        }
+                        Err(e) => {
+                            warn!(tool = %name, error = %e, "tool failed");
+                            (format!("error: {e}"), true)
+                        }
                     }
                 }
-            }
-            Ok(Gate::Stop(reason)) => {
-                info!(tool = %name, "not executed");
-                (reason, true)
-            }
-            Ok(Gate::Abort) => {
-                info!(tool = %name, "run aborted by the user");
-                return Err(CoreError::Aborted);
-            }
-            Err(e) => {
-                warn!(tool = %name, error = %e, "tool could not be planned");
-                (format!("error: {e}"), true)
-            }
-        })
+                Ok(Gate::Stop(reason)) => {
+                    info!(tool = %name, "not executed");
+                    (reason, true)
+                }
+                Ok(Gate::Abort) => {
+                    info!(tool = %name, "run aborted by the user");
+                    return Err(CoreError::Aborted);
+                }
+                Err(e) => {
+                    warn!(tool = %name, error = %e, "tool could not be planned");
+                    (format!("error: {e}"), true)
+                }
+            },
+        )
     }
 
+    /// `wrote` is set to the path when the plan is a write, whether or not
+    /// it is confirmed, so the caller can capture what was there first.
     async fn gate(
         &self,
         tool: &dyn Tool,
         input: &Value,
         out: &mut dyn Output,
         approved: &mut Approved,
+        wrote: &mut Option<PathBuf>,
     ) -> Result<Gate, ToolError> {
         let safety = &self.config.safety;
         let gate = match tool.plan(input).await? {
             Plan::Safe => Gate::Proceed,
             Plan::Write { path, diff } => {
+                *wrote = Some(path.clone());
                 if !safety.confirm_writes || approved.writes {
                     return Ok(Gate::Proceed);
                 }

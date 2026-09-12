@@ -25,7 +25,9 @@ dependencies = [
  "airlok-llm",
  "airlok-tests",
  "anyhow",
+ "async-trait",
  "clap",
+ "futures",
  "ignore",
  "libc",
  "rustyline",
@@ -82,6 +84,7 @@ version = "0.8.2"
 dependencies = [
  "airlok-core",
  "airlok-llm",
+ "async-trait",
  "futures",
  "serde_json",
  "tokio",

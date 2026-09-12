@@ -749,6 +749,92 @@ async fn an_unknown_effort_is_questioned_rather_than_taken() {
 }
 
 #[tokio::test]
+async fn diff_shows_only_what_this_session_wrote() {
+    let dir = TempDir::new("repl-diff");
+    // One file that existed before the session, one the session creates,
+    // and one it never touches.
+    std::fs::write(dir.path().join("kept.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(dir.path().join("untouched.txt"), "not mine\n").unwrap();
+
+    let provider = MockProvider::scripted(vec![
+        tool_call(
+            "toolu_1",
+            "write_file",
+            json!({"path": "kept.txt", "content": "one\nTWO\n"}),
+        ),
+        tool_call(
+            "toolu_2",
+            "write_file",
+            json!({"path": "fresh.txt", "content": "brand new\n"}),
+        ),
+        reply("done"),
+    ]);
+    let mut agent = agent(provider, dir.path());
+    agent.config_mut().safety.confirm_writes = false;
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["change things", "/diff"]);
+    let mut out = RecordingOutput::default();
+    let session = {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await
+    };
+
+    let paths: Vec<&str> = session.writes.iter().map(|w| w.path.as_str()).collect();
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    assert!(paths.iter().any(|p| p.ends_with("kept.txt")), "{paths:?}");
+    assert!(paths.iter().any(|p| p.ends_with("fresh.txt")), "{paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.ends_with("untouched.txt")),
+        "a file airlok never wrote is not in the session: {paths:?}"
+    );
+
+    let existed: Vec<bool> = session.writes.iter().map(|w| w.existed).collect();
+    assert_eq!(existed, vec![true, false], "{:?}", session.writes);
+
+    let shown = out.statuses().join("\n");
+    assert!(shown.contains("kept.txt"), "{shown}");
+    assert!(shown.contains("TWO"), "the change is in the diff: {shown}");
+    assert!(
+        !shown.contains("not mine"),
+        "nothing from an untouched file: {shown}"
+    );
+}
+
+#[tokio::test]
+async fn diff_says_so_when_nothing_was_written() {
+    let dir = TempDir::new("repl-diff-empty");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider, dir.path());
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["/diff"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    assert!(
+        out.statuses()
+            .iter()
+            .any(|l| l == "airlok has not written anything this session"),
+        "{:?}",
+        out.statuses()
+    );
+}
+
+#[tokio::test]
 async fn init_proposes_a_diff_and_writes_nothing_until_approved() {
     let dir = TempDir::new("repl-init");
     std::fs::write(

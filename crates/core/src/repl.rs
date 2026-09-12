@@ -189,6 +189,14 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "propose an AIRLOK.md for this repository, as a diff to approve",
     ),
     (
+        "/copy",
+        "copy the last reply to the clipboard; /copy 2 for the one before, /copy code",
+    ),
+    (
+        "/diff",
+        "what airlok changed on disk this session; /diff <path> for one file",
+    ),
+    (
         "/doctor",
         "check config, key, provider, MCP servers, git, terminal and storage",
     ),
@@ -232,6 +240,78 @@ pub fn resolve_command(name: &str) -> Resolved {
 
 /// How many ids to print when there is no terminal to pick with.
 const MENU_CHOICES: usize = 10;
+
+/// The body of the last fenced code block in `text`, without its fences.
+fn fenced_block(text: &str) -> Option<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            match current.take() {
+                Some(body) => blocks.push(body.join("\n")),
+                None => current = Some(Vec::new()),
+            }
+            continue;
+        }
+        if let Some(body) = current.as_mut() {
+            body.push(line);
+        }
+    }
+    blocks.pop()
+}
+
+/// Hands `text` to whichever clipboard program this system has. Says so
+/// plainly when it has none, rather than looking like it worked.
+fn to_clipboard(text: &str) -> Result<&'static str, String> {
+    to_clipboard_with(CLIPBOARD_PROGRAMS, text)
+}
+
+/// The clipboard programs tried, in order, on the systems airlok runs on.
+const CLIPBOARD_PROGRAMS: &[(&str, &[&str])] = &[
+    ("pbcopy", &[]),
+    ("wl-copy", &[]),
+    ("xclip", &["-selection", "clipboard"]),
+    ("xsel", &["--clipboard", "--input"]),
+];
+
+fn to_clipboard_with(
+    programs: &[(&'static str, &'static [&'static str])],
+    text: &str,
+) -> Result<&'static str, String> {
+    let mut tried = Vec::new();
+    for (program, args) in programs {
+        let mut child = match std::process::Command::new(program)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => {
+                tried.push(*program);
+                continue;
+            }
+        };
+        let wrote = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| format!("{program} took no input"))
+            .and_then(|stdin| stdin.write_all(text.as_bytes()).map_err(|e| e.to_string()));
+        if let Err(e) = wrote {
+            return Err(format!("{program} failed: {e}"));
+        }
+        return match child.wait() {
+            Ok(status) if status.success() => Ok(program),
+            Ok(status) => Err(format!("{program} exited with {status}")),
+            Err(e) => Err(format!("{program} failed: {e}")),
+        };
+    }
+    Err(format!(
+        "no clipboard program found; tried {}",
+        tried.join(", ")
+    ))
+}
 
 /// The settings `/permissions` can change, for Tab and for the error.
 pub const PERMISSION_NAMES: &[&str] = &[
@@ -384,6 +464,11 @@ impl Repl<'_> {
         );
         candidates.insert("effort", self.effort_choices());
         candidates.insert("goal", vec!["clear".to_string()]);
+        candidates.insert("copy", vec!["code".to_string()]);
+        candidates.insert(
+            "diff",
+            session.writes.iter().map(|w| w.path.clone()).collect(),
+        );
         candidates.insert(
             "permissions",
             PERMISSION_NAMES
@@ -640,6 +725,8 @@ impl Repl<'_> {
             "context" => self.context_report(session, out),
             "permissions" => self.permissions(arg, session, out),
             "init" => self.init(session, out),
+            "copy" => self.copy(arg, session, out),
+            "diff" => self.diff_command(arg, session, out),
             "doctor" => {
                 let checks = self.backend.doctor().await;
                 if checks.is_empty() {
@@ -876,6 +963,114 @@ impl Repl<'_> {
             "reasoning effort {value} for {model} for the rest of this session"
         ));
         self.save(session, out);
+    }
+
+    /// What airlok changed on disk this session: each recorded file diffed
+    /// from what was there before its first write, against what is there
+    /// now. A path whose original was too large to keep says so rather
+    /// than showing a misleading diff.
+    fn diff_command(&mut self, arg: &str, session: &Session, out: &mut dyn Output) {
+        if session.writes.is_empty() {
+            out.status("airlok has not written anything this session");
+            return;
+        }
+        let arg = arg.trim();
+        let wanted: Vec<&crate::session::WriteRecord> = if arg.is_empty() {
+            session.writes.iter().collect()
+        } else {
+            let joined = self.agent.config().cwd.join(arg).display().to_string();
+            session
+                .writes
+                .iter()
+                .filter(|w| w.path == arg || w.path == joined || w.path.ends_with(arg))
+                .collect()
+        };
+        if wanted.is_empty() {
+            out.status(&format!("{arg} was not written this session"));
+            return;
+        }
+        for record in wanted {
+            let current = std::fs::read_to_string(&record.path).unwrap_or_default();
+            match &record.original {
+                None => out.status(&format!(
+                    "{}: changed, original too large to show",
+                    record.path
+                )),
+                Some(original) if original == &current => {
+                    out.status(&format!("{}: back to how it started", record.path))
+                }
+                Some(original) => {
+                    let diff = crate::tools::unified_diff(&record.path, original, &current);
+                    out.diff(&record.path, &diff);
+                }
+            }
+        }
+    }
+
+    /// Puts a reply on the clipboard: the last one, the Nth from last, or
+    /// the last fenced code block.
+    fn copy(&mut self, arg: &str, session: &Session, out: &mut dyn Output) {
+        let replies: Vec<String> = session
+            .messages
+            .iter()
+            .filter(|m| m.role == airlok_llm::Role::Assistant)
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        airlok_llm::ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|text| !text.trim().is_empty())
+            .collect();
+
+        let arg = arg.trim();
+        let (what, text) = if arg == "code" {
+            match replies.iter().rev().find_map(|reply| fenced_block(reply)) {
+                Some(block) => ("the last code block".to_string(), block),
+                None => return out.status("no fenced code block in this session"),
+            }
+        } else {
+            let nth = if arg.is_empty() {
+                1
+            } else {
+                match arg.parse::<usize>() {
+                    Ok(n) if n >= 1 => n,
+                    _ => return out.status("/copy takes a number from the end, or `code`"),
+                }
+            };
+            match replies
+                .len()
+                .checked_sub(nth)
+                .and_then(|at| replies.get(at))
+            {
+                Some(text) => (
+                    if nth == 1 {
+                        "the last reply".to_string()
+                    } else {
+                        format!("reply {nth} from the end")
+                    },
+                    text.clone(),
+                ),
+                None => {
+                    return out.status(&format!(
+                        "there are only {} replies in this session",
+                        replies.len()
+                    ))
+                }
+            }
+        };
+
+        match to_clipboard(&text) {
+            Ok(program) => out.status(&format!(
+                "copied {what} ({} characters) with {program}",
+                text.chars().count()
+            )),
+            Err(why) => out.status(&why),
+        }
     }
 
     /// Proposes an AIRLOK.md built from the repository, as a diff. Nothing
@@ -1288,6 +1483,20 @@ pub fn cost_lines(session: &Session, context_window: u64) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_clipboard_program_is_reported_rather_than_silently_doing_nothing() {
+        let err = to_clipboard_with(&[("airlok-no-such-clipboard", &[])], "hello").unwrap_err();
+        assert!(err.contains("no clipboard program found"), "{err}");
+        assert!(err.contains("airlok-no-such-clipboard"), "{err}");
+    }
+
+    #[test]
+    fn the_last_fenced_block_is_what_copy_code_takes() {
+        let reply = "first\n\n```sh\nls -l\n```\n\nthen\n\n```rust\nfn main() {}\n```\n";
+        assert_eq!(fenced_block(reply).unwrap(), "fn main() {}");
+        assert_eq!(fenced_block("no fences here"), None);
+    }
+
     #[test]
     fn a_check_reads_as_pass_or_fail_on_its_own() {
         let good = Check::pass("git", "on main");

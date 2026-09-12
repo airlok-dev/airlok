@@ -476,18 +476,26 @@ mod tests {
         let menu = prompt.menu("/co", 3).unwrap();
         let lines: Vec<&str> = menu.display().lines().collect();
         assert_eq!(lines[0], "st", "the rest of /cost, inline");
-        assert_eq!(lines.len(), 5, "{lines:?}");
-        assert!(lines[1].starts_with("  /cost ") && lines[1].contains("tokens used"));
-        assert!(lines[2].starts_with("  /compact "));
-        assert!(lines[3].starts_with("  /config "));
-        assert!(lines[4].starts_with("  /context "));
+        // Computed from COMMANDS, so adding a command does not mean
+        // editing a literal here for the fourth time.
+        let matching: Vec<&str> = COMMANDS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| name.starts_with("/co"))
+            .collect();
+        assert!(matching.len() >= 4, "{matching:?}");
+        assert_eq!(lines.len(), 1 + matching.len(), "{lines:?}");
+        for (line, name) in lines[1..].iter().zip(&matching) {
+            assert!(
+                line.starts_with(&format!("  {name} ")),
+                "{line:?} vs {name}"
+            );
+        }
+        assert!(lines[1].contains("tokens used"), "{lines:?}");
         assert_eq!(menu.completion(), Some("st"));
         let (start, pairs) = prompt.candidates("/co", 3);
         assert_eq!(start, 0);
-        assert_eq!(
-            replacements(&pairs),
-            ["/cost", "/compact", "/config", "/context"]
-        );
+        assert_eq!(replacements(&pairs), matching);
         let all = prompt.menu("/", 1).unwrap();
         assert_eq!(
             all.display().lines().count(),

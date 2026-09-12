@@ -205,6 +205,18 @@ impl Output for Stdout {
         }
     }
 
+    fn diff(&mut self, path: &str, unified: &str) {
+        let colors = std::env::var_os("NO_COLOR").is_none().then(highlighting);
+        let lines = diff::render(path, unified, colors);
+        let (page, rest) = lines.split_at(lines.len().min(diff::PAGE));
+        for line in page {
+            self.status(line);
+        }
+        if !rest.is_empty() {
+            self.status(&diff::more_lines(rest.len()));
+        }
+    }
+
     fn confirm(&mut self, request: &Confirmation<'_>) -> Decision {
         self.end_line();
         self.flush_collapsed();

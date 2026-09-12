@@ -40,7 +40,31 @@ pub struct Session {
     /// the system prompt every turn and survives a resume.
     #[serde(default)]
     pub goal: Option<String>,
+    /// Every file airlok wrote or edited this session, in the order they
+    /// were first touched.
+    #[serde(default)]
+    pub writes: Vec<WriteRecord>,
 }
+
+/// One file airlok changed. The original is kept so `/diff` can show what
+/// the session did, under a cap so a session file cannot grow without
+/// bound; past it only the path and hashes remain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WriteRecord {
+    pub path: String,
+    /// Hash of what was on disk before airlok first wrote this path.
+    pub first_seen_hash: String,
+    /// RFC 3339, UTC, of the most recent write.
+    pub last_write: String,
+    /// Whether the file existed before airlok first wrote it.
+    pub existed: bool,
+    /// What was there before that first write. `None` when it was too
+    /// large to keep, which `/diff` says rather than showing nothing.
+    pub original: Option<String>,
+}
+
+/// How much original content one session keeps, across every path.
+pub const ORIGINALS_BUDGET: usize = 1_000_000;
 
 /// Token accounting for the session.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -125,10 +149,39 @@ impl Session {
             resumed_at: Vec::new(),
             interrupted: false,
             goal: None,
+            writes: Vec::new(),
         }
     }
 
     /// The first thing the user asked, for listings.
+    /// Notes that airlok wrote `path`. `before` is what was on disk just
+    /// before this write, or `None` when there was no file. Only the first
+    /// write to a path keeps an original, since that is the state the
+    /// session started from.
+    pub fn record_write(&mut self, path: &Path, before: Option<String>) {
+        let path = path.display().to_string();
+        let now = now_rfc3339();
+        if let Some(seen) = self.writes.iter_mut().find(|w| w.path == path) {
+            seen.last_write = now;
+            return;
+        }
+        let existed = before.is_some();
+        let body = before.unwrap_or_default();
+        let kept: usize = self
+            .writes
+            .iter()
+            .filter_map(|w| w.original.as_ref().map(String::len))
+            .sum();
+        let original = (kept + body.len() <= ORIGINALS_BUDGET).then(|| body.clone());
+        self.writes.push(WriteRecord {
+            path,
+            first_seen_hash: format!("{:016x}", fnv1a(body.as_bytes())),
+            last_write: now,
+            existed,
+            original,
+        });
+    }
+
     pub fn first_prompt(&self) -> Option<&str> {
         self.messages.iter().find_map(|m| match m.content.first() {
             Some(airlok_llm::ContentBlock::Text { text }) if m.role == airlok_llm::Role::User => {
