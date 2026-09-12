@@ -743,6 +743,80 @@ async fn an_unknown_effort_is_questioned_rather_than_taken() {
 }
 
 #[tokio::test]
+async fn a_goal_reaches_the_request_and_the_footer() {
+    let dir = TempDir::new("repl-goal");
+    let provider = MockProvider::scripted(vec![reply("working on it")]);
+    let mut agent = agent(provider.clone(), dir.path());
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&["/goal ship 0.9.0", "do the thing"]);
+    let mut out = RecordingOutput::default();
+    let session = {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await
+    };
+
+    assert_eq!(session.goal.as_deref(), Some("ship 0.9.0"));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(
+        requests[0].system.contains("ship 0.9.0"),
+        "the goal is in the system prompt: {}",
+        requests[0].system
+    );
+    let statuses = out.statuses();
+    assert!(
+        statuses
+            .iter()
+            .any(|line| line.contains("goal: ship 0.9.0")),
+        "{statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_goal_can_be_shown_and_cleared() {
+    let dir = TempDir::new("repl-goal-clear");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider, dir.path());
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&[
+        "/goal",
+        "/goal keep it green",
+        "/goal",
+        "/goal clear",
+        "/goal",
+    ]);
+    let mut out = RecordingOutput::default();
+    let session = {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await
+    };
+
+    assert_eq!(session.goal, None, "cleared");
+    let statuses = out.statuses();
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|l| l.starts_with("no goal set"))
+            .count(),
+        2,
+        "before it was set and after it was cleared: {statuses:?}"
+    );
+    assert!(statuses.iter().any(|l| l == "goal cleared"), "{statuses:?}");
+}
+
+#[tokio::test]
 async fn an_unknown_model_id_is_questioned_rather_than_taken() {
     let dir = TempDir::new("repl-unknown-model");
     let provider = MockProvider::scripted(vec![reply("hi")]);

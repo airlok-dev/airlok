@@ -36,6 +36,10 @@ pub struct Session {
     pub resumed_at: Vec<String>,
     /// The last turn was cut short by the user.
     pub interrupted: bool,
+    /// What the user asked airlok to work toward, from `/goal`. Goes into
+    /// the system prompt every turn and survives a resume.
+    #[serde(default)]
+    pub goal: Option<String>,
 }
 
 /// Token accounting for the session.
@@ -120,6 +124,7 @@ impl Session {
             compactions: Vec::new(),
             resumed_at: Vec::new(),
             interrupted: false,
+            goal: None,
         }
     }
 

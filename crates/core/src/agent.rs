@@ -1009,6 +1009,17 @@ fn system_prompt(
         prompt.push_str("\n\n");
         prompt.push_str(note);
     }
+    if let Some(goal) = session
+        .goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+    {
+        prompt.push_str(&format!(
+            "\n\nThe user set this goal for the session: {goal}\n\
+             Work toward it. When you believe it is met, say so plainly and say why."
+        ));
+    }
     if let Some(note) = plan_note {
         prompt.push_str("\n\n");
         prompt.push_str(note);

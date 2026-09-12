@@ -113,6 +113,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/redactions",
         "what was redacted before leaving this machine",
     ),
+    (
+        "/goal",
+        "show the session goal, set it with /goal <statement>, or /goal clear",
+    ),
     ("/clear", "start a new session; the current one stays saved"),
     ("/exit", "save and quit; Ctrl-D does the same"),
 ];
@@ -149,6 +153,16 @@ pub fn resolve_command(name: &str) -> Resolved {
 
 /// How many ids to print when there is no terminal to pick with.
 const MENU_CHOICES: usize = 10;
+
+/// The first line of `text`, cut to `width` columns with an ellipsis.
+fn first_line(text: &str, width: usize) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= width {
+        return line.to_string();
+    }
+    let kept: String = line.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}\u{2026}")
+}
 
 /// The known ids closest to `typed`, nearest first, and only ones close
 /// enough to be worth naming.
@@ -263,6 +277,7 @@ impl Repl<'_> {
             ],
         );
         candidates.insert("effort", self.effort_choices());
+        candidates.insert("goal", vec!["clear".to_string()]);
         candidates
     }
 
@@ -334,8 +349,15 @@ impl Repl<'_> {
         let percent = (session.usage.context_tokens * 100)
             .checked_div(config.provider.context_window)
             .unwrap_or(0);
+        let goal = session
+            .goal
+            .as_deref()
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+            .map(|g| format!(" · goal: {}", first_line(g, 40)))
+            .unwrap_or_default();
         format!(
-            "{} · context {percent}% · session {}",
+            "{} · context {percent}% · session {}{goal}",
             config.provider.model, session.id
         )
     }
@@ -483,6 +505,23 @@ impl Repl<'_> {
             "mcp" => self.enable_mcp(arg, out).await,
             "plan" => self.toggle_plan(out),
             "go" => self.go(session, out).await,
+            "goal" if arg.is_empty() => match session.goal.as_deref() {
+                Some(goal) => {
+                    out.status(&format!("goal: {goal}"));
+                    out.status("/goal <statement> replaces it, /goal clear removes it");
+                }
+                None => out.status("no goal set; /goal <statement> sets one"),
+            },
+            "goal" if arg.trim() == "clear" => {
+                session.goal = None;
+                out.status("goal cleared");
+                self.save(session, out);
+            }
+            "goal" => {
+                session.goal = Some(arg.trim().to_string());
+                out.status(&format!("goal: {}", arg.trim()));
+                self.save(session, out);
+            }
             "exit" => return Flow::Exit,
             other => unreachable!("/{other} is in COMMANDS but not handled"),
         }
