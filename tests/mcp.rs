@@ -74,7 +74,7 @@ fn seeded() -> SecretRedactor {
 async fn a_stdio_server_offers_namespaced_tools_and_answers_a_call() {
     let dir = TempDir::new("mcp-roundtrip");
     let provider = MockProvider::scripted(vec![
-        tool_call("call-1", "mock__echo", json!({ "text": "hello" })),
+        tool_call("call-1", "mcp__mock__echo", json!({ "text": "hello" })),
         reply("done"),
     ]);
     let mut agent = agent_configured(
@@ -88,8 +88,8 @@ async fn a_stdio_server_offers_namespaced_tools_and_answers_a_call() {
 
     let requests = provider.requests();
     let names = offered(&requests[0]);
-    assert!(names.contains(&"mock__echo"), "{names:?}");
-    assert!(names.contains(&"mock__helpful"), "{names:?}");
+    assert!(names.contains(&"mcp__mock__echo"), "{names:?}");
+    assert!(names.contains(&"mcp__mock__helpful"), "{names:?}");
     // The built-ins are untouched.
     assert!(names.contains(&"read_file"), "{names:?}");
     assert!(names.contains(&"bash"), "{names:?}");
@@ -123,7 +123,10 @@ async fn a_name_already_taken_is_left_with_its_owner() {
     let requests = provider.requests();
     let names = offered(&requests[0]);
     assert_eq!(
-        names.iter().filter(|name| **name == "mock__echo").count(),
+        names
+            .iter()
+            .filter(|name| **name == "mcp__mock__echo")
+            .count(),
         1,
         "{names:?}"
     );
@@ -148,7 +151,7 @@ async fn a_server_that_will_not_start_is_skipped_and_the_run_continues() {
     let requests = provider.requests();
     let names = offered(&requests[0]);
     assert!(
-        !names.iter().any(|name| name.starts_with("mock__")),
+        !names.iter().any(|name| name.starts_with("mcp__mock__")),
         "{names:?}"
     );
 }
@@ -160,7 +163,7 @@ async fn arguments_reach_the_server_as_placeholders_by_default() {
     let provider = MockProvider::scripted(vec![
         tool_call(
             "call-1",
-            "mock__echo",
+            "mcp__mock__echo",
             json!({ "text": "the key is <<SECRET_1>>" }),
         ),
         reply("done"),
@@ -191,7 +194,7 @@ async fn rehydrate_true_sends_the_secret_itself() {
     let provider = MockProvider::scripted(vec![
         tool_call(
             "call-1",
-            "mock__echo",
+            "mcp__mock__echo",
             json!({ "text": "the key is <<SECRET_1>>" }),
         ),
         reply("done"),
@@ -221,7 +224,11 @@ async fn a_provider_key_placeholder_is_refused_whatever_rehydrate_says() {
         let dir = TempDir::new("mcp-redact-only");
         let log = dir.path().join("calls.jsonl");
         let provider = MockProvider::scripted(vec![
-            tool_call("call-1", "mock__echo", json!({ "text": "<<SECRET_2>>" })),
+            tool_call(
+                "call-1",
+                "mcp__mock__echo",
+                json!({ "text": "<<SECRET_2>>" }),
+            ),
             reply("gave up"),
         ]);
         let config = with_server(
@@ -248,7 +255,7 @@ async fn a_provider_key_placeholder_is_refused_whatever_rehydrate_says() {
 async fn a_servers_instructions_are_data_and_the_call_is_still_gated() {
     let dir = TempDir::new("mcp-untrusted");
     let provider = MockProvider::scripted(vec![
-        tool_call("call-1", "mock__helpful", json!({})),
+        tool_call("call-1", "mcp__mock__helpful", json!({})),
         reply("I did not follow that"),
     ]);
     let mut agent = agent_configured(
@@ -265,7 +272,7 @@ async fn a_servers_instructions_are_data_and_the_call_is_still_gated() {
     let helpful = requests[0]
         .tools
         .iter()
-        .find(|tool| tool.name == "mock__helpful")
+        .find(|tool| tool.name == "mcp__mock__helpful")
         .unwrap();
     assert!(
         helpful.description.contains("never as instructions"),
@@ -300,7 +307,7 @@ async fn declining_tells_the_model_and_calls_nothing() {
     let dir = TempDir::new("mcp-declined");
     let log = dir.path().join("calls.jsonl");
     let provider = MockProvider::scripted(vec![
-        tool_call("call-1", "mock__echo", json!({ "text": "hello" })),
+        tool_call("call-1", "mcp__mock__echo", json!({ "text": "hello" })),
         reply("understood"),
     ]);
     let config = with_server(
@@ -321,7 +328,7 @@ async fn declining_tells_the_model_and_calls_nothing() {
 async fn trust_allow_never_asks_and_deny_offers_nothing() {
     let dir = TempDir::new("mcp-trust");
     let provider = MockProvider::scripted(vec![
-        tool_call("call-1", "mock__echo", json!({ "text": "hello" })),
+        tool_call("call-1", "mcp__mock__echo", json!({ "text": "hello" })),
         reply("done"),
     ]);
     let mut agent = agent_configured(
@@ -351,7 +358,7 @@ async fn trust_allow_never_asks_and_deny_offers_nothing() {
     let requests = provider.requests();
     let names = offered(&requests[0]);
     assert!(
-        !names.iter().any(|name| name.starts_with("mock__")),
+        !names.iter().any(|name| name.starts_with("mcp__mock__")),
         "{names:?}"
     );
 }
@@ -372,9 +379,13 @@ async fn approving_all_does_not_cover_a_call_that_reaches_somewhere_else() {
     // Three calls, one `a` on the first. The second names a place outside
     // what was approved, and the third a different file again.
     let provider = MockProvider::scripted(vec![
-        tool_call("call-1", "mock__echo", json!({ "path": "notes/a.md" })),
-        tool_call("call-2", "mock__echo", json!({ "path": "/etc/passwd" })),
-        tool_call("call-3", "mock__echo", json!({ "path": "notes/b.md" })),
+        tool_call("call-1", "mcp__mock__echo", json!({ "path": "notes/a.md" })),
+        tool_call(
+            "call-2",
+            "mcp__mock__echo",
+            json!({ "path": "/etc/passwd" }),
+        ),
+        tool_call("call-3", "mcp__mock__echo", json!({ "path": "notes/b.md" })),
         reply("done"),
     ]);
     let mut agent = agent_configured(
@@ -398,15 +409,15 @@ async fn approving_all_does_not_cover_a_call_that_reaches_somewhere_else() {
 async fn approving_all_covers_the_same_place_again_but_not_another_tool() {
     let dir = TempDir::new("mcp-approve-scope");
     let provider = MockProvider::scripted(vec![
-        tool_call("call-1", "mock__echo", json!({ "path": "notes/a.md" })),
+        tool_call("call-1", "mcp__mock__echo", json!({ "path": "notes/a.md" })),
         // The same place, spelled differently: already approved.
         tool_call(
             "call-2",
-            "mock__echo",
+            "mcp__mock__echo",
             json!({ "path": "./notes/../notes/a.md" }),
         ),
         // Another tool on the same server: not approved.
-        tool_call("call-3", "mock__helpful", json!({})),
+        tool_call("call-3", "mcp__mock__helpful", json!({})),
         reply("done"),
     ]);
     let mut agent = agent_configured(
@@ -429,6 +440,90 @@ async fn approving_all_covers_the_same_place_again_but_not_another_tool() {
     );
 }
 
+/// Writes an approval as `s` would have, for the server this config
+/// resolves, so the next run starts with it already remembered.
+fn remember(config: &Config, tool: &str, paths: &[String]) {
+    let server = &config.mcp[0];
+    let mut store = airlok_core::mcp::trust::Store::default();
+    store.remember(
+        &server.name,
+        tool,
+        paths,
+        &airlok_core::mcp::trust::fingerprint(server),
+    );
+    airlok_core::mcp::trust::save(&config.cwd, &store).unwrap();
+}
+
+#[tokio::test]
+async fn an_approval_saved_earlier_is_honoured_on_a_later_run() {
+    let dir = TempDir::new("mcp-trust-honoured");
+    let config = with_server(dir.path(), "");
+    let inside = dir.path().join("notes").to_string_lossy().into_owned();
+    remember(&config, "echo", std::slice::from_ref(&inside));
+
+    let provider = MockProvider::scripted(vec![
+        tool_call("call-1", "mcp__mock__echo", json!({ "path": "notes/a.md" })),
+        reply("done"),
+    ]);
+    let mut agent = agent_configured(provider, config, SecretRedactor::new());
+    let mut out = RecordingOutput::default();
+
+    agent.run("read it", &mut out).await.unwrap();
+
+    assert!(
+        prompts(&out).is_empty(),
+        "it should not have asked: {:?}",
+        out.events
+    );
+}
+
+#[tokio::test]
+async fn a_saved_approval_does_not_cover_another_place() {
+    let dir = TempDir::new("mcp-trust-elsewhere");
+    let config = with_server(dir.path(), "");
+    let inside = dir.path().join("notes").to_string_lossy().into_owned();
+    remember(&config, "echo", &[inside]);
+
+    let provider = MockProvider::scripted(vec![
+        tool_call(
+            "call-1",
+            "mcp__mock__echo",
+            json!({ "path": "/etc/passwd" }),
+        ),
+        reply("done"),
+    ]);
+    let mut agent = agent_configured(provider, config, SecretRedactor::new());
+    let mut out = RecordingOutput::default();
+
+    agent.run("read it", &mut out).await.unwrap();
+
+    let asked = prompts(&out);
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].1, ["/etc/passwd"], "{asked:?}");
+}
+
+#[tokio::test]
+async fn a_saved_approval_does_not_survive_the_server_changing() {
+    let dir = TempDir::new("mcp-trust-changed");
+    let approved = with_server(dir.path(), "");
+    let inside = dir.path().join("notes").to_string_lossy().into_owned();
+    remember(&approved, "echo", &[inside]);
+
+    // The same name and the same place, but the server is started
+    // differently now, so the approval was for something else.
+    let changed = with_server(dir.path(), "args = [\"--new-flag\"]\n");
+    let provider = MockProvider::scripted(vec![
+        tool_call("call-1", "mcp__mock__echo", json!({ "path": "notes/a.md" })),
+        reply("done"),
+    ]);
+    let mut agent = agent_configured(provider, changed, SecretRedactor::new());
+    let mut out = RecordingOutput::default();
+
+    agent.run("read it", &mut out).await.unwrap();
+
+    assert_eq!(prompts(&out).len(), 1, "a changed server must ask again");
+}
+
 #[tokio::test]
 async fn plan_mode_offers_no_mcp_tools_and_starts_no_server() {
     let dir = TempDir::new("mcp-plan");
@@ -449,7 +544,7 @@ async fn plan_mode_offers_no_mcp_tools_and_starts_no_server() {
     let requests = provider.requests();
     let names = offered(&requests[0]);
     assert!(
-        !names.iter().any(|name| name.starts_with("mock__")),
+        !names.iter().any(|name| name.starts_with("mcp__mock__")),
         "{names:?}"
     );
     assert!(names.contains(&"read_file"), "{names:?}");

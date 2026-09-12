@@ -62,6 +62,10 @@ name = "mcp"
 path = "mcp.rs"
 
 [[test]]
+name = "mcp_scopes"
+path = "mcp_scopes.rs"
+
+[[test]]
 name = "mcp_cleanup"
 path = "mcp_cleanup.rs"
 

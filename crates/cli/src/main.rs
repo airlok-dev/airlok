@@ -13,8 +13,11 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use airlok_core::config::{self, KeySource, Overrides, ProviderConfig, ProviderName, Sources};
+use airlok_core::config::{
+    self, KeySource, McpScope, Overrides, ProviderConfig, ProviderName, Sources,
+};
 use airlok_core::context::{self, ContextInput};
+use airlok_core::mcp::{json, trust};
 use airlok_core::redact::{Class, RedactionMap, Redactor, SecretRedactor};
 use airlok_core::repl::{Backend, Repl, Switch};
 use airlok_core::session::Summary;
@@ -27,7 +30,9 @@ use anyhow::{anyhow, bail, Context};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use args::{Args, Command, ConfigAction, McpAction, SessionsAction};
+use args::{
+    Args, Command, ConfigAction, McpAction, ScopeArg, SessionsAction, TransportArg, TrustAction,
+};
 use keys::Keys;
 use output::Stdout;
 use terminal::Terminal;
@@ -98,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
             print!("{redacted}");
             return Ok(());
         }
-        Some(Command::Mcp { action }) => return mcp_command(action, &config).await,
+        Some(Command::Mcp { action }) => return mcp_command(action, &config, &sources).await,
         Some(Command::Sessions { action }) => return sessions_command(action, &store()?, &cwd),
         None => {}
     }
@@ -408,14 +413,22 @@ impl Backend for CliBackend {
     }
 }
 
-/// `airlok mcp`: what the servers offer, and a way to call one tool
-/// without a model. The gates are the same as in a run.
-async fn mcp_command(action: Option<McpAction>, config: &Config) -> anyhow::Result<()> {
-    if config.mcp.is_empty() {
-        bail!("no MCP servers configured. Add an [[mcp]] block to the config; airlok config show says where it is");
+/// `airlok mcp`: what the servers offer, where each came from, and the
+/// files that define them.
+async fn mcp_command(
+    action: Option<McpAction>,
+    config: &Config,
+    sources: &Sources,
+) -> anyhow::Result<()> {
+    for problem in &sources.mcp_problems {
+        eprintln!("warning: {problem}");
     }
     let result = match action.unwrap_or(McpAction::List) {
         McpAction::List => {
+            if config.mcp.is_empty() {
+                println!("no MCP servers configured. `airlok mcp add` writes one, or add an [[mcp]] block to the config");
+                return Ok(());
+            }
             for status in airlok_core::mcp::connect_all(&config.mcp, &config.cwd)
                 .await
                 .1
@@ -424,6 +437,22 @@ async fn mcp_command(action: Option<McpAction>, config: &Config) -> anyhow::Resu
             }
             Ok(())
         }
+        McpAction::Add {
+            name,
+            scope,
+            transport,
+            url,
+            env,
+            header,
+            command,
+        } => mcp_add(
+            config, &name, scope, transport, url, &env, &header, &command,
+        ),
+        McpAction::Remove { name, scope } => mcp_remove(config, &name, scope),
+        McpAction::Get { name } => mcp_get(config, &name),
+        McpAction::Import { path, scope } => mcp_import(config, &path, scope),
+        McpAction::Export { scope } => mcp_export(config, scope),
+        McpAction::Trust { action } => mcp_trust(config, action),
         McpAction::Call {
             server,
             tool,
@@ -434,6 +463,160 @@ async fn mcp_command(action: Option<McpAction>, config: &Config) -> anyhow::Resu
     // outlives the command.
     airlok_core::mcp::kill_children();
     result
+}
+
+/// Where one scope's JSON file is.
+fn scope_file(scope: McpScope, cwd: &Path) -> anyhow::Result<PathBuf> {
+    let dir = config::user_config_path().and_then(|path| path.parent().map(Path::to_path_buf));
+    json::path_for(scope, dir.as_deref(), cwd)
+        .ok_or_else(|| anyhow!("{} has no file of its own", scope.as_str()))
+}
+
+fn pairs(
+    values: &[String],
+    what: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    values
+        .iter()
+        .map(|value| {
+            value
+                .split_once('=')
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .ok_or_else(|| anyhow!("{what} must be written K=V, not {value:?}"))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mcp_add(
+    config: &Config,
+    name: &str,
+    scope: ScopeArg,
+    transport: Option<TransportArg>,
+    url: Option<String>,
+    env: &[String],
+    header: &[String],
+    command: &[String],
+) -> anyhow::Result<()> {
+    let scope: McpScope = scope.into();
+    let http = matches!(transport, Some(TransportArg::Http)) || url.is_some();
+    if http && url.is_none() {
+        bail!("an http server needs --url");
+    }
+    if !http && command.is_empty() {
+        bail!("a stdio server needs a command after --, for example: airlok mcp add files -- npx -y server-filesystem .");
+    }
+    let entry = json::Entry {
+        kind: Some(if http { "http" } else { "stdio" }.to_string()),
+        command: command.first().cloned(),
+        args: command.iter().skip(1).cloned().collect(),
+        env: pairs(env, "--env")?,
+        url,
+        headers: pairs(header, "--header")?,
+        airlok: None,
+    };
+    let path = scope_file(scope, &config.cwd)?;
+    let mut file = json::read(&path).map_err(|e| anyhow!(e))?;
+    let replaced = file.servers.insert(name.to_string(), entry).is_some();
+    json::write(&path, &file).map_err(|e| anyhow!(e))?;
+    println!(
+        "{} {name} in {}",
+        if replaced { "replaced" } else { "added" },
+        path.display()
+    );
+    Ok(())
+}
+
+fn mcp_remove(config: &Config, name: &str, scope: Option<ScopeArg>) -> anyhow::Result<()> {
+    let scopes: Vec<McpScope> = match scope {
+        Some(scope) => vec![scope.into()],
+        None => vec![McpScope::User, McpScope::Project, McpScope::Local],
+    };
+    let mut removed = 0;
+    for scope in scopes {
+        let path = scope_file(scope, &config.cwd)?;
+        let mut file = json::read(&path).map_err(|e| anyhow!(e))?;
+        if file.servers.remove(name).is_some() {
+            json::write(&path, &file).map_err(|e| anyhow!(e))?;
+            println!("removed {name} from {}", path.display());
+            removed += 1;
+        }
+    }
+    if removed == 0 {
+        bail!("no server called {name} in the JSON files; an [[mcp]] block is removed by editing the TOML");
+    }
+    Ok(())
+}
+
+fn mcp_get(config: &Config, name: &str) -> anyhow::Result<()> {
+    let server = config
+        .mcp
+        .iter()
+        .find(|server| server.name == name)
+        .ok_or_else(|| anyhow!("no server called {name}; `airlok mcp list` shows them"))?;
+    println!("{name} from {}", server.scope.as_str());
+    if let Some(root) = server.root() {
+        println!("serving {root}");
+    }
+    let entry = json::entry_of(server);
+    println!("{}", serde_json::to_string_pretty(&entry)?);
+    Ok(())
+}
+
+fn mcp_import(config: &Config, path: &Path, scope: ScopeArg) -> anyhow::Result<()> {
+    let incoming = json::read(path).map_err(|e| anyhow!(e))?;
+    if incoming.servers.is_empty() {
+        bail!("{} has no mcpServers entries", path.display());
+    }
+    let into = scope_file(scope.into(), &config.cwd)?;
+    let mut file = json::read(&into).map_err(|e| anyhow!(e))?;
+    let mut names: Vec<String> = Vec::new();
+    for (name, entry) in incoming.servers {
+        names.push(name.clone());
+        file.servers.insert(name, entry);
+    }
+    json::write(&into, &file).map_err(|e| anyhow!(e))?;
+    println!("imported {} into {}", names.join(", "), into.display());
+    Ok(())
+}
+
+fn mcp_export(config: &Config, scope: Option<ScopeArg>) -> anyhow::Result<()> {
+    let file = match scope {
+        Some(scope) => {
+            json::read(&scope_file(scope.into(), &config.cwd)?).map_err(|e| anyhow!(e))?
+        }
+        None => json::McpJson {
+            servers: config
+                .mcp
+                .iter()
+                .map(|server| (server.name.clone(), json::entry_of(server)))
+                .collect(),
+        },
+    };
+    println!("{}", serde_json::to_string_pretty(&file)?);
+    Ok(())
+}
+
+fn mcp_trust(config: &Config, action: TrustAction) -> anyhow::Result<()> {
+    match action {
+        TrustAction::List => {
+            let lines = trust::load(&config.cwd).lines();
+            if lines.is_empty() {
+                println!("nothing is remembered here; `s` at a confirmation saves an approval");
+            }
+            lines.iter().for_each(|line| println!("{line}"));
+        }
+        TrustAction::Revoke { server } => {
+            let mut store = trust::load(&config.cwd);
+            let gone = store.revoke(&server);
+            if gone == 0 {
+                bail!("nothing was remembered for {server}");
+            }
+            trust::save(&config.cwd, &store).map_err(|e| anyhow!(e))?;
+            println!("forgot {gone} approval(s) for {server}");
+        }
+    }
+    Ok(())
 }
 
 async fn mcp_call(

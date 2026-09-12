@@ -39,6 +39,10 @@ pub enum Decision {
     Reject,
     /// Approve this and every later prompt of the same kind in this run.
     ApproveAll,
+    /// [`Decision::ApproveAll`], and remember it past this run. Offered
+    /// for MCP calls, where what is approved is a server, a tool, and the
+    /// places that call named.
+    SaveAll,
     /// Stop the whole run now. Nothing further is sent to the provider.
     Quit,
 }

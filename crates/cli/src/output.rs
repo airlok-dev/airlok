@@ -243,7 +243,9 @@ impl Output for Stdout {
                     if !rest.is_empty() {
                         terminal.show_lines(&[diff::more_lines(rest.len())]);
                     }
-                    terminal.ask_paged(&format!("Call `{tool}` on `{server}`?"), rest)
+                    // Only this prompt can be remembered, so only this
+                    // one offers it.
+                    terminal.ask_savable(&format!("Call `{tool}` on `{server}`?"), rest)
                 }
             },
         };

@@ -1,4 +1,6 @@
-use airlok_core::config::ProviderName;
+use std::path::PathBuf;
+
+use airlok_core::config::{McpScope, ProviderName};
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// A privacy airlock between your code and a model you do not control.
@@ -78,10 +80,78 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ScopeArg {
+    /// ~/.config/airlok/mcp.json
+    User,
+    /// ./.mcp.json, meant to be committed
+    Project,
+    /// ./.airlok/mcp.json, personal and gitignored
+    Local,
+}
+
+impl From<ScopeArg> for McpScope {
+    fn from(scope: ScopeArg) -> Self {
+        match scope {
+            ScopeArg::User => McpScope::User,
+            ScopeArg::Project => McpScope::Project,
+            ScopeArg::Local => McpScope::Local,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum McpAction {
-    /// Show each server, whether it answers, and the tools it offers
+    /// Show each server, its scope, whether it answers, and its tools
     List,
+    /// Write a server to one of the JSON files
+    Add {
+        name: String,
+        /// Which file to write it to
+        #[arg(long, value_enum, default_value = "local")]
+        scope: ScopeArg,
+        /// stdio runs the command after --; http posts to --url
+        #[arg(long, value_enum)]
+        transport: Option<TransportArg>,
+        /// The endpoint, for an http server
+        #[arg(long)]
+        url: Option<String>,
+        /// An environment variable for the server, repeatable
+        #[arg(long = "env", value_name = "K=V")]
+        env: Vec<String>,
+        /// An http header, repeatable
+        #[arg(long = "header", value_name = "K=V")]
+        header: Vec<String>,
+        /// The command and its arguments, after --
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+    /// Remove a server from a JSON file
+    Remove {
+        name: String,
+        /// Which file to take it out of; every scope by default
+        #[arg(long, value_enum)]
+        scope: Option<ScopeArg>,
+    },
+    /// Show the resolved entry for one server and where it came from
+    Get { name: String },
+    /// Merge another tool's mcpServers file into one of the scopes
+    Import {
+        path: PathBuf,
+        #[arg(long, value_enum, default_value = "local")]
+        scope: ScopeArg,
+    },
+    /// Print the configured servers as standard mcpServers JSON
+    Export {
+        /// Only this scope, rather than everything resolved
+        #[arg(long, value_enum)]
+        scope: Option<ScopeArg>,
+    },
+    /// Approvals remembered past a run
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
     /// Call one tool, for debugging. The same trust and confirmation apply
     Call {
         server: String,
@@ -90,6 +160,20 @@ pub enum McpAction {
         #[arg(default_value = "{}")]
         arguments: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TransportArg {
+    Stdio,
+    Http,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TrustAction {
+    /// Show what has been approved past the end of a run
+    List,
+    /// Forget every saved approval for one server
+    Revoke { server: String },
 }
 
 #[derive(Debug, Subcommand)]

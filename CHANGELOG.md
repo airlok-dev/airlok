@@ -2,6 +2,21 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.7.0] - 2026-09-12
+
+### Changed
+
+- Tools from an MCP server are now named `mcp__<server>__<tool>`, the convention the other clients use, in place of `<server>__<tool>`. This is a breaking change for anything that referred to the old names: a saved session's history, a note in AIRLOK.md, or a `tools = [...]` list naming a tool keeps working, since that list names the server's own tool rather than the prefixed one.
+
+### Added
+
+- MCP servers are configured with the `mcpServers` JSON that Claude Code, Cursor, and VS Code share, so a `.mcp.json` copied from another project works unchanged. Both forms are read: `command`/`args`/`env` for stdio, and `type`/`url`/`headers` for http. Unknown keys other tools write are ignored rather than refused.
+- Three scopes, each winning over the one above it: `~/.config/airlok/mcp.json`, `./.mcp.json` meant to be committed, and `./.airlok/mcp.json` for personal overrides. A server named in more than one takes the highest definition whole. `[[mcp]]` TOML blocks keep working, merge with the JSON, and win a name clash.
+- Airlok's own options live under an `airlok` key inside a JSON entry, so a plain config stays plain.
+- `${VAR}` and `${VAR:-default}` expand from the environment in `command`, `args`, `env`, `url`, and `headers`. Unset or empty with no default is an error naming the variable. `env_cmd` and `header_cmd` remain the better way to hold a secret.
+- `airlok mcp add`, `remove`, `get`, `import`, and `export` manage those files, and `airlok mcp list` now shows which scope each server came from.
+- An approval can outlive the run: `s` at an MCP confirmation remembers that server, that tool, and the places that call named, in `.airlok/mcp-trust.json`, written 0600 and gitignored. It never covers a place outside the ones approved, and it records what the server was, so changing its command or url asks again. `airlok mcp trust list` and `trust revoke <server>` manage it.
+
 ## [0.6.1] - 2026-09-12
 
 ### Fixed

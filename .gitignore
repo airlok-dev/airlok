@@ -4,3 +4,6 @@
 .env
 
 .claude/scratch/
+
+# Personal MCP scope and saved approvals; .mcp.json is meant to be committed.
+.airlok/
