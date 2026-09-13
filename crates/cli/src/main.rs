@@ -254,7 +254,14 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
         Err(e) => {
-            if let Some(hint) = e.hint(&agent.config().provider.model) {
+            // A one-shot run has no session override by definition.
+            let model = agent.config().provider.model.clone();
+            let from_file = agent
+                .config()
+                .models
+                .get(&model)
+                .and_then(|m| m.reasoning_effort.clone());
+            if let Some(hint) = e.hint(&model, None, from_file.as_deref()) {
                 eprintln!("Error: {e}\n{hint}");
                 std::process::exit(1);
             }

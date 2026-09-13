@@ -94,13 +94,32 @@ impl CoreError {
 
     /// How to fix this in the config, when a setting can. Today: a provider
     /// that rejects its default `reasoning_effort` for `model`.
-    pub fn hint(&self, model: &str) -> Option<String> {
+    /// `session_effort` is what `/effort` set this run, when it set
+    /// anything; `config_effort` is what the files say. A rejection caused
+    /// by a session override is fixed with another `/effort`, not by
+    /// editing a config that already says the right thing.
+    pub fn hint(
+        &self,
+        model: &str,
+        session_effort: Option<&str>,
+        config_effort: Option<&str>,
+    ) -> Option<String> {
         let CoreError::Llm(airlok_llm::LlmError::Api { status: 400, body }) = self else {
             return None;
         };
         let value: serde_json::Value = serde_json::from_str(body).ok()?;
-        if value["error"]["param"].as_str()? != "reasoning_effort" {
+        // Chat Completions names it `reasoning_effort`; the Responses API
+        // names the same setting `reasoning.effort`.
+        let param = value["error"]["param"].as_str()?;
+        if param != "reasoning_effort" && param != "reasoning.effort" {
             return None;
+        }
+        if let Some(in_force) = session_effort.filter(|v| Some(*v) != config_effort) {
+            let back_to = config_effort.unwrap_or("none");
+            return Some(format!(
+                "hint: {model} rejected the reasoning effort {in_force}, which /effort set for \
+                 this session. `/effort {back_to}` puts it back; the config is not the problem."
+            ));
         }
         Some(format!(
             "hint: the provider rejected its reasoning effort for {model}. \

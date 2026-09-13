@@ -670,6 +670,45 @@ async fn the_effort_in_force_says_where_it_came_from() {
 }
 
 #[tokio::test]
+async fn raising_the_effort_off_a_none_config_warns_about_tools() {
+    let dir = TempDir::new("effort-warn");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = on_openai(provider, dir.path(), "gpt-6-astra");
+    agent.config_mut().models.insert(
+        "gpt-6-astra".into(),
+        ModelConfig {
+            reasoning_effort: Some("none".into()),
+            api: None,
+        },
+    );
+    let session = agent.new_session();
+    let mut backend = TestBackend::default();
+    backend.efforts.insert("gpt-6-astra", "none".into());
+    let mut lines = ScriptedLines::typed(&["/effort high", "/effort none"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(backend),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let statuses = out.statuses();
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|line| line.contains("may refuse to take tools"))
+            .count(),
+        1,
+        "warn on the way up, not on the way back down: {statuses:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_effort_set_in_the_session_reaches_the_next_request() {
     let dir = TempDir::new("effort-sent");
     let provider = MockProvider::scripted(vec![reply("before"), reply("after")]);
