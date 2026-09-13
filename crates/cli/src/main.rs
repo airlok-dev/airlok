@@ -1,4 +1,5 @@
 mod args;
+mod clipboard;
 mod complete;
 mod diff;
 mod keys;
