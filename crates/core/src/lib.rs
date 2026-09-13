@@ -115,11 +115,26 @@ impl CoreError {
             return None;
         }
         if let Some(in_force) = session_effort.filter(|v| Some(*v) != config_effort) {
-            let back_to = config_effort.unwrap_or("none");
-            return Some(format!(
-                "hint: {model} rejected the reasoning effort {in_force}, which /effort set for \
-                 this session. `/effort {back_to}` puts it back; the config is not the problem."
-            ));
+            // Naming the rejected value as the way back is no help, which
+            // is what happens when none is both the override and the
+            // fallback, as on a deployment that does not accept none.
+            let back_to = config_effort.filter(|v| *v != in_force);
+            return Some(match back_to {
+                Some(value) => format!(
+                    "hint: {model} rejected the reasoning effort {in_force}, which /effort set \
+                     for this session. `/effort {value}` puts it back to the config's; the \
+                     config is not the problem."
+                ),
+                None if in_force == "none" => format!(
+                    "hint: {model} rejected the reasoning effort none, which /effort set for \
+                     this session. Choose one of the values the provider lists above, with \
+                     /effort <value>."
+                ),
+                None => format!(
+                    "hint: {model} rejected the reasoning effort {in_force}, which /effort set \
+                     for this session. `/effort none` puts it back; the config is not the problem."
+                ),
+            });
         }
         // Suggesting the configured value is useless when that value is
         // the one being rejected.

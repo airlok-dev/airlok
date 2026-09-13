@@ -263,6 +263,15 @@ fn a_rejected_session_effort_points_at_effort_not_the_config() {
     let hint = rejected.hint("gpt-6-astra", Some("high"), None).unwrap();
     assert!(hint.contains("/effort none"), "{hint}");
 
+    // But when none is the value that was rejected, offering it again is
+    // no way back at all.
+    let hint = rejected.hint("gpt-6-astra", Some("none"), None).unwrap();
+    assert!(
+        !hint.contains("/effort none"),
+        "circular suggestion: {hint}"
+    );
+    assert!(hint.contains("lists above"), "{hint}");
+
     // The Responses API names the same parameter reasoning.effort.
     let responses = CoreError::Llm(LlmError::Api {
         status: 400,
