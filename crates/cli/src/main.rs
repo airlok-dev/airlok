@@ -106,11 +106,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Mcp { action }) => return mcp_command(action, &config, &sources).await,
         Some(Command::Sessions { action }) => return sessions_command(action, &store()?, &cwd),
-        Some(Command::Doctor) => {
+        Some(Command::Doctor { offline }) => {
             let checks = doctor_checks(
                 &config,
                 &config_file_lines(&sources),
                 &config.provider.model,
+                offline,
             )
             .await;
             for check in &checks {
@@ -530,8 +531,8 @@ impl Backend for CliBackend {
         Some(self.key_source.clone())
     }
 
-    async fn doctor(&mut self, model: &str) -> Vec<airlok_core::repl::Check> {
-        doctor_checks(&self.config, &self.config_files, model).await
+    async fn doctor(&mut self, model: &str, offline: bool) -> Vec<airlok_core::repl::Check> {
+        doctor_checks(&self.config, &self.config_files, model, offline).await
     }
 
     fn known_models(&mut self, provider: ProviderName) -> Vec<String> {
@@ -992,6 +993,7 @@ async fn doctor_checks(
     config: &Config,
     files: &[String],
     model: &str,
+    offline: bool,
 ) -> Vec<airlok_core::repl::Check> {
     use airlok_core::repl::Check;
     use futures::StreamExt;
@@ -1008,6 +1010,11 @@ async fn doctor_checks(
 
     let key = config.resolve_key();
     match &key {
+        // The rest read files or talk to local processes.
+        _ if offline => checks.push(Check::pass(
+            "provider request",
+            "skipped: --offline".to_string(),
+        )),
         Ok(_) => checks.push(Check::pass(
             "provider key",
             format!("resolved from {}", config.key_source()),

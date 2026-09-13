@@ -128,8 +128,8 @@ pub trait Backend: Send {
     /// Runs the `/doctor` checks against `model`, which is the model in
     /// use now rather than the one the run started on. Talking to the
     /// provider and to the MCP servers is the binary's job.
-    async fn doctor(&mut self, model: &str) -> Vec<Check> {
-        let _ = model;
+    async fn doctor(&mut self, model: &str, offline: bool) -> Vec<Check> {
+        let _ = (model, offline);
         Vec::new()
     }
 }
@@ -739,7 +739,8 @@ impl Repl<'_> {
             "diff" => self.diff_command(arg, session, out),
             "doctor" => {
                 let model = session.model.clone();
-                let checks = self.backend.doctor(&model).await;
+                let offline = matches!(arg.trim(), "--offline" | "offline");
+                let checks = self.backend.doctor(&model, offline).await;
                 if checks.is_empty() {
                     out.status("no checks to run from here");
                 }
