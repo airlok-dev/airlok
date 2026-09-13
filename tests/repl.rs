@@ -497,6 +497,7 @@ async fn plan_then_go_researches_read_only_then_runs_with_every_tool() {
         MODEL.into(),
         ModelConfig {
             reasoning_effort: Some("none".into()),
+            api: None,
         },
     );
     let mut repl = Repl {
@@ -629,6 +630,7 @@ async fn the_effort_in_force_says_where_it_came_from() {
         "gpt-6-astra".into(),
         ModelConfig {
             reasoning_effort: Some("none".into()),
+            api: None,
         },
     );
     let session = agent.new_session();

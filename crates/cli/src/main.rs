@@ -488,6 +488,7 @@ impl Backend for CliBackend {
                 api_key_env: None,
                 api_key_cmd: None,
                 context_window: self.config.provider.context_window,
+                api: Default::default(),
             }
         };
         // Errors name the variable or command; they never carry its output.
@@ -1190,6 +1191,7 @@ mod tests {
             "gpt-6-astra".into(),
             ModelConfig {
                 reasoning_effort: Some("low".into()),
+                api: None,
             },
         );
         let mut session = airlok_core::Session::new(&cwd, &config);
@@ -1198,6 +1200,7 @@ mod tests {
             "gpt-6-astra".into(),
             ModelSection {
                 reasoning_effort: Some("none".into()),
+                api: None,
             },
         );
 

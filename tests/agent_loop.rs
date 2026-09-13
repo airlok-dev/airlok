@@ -191,6 +191,7 @@ async fn reasoning_effort_is_sent_only_for_the_configured_model() {
         "gpt-6-astra".into(),
         airlok_core::config::ModelConfig {
             reasoning_effort: Some("none".into()),
+            api: None,
         },
     );
     let mut session = agent.new_session();
