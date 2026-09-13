@@ -33,6 +33,7 @@ fn astra(provider: Arc<MockProvider>, cwd: &Path) -> Agent {
         MODEL.into(),
         ModelConfig {
             reasoning_effort: Some("none".into()),
+            api: None,
         },
     );
     agent

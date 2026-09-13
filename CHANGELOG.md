@@ -2,6 +2,18 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.9.1] - 2026-09-13
+
+### Added
+
+- `[provider] api`, settable per model as `[models."<id>"] api`, choosing which OpenAI HTTP API to speak. `"chat"` is the default and is unchanged. On `"responses"` the conversation is sent as input items, a tool call and its result are top-level items joined by `call_id`, the system prompt is sent as `instructions`, and the reasoning effort is an object rather than a string, which is what lets a deployment keep tools and a reasoning effort at the same time.
+- `airlok doctor --offline`, and `/doctor --offline` in a session, which skips the provider request, the one check that leaves the machine, and reports it as skipped rather than dropping the line.
+
+### Fixed
+
+- A reasoning effort rejected by the provider now says when the value came from `/effort` and how to put it back, instead of suggesting an edit to a config that already says the right thing. `/effort` also warns when raising the effort on a model whose config pins it to `none`, which is where a deployment starts refusing tools.
+- The argument hint no longer offers the first candidate before anything is typed, so `/goal` no longer reads as an offer to complete to `/goal clear`.
+
 ## [0.9.0] - 2026-09-13
 
 ### Added

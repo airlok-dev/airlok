@@ -497,6 +497,7 @@ async fn plan_then_go_researches_read_only_then_runs_with_every_tool() {
         MODEL.into(),
         ModelConfig {
             reasoning_effort: Some("none".into()),
+            api: None,
         },
     );
     let mut repl = Repl {
@@ -629,6 +630,7 @@ async fn the_effort_in_force_says_where_it_came_from() {
         "gpt-6-astra".into(),
         ModelConfig {
             reasoning_effort: Some("none".into()),
+            api: None,
         },
     );
     let session = agent.new_session();
@@ -664,6 +666,82 @@ async fn the_effort_in_force_says_where_it_came_from() {
             .iter()
             .any(|line| line.contains("high, set for this session")),
         "{statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn raising_the_effort_off_a_none_config_warns_about_tools() {
+    let dir = TempDir::new("effort-warn");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = on_openai(provider, dir.path(), "gpt-6-astra");
+    agent.config_mut().models.insert(
+        "gpt-6-astra".into(),
+        ModelConfig {
+            reasoning_effort: Some("none".into()),
+            api: None,
+        },
+    );
+    let session = agent.new_session();
+    let mut backend = TestBackend::default();
+    backend.efforts.insert("gpt-6-astra", "none".into());
+    let mut lines = ScriptedLines::typed(&["/effort high", "/effort none"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(backend),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let statuses = out.statuses();
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|line| line.contains("may refuse to take tools"))
+            .count(),
+        1,
+        "warn on the way up, not on the way back down: {statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_tools_warning_is_for_chat_completions_only() {
+    let dir = TempDir::new("effort-responses");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = on_openai(provider, dir.path(), "gpt-6-astra");
+    agent.config_mut().models.insert(
+        "gpt-6-astra".into(),
+        ModelConfig {
+            reasoning_effort: Some("none".into()),
+            api: Some(airlok_core::config::Api::Responses),
+        },
+    );
+    let session = agent.new_session();
+    let mut backend = TestBackend::default();
+    backend.efforts.insert("gpt-6-astra", "none".into());
+    let mut lines = ScriptedLines::typed(&["/effort high"]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(backend),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let statuses = out.statuses();
+    assert!(
+        !statuses
+            .iter()
+            .any(|line| line.contains("may refuse to take tools")),
+        "the responses api is where effort and tools work together: {statuses:?}"
     );
 }
 

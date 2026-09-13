@@ -193,6 +193,7 @@ impl Backend for TestBackend {
                 api_key_env: None,
                 api_key_cmd: None,
                 context_window: airlok_core::config::DEFAULT_CONTEXT_WINDOW,
+                api: Default::default(),
             },
             provider,
             redactor: Box::new(SecretRedactor::new().with_map(seed)),

@@ -79,7 +79,11 @@ pub enum Command {
         action: Option<SessionsAction>,
     },
     /// Check everything airlok needs, and exit non-zero if anything fails
-    Doctor,
+    Doctor {
+        /// Skip the provider request, the one check that needs the network
+        #[arg(long)]
+        offline: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

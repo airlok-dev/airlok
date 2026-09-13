@@ -68,6 +68,25 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
+/// Which OpenAI HTTP API to speak. Chat Completions is the default; the
+/// Responses API is what newer reasoning deployments expect.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Api {
+    #[default]
+    Chat,
+    Responses,
+}
+
+impl std::fmt::Display for Api {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Api::Chat => "chat",
+            Api::Responses => "responses",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub model: String,
@@ -78,6 +97,10 @@ pub struct Request {
     /// Sent as `reasoning_effort` by the openai provider, and only when set.
     /// The Anthropic provider ignores it.
     pub reasoning_effort: Option<String>,
+    /// Which OpenAI HTTP API to send this on. The Anthropic provider
+    /// ignores it.
+    #[serde(default)]
+    pub api: Api,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

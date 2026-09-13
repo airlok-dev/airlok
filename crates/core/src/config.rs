@@ -138,11 +138,15 @@ pub struct ConfigFile {
     pub mcp: Vec<McpSection>,
 }
 
+pub use airlok_llm::types::Api;
+
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api: Option<Api>,
 }
 
 /// One `[[mcp]]` entry on disk. `name` is required; everything else is
@@ -300,6 +304,8 @@ pub struct ProviderSection {
     pub api_key_cmd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api: Option<Api>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -379,6 +385,7 @@ impl ConfigFile {
                     .provider
                     .context_window
                     .or(self.provider.context_window),
+                api: over.provider.api.or(self.provider.api),
             },
             agent: AgentSection {
                 max_turns: over.agent.max_turns.or(self.agent.max_turns),
@@ -456,6 +463,7 @@ fn layer_models(
             id,
             ModelSection {
                 reasoning_effort: section.reasoning_effort.or(merged.reasoning_effort),
+                api: section.api.or(merged.api),
             },
         );
     }
@@ -491,6 +499,8 @@ pub struct ModelConfig {
     /// Sent as `reasoning_effort` by the openai provider. Not validated: the
     /// provider rejects values it does not accept.
     pub reasoning_effort: Option<String>,
+    /// Overrides `[provider] api` for this model.
+    pub api: Option<Api>,
 }
 
 /// A configured MCP server. Commands that produce secrets are kept as
@@ -625,6 +635,8 @@ pub struct ProviderConfig {
     /// Tokens the model can take as input. Not looked up per model; set it
     /// when the default is wrong for yours.
     pub context_window: u64,
+    /// The HTTP API the openai provider speaks, unless a model overrides it.
+    pub api: Api,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -780,6 +792,7 @@ impl Config {
                     .provider
                     .context_window
                     .unwrap_or(DEFAULT_CONTEXT_WINDOW),
+                api: file.provider.api.unwrap_or_default(),
             },
             agent: AgentConfig {
                 max_turns: file.agent.max_turns.unwrap_or(50),
@@ -815,6 +828,7 @@ impl Config {
                         id,
                         ModelConfig {
                             reasoning_effort: m.reasoning_effort,
+                            api: m.api,
                         },
                     )
                 })
@@ -834,6 +848,7 @@ impl Config {
                 api_key_env: self.provider.api_key_env.clone(),
                 api_key_cmd: self.provider.api_key_cmd.clone(),
                 context_window: Some(self.provider.context_window),
+                api: Some(self.provider.api),
             },
             agent: AgentSection {
                 max_turns: Some(self.agent.max_turns),
@@ -863,6 +878,7 @@ impl Config {
                         id.clone(),
                         ModelSection {
                             reasoning_effort: m.reasoning_effort.clone(),
+                            api: m.api,
                         },
                     )
                 })
@@ -1004,6 +1020,7 @@ pub const TEMPLATE: &str = r##"# airlok configuration. Precedence: CLI flags > .
 # Settings for one model id (the deployment name on Azure), applied however it is chosen, /model included.
 # [models."gpt-6-astra"]
 # reasoning_effort = "none"   # openai only, sent as reasoning_effort; Azure's gpt-6-astra needs "none" to use tools on Chat Completions
+# api = "responses"          # openai only: "chat" (the default) or "responses"
 
 # An MCP server whose tools the model may call, offered as <name>__<tool>. Repeat the block for more.
 # [[mcp]]

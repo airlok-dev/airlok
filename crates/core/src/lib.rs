@@ -94,13 +94,56 @@ impl CoreError {
 
     /// How to fix this in the config, when a setting can. Today: a provider
     /// that rejects its default `reasoning_effort` for `model`.
-    pub fn hint(&self, model: &str) -> Option<String> {
+    /// `session_effort` is what `/effort` set this run, when it set
+    /// anything; `config_effort` is what the files say. A rejection caused
+    /// by a session override is fixed with another `/effort`, not by
+    /// editing a config that already says the right thing.
+    pub fn hint(
+        &self,
+        model: &str,
+        session_effort: Option<&str>,
+        config_effort: Option<&str>,
+    ) -> Option<String> {
         let CoreError::Llm(airlok_llm::LlmError::Api { status: 400, body }) = self else {
             return None;
         };
         let value: serde_json::Value = serde_json::from_str(body).ok()?;
-        if value["error"]["param"].as_str()? != "reasoning_effort" {
+        // Chat Completions names it `reasoning_effort`; the Responses API
+        // names the same setting `reasoning.effort`.
+        let param = value["error"]["param"].as_str()?;
+        if param != "reasoning_effort" && param != "reasoning.effort" {
             return None;
+        }
+        if let Some(in_force) = session_effort.filter(|v| Some(*v) != config_effort) {
+            // Naming the rejected value as the way back is no help, which
+            // is what happens when none is both the override and the
+            // fallback, as on a deployment that does not accept none.
+            let back_to = config_effort.filter(|v| *v != in_force);
+            return Some(match back_to {
+                Some(value) => format!(
+                    "hint: {model} rejected the reasoning effort {in_force}, which /effort set \
+                     for this session. `/effort {value}` puts it back to the config's; the \
+                     config is not the problem."
+                ),
+                None if in_force == "none" => format!(
+                    "hint: {model} rejected the reasoning effort none, which /effort set for \
+                     this session. Choose one of the values the provider lists above, with \
+                     /effort <value>."
+                ),
+                None => format!(
+                    "hint: {model} rejected the reasoning effort {in_force}, which /effort set \
+                     for this session. `/effort none` puts it back; the config is not the problem."
+                ),
+            });
+        }
+        // Suggesting the configured value is useless when that value is
+        // the one being rejected.
+        if let Some(configured) = config_effort {
+            return Some(format!(
+                "hint: [models.\"{model}\"] sets reasoning_effort = \"{configured}\", which the \
+                 provider rejected. Use one of the values it lists above, or remove the line to \
+                 take the provider's default."
+            ));
         }
         Some(format!(
             "hint: the provider rejected its reasoning effort for {model}. \

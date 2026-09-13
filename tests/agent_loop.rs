@@ -191,6 +191,7 @@ async fn reasoning_effort_is_sent_only_for_the_configured_model() {
         "gpt-6-astra".into(),
         airlok_core::config::ModelConfig {
             reasoning_effort: Some("none".into()),
+            api: None,
         },
     );
     let mut session = agent.new_session();
@@ -212,17 +213,71 @@ fn a_rejected_reasoning_effort_gets_a_config_hint() {
         status: 400,
         body: r#"{"error":{"message":"Function tools with reasoning_effort are not supported","param":"reasoning_effort"}}"#.into(),
     });
-    let hint = rejected.hint("gpt-6-astra").unwrap();
+    // Nothing overrode the config, so the config is what to edit.
+    let hint = rejected.hint("gpt-6-astra", None, None).unwrap();
     assert!(
         hint.contains("[models.\"gpt-6-astra\"]\nreasoning_effort = \"none\""),
         "{hint}"
     );
+    // A value matching the config is not an override, and saying to set
+    // what is already set, and was just rejected, helps nobody.
+    let hint = rejected
+        .hint("gpt-6-astra", Some("none"), Some("none"))
+        .unwrap();
+    assert!(hint.contains("[models.\"gpt-6-astra\"]"), "{hint}");
+    assert!(hint.contains("which the provider rejected"), "{hint}");
+    assert!(
+        !hint.contains("Set one in the config"),
+        "it is already set: {hint}"
+    );
+
     let other = CoreError::Llm(LlmError::Api {
         status: 400,
         body: r#"{"error":{"message":"bad","param":"messages"}}"#.into(),
     });
-    assert!(other.hint("gpt-6-astra").is_none());
-    assert!(CoreError::TurnLimit(3).hint("m").is_none());
+    assert!(other.hint("gpt-6-astra", None, None).is_none());
+    assert!(CoreError::TurnLimit(3).hint("m", None, None).is_none());
+}
+
+#[test]
+fn a_rejected_session_effort_points_at_effort_not_the_config() {
+    use airlok_core::CoreError;
+    use airlok_llm::LlmError;
+    let rejected = CoreError::Llm(LlmError::Api {
+        status: 400,
+        body: r#"{"error":{"message":"Function tools with reasoning_effort are not supported","param":"reasoning_effort"}}"#.into(),
+    });
+
+    // /effort high over a config that says none: the way back is /effort none.
+    let hint = rejected
+        .hint("gpt-6-astra", Some("high"), Some("none"))
+        .unwrap();
+    assert!(hint.contains("/effort none"), "{hint}");
+    assert!(hint.contains("high"), "{hint}");
+    assert!(
+        !hint.contains("[models."),
+        "should not suggest a config edit: {hint}"
+    );
+
+    // /effort high with nothing in the config: none is still the way back.
+    let hint = rejected.hint("gpt-6-astra", Some("high"), None).unwrap();
+    assert!(hint.contains("/effort none"), "{hint}");
+
+    // But when none is the value that was rejected, offering it again is
+    // no way back at all.
+    let hint = rejected.hint("gpt-6-astra", Some("none"), None).unwrap();
+    assert!(
+        !hint.contains("/effort none"),
+        "circular suggestion: {hint}"
+    );
+    assert!(hint.contains("lists above"), "{hint}");
+
+    // The Responses API names the same parameter reasoning.effort.
+    let responses = CoreError::Llm(LlmError::Api {
+        status: 400,
+        body: r#"{"error":{"message":"Unsupported value","param":"reasoning.effort"}}"#.into(),
+    });
+    assert!(responses.hint("gpt-6-astra", None, None).is_some());
 }
 
 #[tokio::test]

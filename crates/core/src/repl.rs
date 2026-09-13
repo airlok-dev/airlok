@@ -128,8 +128,8 @@ pub trait Backend: Send {
     /// Runs the `/doctor` checks against `model`, which is the model in
     /// use now rather than the one the run started on. Talking to the
     /// provider and to the MCP servers is the binary's job.
-    async fn doctor(&mut self, model: &str) -> Vec<Check> {
-        let _ = model;
+    async fn doctor(&mut self, model: &str, offline: bool) -> Vec<Check> {
+        let _ = (model, offline);
         Vec::new()
     }
 }
@@ -533,7 +533,15 @@ impl Repl<'_> {
                     Some(line) => out.status(&line),
                     None => out.status(&format!("error: {e}")),
                 }
-                if let Some(hint) = e.hint(&self.agent.config().provider.model) {
+                let model = self.agent.config().provider.model.clone();
+                let in_force = self
+                    .agent
+                    .config()
+                    .models
+                    .get(&model)
+                    .and_then(|m| m.reasoning_effort.clone());
+                let from_file = self.backend.startup_effort(&model);
+                if let Some(hint) = e.hint(&model, in_force.as_deref(), from_file.as_deref()) {
                     hint.lines().for_each(|l| out.status(l));
                 }
             }
@@ -731,7 +739,8 @@ impl Repl<'_> {
             "diff" => self.diff_command(arg, session, out),
             "doctor" => {
                 let model = session.model.clone();
-                let checks = self.backend.doctor(&model).await;
+                let offline = matches!(arg.trim(), "--offline" | "offline");
+                let checks = self.backend.doctor(&model, offline).await;
                 if checks.is_empty() {
                     out.status("no checks to run from here");
                 }
@@ -971,6 +980,28 @@ impl Repl<'_> {
         out.status(&format!(
             "reasoning effort {value} for {model} for the rest of this session"
         ));
+        // Raising the effort on a model the config pins to none is how a
+        // deployment starts refusing tools, which reads as an unrelated
+        // failure a turn later. The Responses API is where that pairing
+        // works, so the warning belongs to chat completions only.
+        let on_chat = self
+            .agent
+            .config()
+            .models
+            .get(&model)
+            .and_then(|m| m.api)
+            .unwrap_or(self.agent.config().provider.api)
+            == crate::config::Api::Chat;
+        if value != "none"
+            && on_chat
+            && self.backend.startup_effort(&model).as_deref() == Some("none")
+        {
+            out.status(&format!(
+                "note: the config sets {model} to none. On chat completions this deployment may \
+                 refuse to take tools with an effort set; /effort none puts it back, or give it \
+                 api = \"responses\""
+            ));
+        }
         self.save(session, out);
     }
 

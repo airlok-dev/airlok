@@ -106,11 +106,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Mcp { action }) => return mcp_command(action, &config, &sources).await,
         Some(Command::Sessions { action }) => return sessions_command(action, &store()?, &cwd),
-        Some(Command::Doctor) => {
+        Some(Command::Doctor { offline }) => {
             let checks = doctor_checks(
                 &config,
                 &config_file_lines(&sources),
                 &config.provider.model,
+                offline,
             )
             .await;
             for check in &checks {
@@ -254,7 +255,14 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
         Err(e) => {
-            if let Some(hint) = e.hint(&agent.config().provider.model) {
+            // A one-shot run has no session override by definition.
+            let model = agent.config().provider.model.clone();
+            let from_file = agent
+                .config()
+                .models
+                .get(&model)
+                .and_then(|m| m.reasoning_effort.clone());
+            if let Some(hint) = e.hint(&model, None, from_file.as_deref()) {
                 eprintln!("Error: {e}\n{hint}");
                 std::process::exit(1);
             }
@@ -488,6 +496,7 @@ impl Backend for CliBackend {
                 api_key_env: None,
                 api_key_cmd: None,
                 context_window: self.config.provider.context_window,
+                api: Default::default(),
             }
         };
         // Errors name the variable or command; they never carry its output.
@@ -522,8 +531,8 @@ impl Backend for CliBackend {
         Some(self.key_source.clone())
     }
 
-    async fn doctor(&mut self, model: &str) -> Vec<airlok_core::repl::Check> {
-        doctor_checks(&self.config, &self.config_files, model).await
+    async fn doctor(&mut self, model: &str, offline: bool) -> Vec<airlok_core::repl::Check> {
+        doctor_checks(&self.config, &self.config_files, model, offline).await
     }
 
     fn known_models(&mut self, provider: ProviderName) -> Vec<String> {
@@ -984,6 +993,7 @@ async fn doctor_checks(
     config: &Config,
     files: &[String],
     model: &str,
+    offline: bool,
 ) -> Vec<airlok_core::repl::Check> {
     use airlok_core::repl::Check;
     use futures::StreamExt;
@@ -1011,6 +1021,12 @@ async fn doctor_checks(
     }
 
     match key {
+        // The one check that leaves the machine. Everything else reads
+        // files or talks to local processes.
+        _ if offline => checks.push(Check::pass(
+            "provider request",
+            "skipped: --offline".to_string(),
+        )),
         Err(_) => checks.push(Check::fail(
             "provider request",
             "not attempted: no key to send".to_string(),
@@ -1027,6 +1043,11 @@ async fn doctor_checks(
                     .models
                     .get(model)
                     .and_then(|m| m.reasoning_effort.clone()),
+                api: config
+                    .models
+                    .get(model)
+                    .and_then(|m| m.api)
+                    .unwrap_or(config.provider.api),
             };
             let mut stream = provider.stream(request);
             let mut failure = None;
@@ -1190,6 +1211,7 @@ mod tests {
             "gpt-6-astra".into(),
             ModelConfig {
                 reasoning_effort: Some("low".into()),
+                api: None,
             },
         );
         let mut session = airlok_core::Session::new(&cwd, &config);
@@ -1198,6 +1220,7 @@ mod tests {
             "gpt-6-astra".into(),
             ModelSection {
                 reasoning_effort: Some("none".into()),
+                api: None,
             },
         );
 
