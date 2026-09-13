@@ -110,6 +110,8 @@ impl Usage {
                             name.len() + input.to_string().len()
                         }
                         ContentBlock::ToolResult { content, .. } => content.len(),
+                        // A reply never carries one; a model returns text.
+                        ContentBlock::Image { .. } => 0,
                     })
                     .sum();
                 self.input_tokens += estimate;

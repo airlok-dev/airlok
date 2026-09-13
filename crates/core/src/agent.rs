@@ -262,6 +262,11 @@ impl Agent {
                         history += name.len() + input.to_string().len();
                     }
                     ContentBlock::ToolResult { content, .. } => tool_results += content.len(),
+                    // Counted as the estimator counts it, so the parts
+                    // still add up to the whole.
+                    ContentBlock::Image { .. } => {
+                        history += (airlok_llm::IMAGE_TOKENS * 4) as usize
+                    }
                 }
             }
         }
@@ -746,6 +751,23 @@ impl Agent {
                 tool_use_id: tool_use_id.clone(),
                 content: self.redact_str(content, map),
                 is_error: *is_error,
+            },
+            // An image cannot be scanned, so its bytes go as they are.
+            // A reference has no bytes: it is all a resumed session kept,
+            // and sending it as an image would be a request with no data.
+            ContentBlock::Image { source } => match source {
+                airlok_llm::ImageSource::Base64 { .. } => block.clone(),
+                airlok_llm::ImageSource::Reference {
+                    media_type,
+                    width,
+                    height,
+                    ..
+                } => ContentBlock::Text {
+                    text: format!(
+                        "[image: {width}x{height} {}, sent earlier in this session and not retained]",
+                        media_type.strip_prefix("image/").unwrap_or(media_type)
+                    ),
+                },
             },
         }
     }

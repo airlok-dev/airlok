@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use tracing::{debug, trace};
 
 use crate::sse;
-use crate::types::{Api, ContentBlock, Request, Role, StopReason, StreamEvent, Usage};
+use crate::types::{Api, ContentBlock, ImageSource, Request, Role, StopReason, StreamEvent, Usage};
 use crate::{LlmError, Provider};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -142,9 +142,15 @@ fn wire_request(request: &Request) -> Value {
     for message in &request.messages {
         let mut text = String::new();
         let mut tool_calls = Vec::new();
+        let mut images = Vec::new();
         for block in &message.content {
             match block {
                 ContentBlock::Text { text: t } => text.push_str(t),
+                ContentBlock::Image { source } => {
+                    if let Some(url) = data_url(source) {
+                        images.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                    }
+                }
                 ContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                     "id": id,
                     "type": "function",
@@ -173,7 +179,16 @@ fn wire_request(request: &Request) -> Value {
                 messages.push(assistant);
             }
             Role::User => {
-                if !text.is_empty() {
+                // Only a message carrying an image needs the array form,
+                // so every text-only message keeps the shape it had.
+                if !images.is_empty() {
+                    let mut parts = Vec::new();
+                    if !text.is_empty() {
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
+                    parts.extend(images);
+                    messages.push(json!({"role": "user", "content": parts}));
+                } else if !text.is_empty() {
                     messages.push(json!({"role": "user", "content": text}));
                 }
             }
@@ -219,9 +234,15 @@ fn wire_responses(request: &Request) -> Value {
         let mut text = String::new();
         let mut calls = Vec::new();
         let mut results = Vec::new();
+        let mut images = Vec::new();
         for block in &message.content {
             match block {
                 ContentBlock::Text { text: t } => text.push_str(t),
+                ContentBlock::Image { source } => {
+                    if let Some(url) = data_url(source) {
+                        images.push(json!({"type": "input_image", "image_url": url}));
+                    }
+                }
                 ContentBlock::ToolUse { id, name, input } => calls.push(json!({
                     "type": "function_call",
                     "call_id": id,
@@ -239,15 +260,20 @@ fn wire_responses(request: &Request) -> Value {
                 })),
             }
         }
-        if !text.is_empty() {
+        if !text.is_empty() || !images.is_empty() {
             let (role, part) = match message.role {
                 Role::Assistant => ("assistant", "output_text"),
                 Role::User => ("user", "input_text"),
             };
+            let mut content = Vec::new();
+            if !text.is_empty() {
+                content.push(json!({"type": part, "text": text}));
+            }
+            content.extend(images);
             input.push(json!({
                 "type": "message",
                 "role": role,
-                "content": [{"type": part, "text": text}],
+                "content": content,
             }));
         }
         input.append(&mut calls);
@@ -430,6 +456,18 @@ impl sse::Assembler for ResponsesAssembler {
             }
             _ => Ok(Vec::new()),
         }
+    }
+}
+
+/// A data URL for the providers that take an image inline. A reference
+/// carries no bytes, so it has no URL; `redact_block` turns those into
+/// text long before a request is built.
+fn data_url(source: &ImageSource) -> Option<String> {
+    match source {
+        ImageSource::Base64 { media_type, data } => {
+            Some(format!("data:{media_type};base64,{data}"))
+        }
+        ImageSource::Reference { .. } => None,
     }
 }
 
@@ -1087,6 +1125,114 @@ mod tests {
         assert_eq!(
             responses.url().as_str(),
             "https://api.openai.com/v1/responses"
+        );
+    }
+
+    /// A user turn with one image, the shape both OpenAI APIs must carry.
+    fn image_request(api: Api) -> Request {
+        Request {
+            model: "m".into(),
+            max_tokens: 100,
+            system: String::new(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "what is this?".into(),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: "AAAB".into(),
+                        },
+                    },
+                ],
+            }],
+            tools: Vec::new(),
+            reasoning_effort: None,
+            api,
+        }
+    }
+
+    #[test]
+    fn an_image_goes_as_a_data_url_on_chat_completions() {
+        let body = wire_request(&image_request(Api::Chat));
+        assert_eq!(
+            body["messages"],
+            json!([{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAB"}},
+                ]
+            }])
+        );
+    }
+
+    #[test]
+    fn a_message_without_an_image_keeps_its_string_content() {
+        let request = Request {
+            model: "m".into(),
+            max_tokens: 10,
+            system: String::new(),
+            messages: vec![Message::user_text("hi")],
+            tools: Vec::new(),
+            reasoning_effort: None,
+            api: Api::Chat,
+        };
+        assert_eq!(
+            wire_request(&request)["messages"][0]["content"],
+            "hi",
+            "the array form is only for messages that carry an image"
+        );
+    }
+
+    #[test]
+    fn an_image_is_an_input_image_on_responses() {
+        let body = wire_responses(&image_request(Api::Responses));
+        assert_eq!(
+            body["input"],
+            json!([{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "what is this?"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAB"},
+                ]
+            }])
+        );
+    }
+
+    #[test]
+    fn a_reference_carries_no_bytes_so_it_reaches_no_wire() {
+        let mut request = image_request(Api::Chat);
+        request.messages[0].content[1] = ContentBlock::Image {
+            source: ImageSource::Reference {
+                media_type: "image/png".into(),
+                width: 100,
+                height: 50,
+                hash: "abc".into(),
+            },
+        };
+        let chat = wire_request(&request).to_string();
+        assert!(!chat.contains("image_url"), "{chat}");
+        let responses = wire_responses(&request).to_string();
+        assert!(!responses.contains("input_image"), "{responses}");
+    }
+
+    #[test]
+    fn an_image_is_not_estimated_by_the_length_of_its_base64() {
+        let mut request = image_request(Api::Chat);
+        if let ContentBlock::Image {
+            source: ImageSource::Base64 { data, .. },
+        } = &mut request.messages[0].content[1]
+        {
+            *data = "A".repeat(1_400_000);
+        }
+        let estimate = request.estimated_tokens();
+        assert!(
+            estimate < 5_000,
+            "one screenshot must not read as a full context: {estimate}"
         );
     }
 }

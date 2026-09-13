@@ -305,4 +305,33 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, LlmError::Protocol(m) if m == "Overloaded"));
     }
+
+    #[test]
+    fn an_image_serialises_to_anthropics_own_source_shape() {
+        let request = Request {
+            model: "claude".into(),
+            max_tokens: 10,
+            system: String::new(),
+            messages: vec![Message {
+                role: crate::types::Role::User,
+                content: vec![crate::types::ContentBlock::Image {
+                    source: crate::types::ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "AAAB".into(),
+                    },
+                }],
+            }],
+            tools: Vec::new(),
+            reasoning_effort: None,
+            api: Default::default(),
+        };
+        let body = serde_json::to_value(WireRequest::new(&request)).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"][0],
+            serde_json::json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "AAAB"},
+            })
+        );
+    }
 }
