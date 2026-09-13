@@ -498,6 +498,7 @@ async fn plan_then_go_researches_read_only_then_runs_with_every_tool() {
         ModelConfig {
             reasoning_effort: Some("none".into()),
             api: None,
+            vision: None,
         },
     );
     let mut repl = Repl {
@@ -631,6 +632,7 @@ async fn the_effort_in_force_says_where_it_came_from() {
         ModelConfig {
             reasoning_effort: Some("none".into()),
             api: None,
+            vision: None,
         },
     );
     let session = agent.new_session();
@@ -679,6 +681,7 @@ async fn raising_the_effort_off_a_none_config_warns_about_tools() {
         ModelConfig {
             reasoning_effort: Some("none".into()),
             api: None,
+            vision: None,
         },
     );
     let session = agent.new_session();
@@ -718,6 +721,7 @@ async fn the_tools_warning_is_for_chat_completions_only() {
         ModelConfig {
             reasoning_effort: Some("none".into()),
             api: Some(airlok_core::config::Api::Responses),
+            vision: None,
         },
     );
     let session = agent.new_session();

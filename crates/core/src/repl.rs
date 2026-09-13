@@ -320,6 +320,7 @@ pub const PERMISSION_NAMES: &[&str] = &[
     "confirm_writes",
     "confirm_bash",
     "confirm_mcp",
+    "confirm_images",
     "allow",
     "unallow",
     "deny",
@@ -1176,20 +1177,23 @@ impl Repl<'_> {
             _ => None,
         };
         match name {
-            "confirm_writes" | "confirm_bash" | "confirm_mcp" => match flag(&value) {
-                Some(on) => {
-                    match name {
-                        "confirm_writes" => safety.confirm_writes = on,
-                        "confirm_bash" => safety.confirm_bash = on,
-                        _ => safety.confirm_mcp = on,
+            "confirm_writes" | "confirm_bash" | "confirm_mcp" | "confirm_images" => {
+                match flag(&value) {
+                    Some(on) => {
+                        match name {
+                            "confirm_writes" => safety.confirm_writes = on,
+                            "confirm_bash" => safety.confirm_bash = on,
+                            "confirm_images" => safety.confirm_images = on,
+                            _ => safety.confirm_mcp = on,
+                        }
+                        out.status(&format!(
+                            "{name} {} for the rest of this session",
+                            if on { "on" } else { "off" }
+                        ));
                     }
-                    out.status(&format!(
-                        "{name} {} for the rest of this session",
-                        if on { "on" } else { "off" }
-                    ));
+                    None => out.status(&format!("{name} takes on or off, not {value}")),
                 }
-                None => out.status(&format!("{name} takes on or off, not {value}")),
-            },
+            }
             "allow" => {
                 if !safety.bash_allowlist.iter().any(|e| e == &value) {
                     safety.bash_allowlist.push(value.clone());
@@ -1233,10 +1237,11 @@ impl Repl<'_> {
         let safety = &self.agent.config().safety;
         let onoff = |on: bool| if on { "on" } else { "off" };
         out.status(&format!(
-            "confirm_writes {} · confirm_bash {} · confirm_mcp {}",
+            "confirm_writes {} · confirm_bash {} · confirm_mcp {} · confirm_images {}",
             onoff(safety.confirm_writes),
             onoff(safety.confirm_bash),
-            onoff(safety.confirm_mcp)
+            onoff(safety.confirm_mcp),
+            onoff(safety.confirm_images)
         ));
         out.status(&if safety.bash_allowlist.is_empty() {
             "allow list: empty, so every command asks".to_string()

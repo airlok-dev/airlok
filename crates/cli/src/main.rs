@@ -1212,6 +1212,7 @@ mod tests {
             ModelConfig {
                 reasoning_effort: Some("low".into()),
                 api: None,
+                vision: None,
             },
         );
         let mut session = airlok_core::Session::new(&cwd, &config);
@@ -1221,6 +1222,7 @@ mod tests {
             ModelSection {
                 reasoning_effort: Some("none".into()),
                 api: None,
+                vision: None,
             },
         );
 
