@@ -41,7 +41,7 @@ async fn a_session_file_records_an_image_without_its_bytes() {
     let dir = TempDir::new("session-image");
     let store = SessionStore::new(dir.path().join("data"));
     let provider = MockProvider::scripted(vec![]);
-    let mut agent = agent(provider, dir.path());
+    let agent = agent(provider, dir.path());
     let mut session = agent.new_session();
 
     // Stands in for a screenshot: what matters is that none of it lands.
