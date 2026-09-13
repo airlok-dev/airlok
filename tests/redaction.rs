@@ -52,6 +52,49 @@ async fn api_key_read_from_a_file_never_reaches_the_provider() {
 }
 
 #[tokio::test]
+async fn redaction_holds_with_the_model_on_the_responses_api() {
+    let dir = TempDir::new("redact-responses");
+    std::fs::write(
+        dir.path().join(".env"),
+        format!("ANTHROPIC_API_KEY={KEY}\n"),
+    )
+    .unwrap();
+
+    let provider = MockProvider::scripted(vec![
+        tool_call("toolu_1", "read_file", json!({"path": ".env"})),
+        reply("The key in .env is <<SECRET_1>>."),
+    ]);
+    let mut out = RecordingOutput::default();
+    let mut agent = agent(provider.clone(), dir.path());
+    agent.config_mut().provider.api = airlok_core::config::Api::Responses;
+
+    agent
+        .run(
+            &format!("what is the key in .env? also, my key is {KEY}"),
+            &mut out,
+        )
+        .await
+        .unwrap();
+
+    for request in provider.requests() {
+        assert_eq!(
+            request.api,
+            airlok_core::config::Api::Responses,
+            "the choice rides on the request the provider is handed"
+        );
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(
+            !wire.contains("sk-ant-"),
+            "secret leaked to provider: {wire}"
+        );
+        assert!(!wire.contains(KEY));
+    }
+    let wire = serde_json::to_string(&provider.requests()[1]).unwrap();
+    assert!(wire.contains("ANTHROPIC_API_KEY=<<SECRET_1>>"), "{wire}");
+    assert_eq!(out.text(), format!("The key in .env is {}.", mask(KEY)));
+}
+
+#[tokio::test]
 async fn placeholder_split_across_stream_chunks_is_rehydrated() {
     let dir = TempDir::new("split");
     std::fs::write(dir.path().join(".env"), format!("TOKEN={KEY}\n")).unwrap();
