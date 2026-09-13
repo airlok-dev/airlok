@@ -982,11 +982,24 @@ impl Repl<'_> {
         ));
         // Raising the effort on a model the config pins to none is how a
         // deployment starts refusing tools, which reads as an unrelated
-        // failure a turn later.
-        if value != "none" && self.backend.startup_effort(&model).as_deref() == Some("none") {
+        // failure a turn later. The Responses API is where that pairing
+        // works, so the warning belongs to chat completions only.
+        let on_chat = self
+            .agent
+            .config()
+            .models
+            .get(&model)
+            .and_then(|m| m.api)
+            .unwrap_or(self.agent.config().provider.api)
+            == crate::config::Api::Chat;
+        if value != "none"
+            && on_chat
+            && self.backend.startup_effort(&model).as_deref() == Some("none")
+        {
             out.status(&format!(
                 "note: the config sets {model} to none. On chat completions this deployment may \
-                 refuse to take tools with an effort set; /effort none puts it back"
+                 refuse to take tools with an effort set; /effort none puts it back, or give it \
+                 api = \"responses\""
             ));
         }
         self.save(session, out);
