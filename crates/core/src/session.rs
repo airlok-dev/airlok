@@ -110,6 +110,8 @@ impl Usage {
                             name.len() + input.to_string().len()
                         }
                         ContentBlock::ToolResult { content, .. } => content.len(),
+                        // A reply never carries one; a model returns text.
+                        ContentBlock::Image { .. } => 0,
                     })
                     .sum();
                 self.input_tokens += estimate;
@@ -240,6 +242,29 @@ impl Session {
         for entry in copy.redactions.values_mut() {
             if entry.class == Class::RedactOnly {
                 entry.value.clear();
+            }
+        }
+        // Hash, dimensions and format are enough for --resume to say an
+        // image was sent. The bytes are never written.
+        for message in &mut copy.messages {
+            for block in &mut message.content {
+                let ContentBlock::Image { source } = block else {
+                    continue;
+                };
+                if let airlok_llm::ImageSource::Base64 {
+                    media_type,
+                    data,
+                    width,
+                    height,
+                } = source
+                {
+                    *source = airlok_llm::ImageSource::Reference {
+                        media_type: media_type.clone(),
+                        width: *width,
+                        height: *height,
+                        hash: format!("{:016x}", fnv1a(data.as_bytes())),
+                    };
+                }
             }
         }
         copy

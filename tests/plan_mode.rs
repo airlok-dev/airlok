@@ -34,6 +34,7 @@ fn astra(provider: Arc<MockProvider>, cwd: &Path) -> Agent {
         ModelConfig {
             reasoning_effort: Some("none".into()),
             api: None,
+            vision: None,
         },
     );
     agent

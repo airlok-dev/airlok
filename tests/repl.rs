@@ -498,6 +498,7 @@ async fn plan_then_go_researches_read_only_then_runs_with_every_tool() {
         ModelConfig {
             reasoning_effort: Some("none".into()),
             api: None,
+            vision: None,
         },
     );
     let mut repl = Repl {
@@ -631,6 +632,7 @@ async fn the_effort_in_force_says_where_it_came_from() {
         ModelConfig {
             reasoning_effort: Some("none".into()),
             api: None,
+            vision: None,
         },
     );
     let session = agent.new_session();
@@ -669,6 +671,224 @@ async fn the_effort_in_force_says_where_it_came_from() {
     );
 }
 
+/// The smallest valid PNG, so a test can put a real image on disk
+/// without pulling in an encoder.
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
+/// An already-prepared image, so a test can attach one without a
+/// clipboard or an encoder.
+fn attachment(label: &str) -> airlok_core::repl::Attachment {
+    airlok_core::repl::Attachment {
+        label: label.to_string(),
+        image: airlok_core::image::Prepared {
+            media_type: "image/png".into(),
+            data: "AAABBBCCC".into(),
+            width: 320,
+            height: 200,
+            hash: "0123456789abcdef".into(),
+            bytes: 9,
+            notes: Vec::new(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_image_path_is_offered_and_anything_else_is_left_as_text() {
+    let dir = TempDir::new("attach-path");
+    // A directory with a space, so the escaped form a terminal delivers
+    // for a drag and drop is what gets parsed.
+    std::fs::create_dir_all(dir.path().join("my shots")).unwrap();
+    std::fs::write(dir.path().join("my shots/shot.png"), PNG_1X1).unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+
+    let provider = MockProvider::scripted(vec![reply("seen")]);
+    let mut agent = agent(provider.clone(), dir.path());
+    let session = agent.new_session();
+    let typed = format!(
+        "look at {}/my\\ shots/shot.png and notes.txt and /nope/missing.png",
+        dir.path().display()
+    );
+    let mut lines = ScriptedLines::typed(&[&typed]);
+    let mut out = RecordingOutput::answering(vec![
+        airlok_core::Decision::Approve,
+        airlok_core::Decision::Approve,
+    ]);
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let offered: Vec<&airlok_tests::Shown> = out
+        .events
+        .iter()
+        .filter(|e| matches!(e, airlok_tests::Shown::ConfirmAttachPath { .. }))
+        .collect();
+    assert_eq!(
+        offered.len(),
+        1,
+        "only the path that exists and is an image: {offered:?}"
+    );
+
+    let sent = &provider.requests()[0].messages[0];
+    let text: String = sent
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            airlok_llm::ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        sent.content
+            .iter()
+            .any(|b| matches!(b, airlok_llm::ContentBlock::Image { .. })),
+        "the approved image is attached"
+    );
+    assert!(
+        !text.contains("shot.png"),
+        "the bare path must not be sent as text: {text}"
+    );
+    assert!(
+        text.contains("notes.txt") && text.contains("/nope/missing.png"),
+        "a non-image and a path that does not exist stay as typed: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_path_followed_by_punctuation_is_still_an_image() {
+    let dir = TempDir::new("attach-punct");
+    std::fs::write(dir.path().join("sky.png"), PNG_1X1).unwrap();
+
+    let provider = MockProvider::scripted(vec![reply("blue")]);
+    let mut agent = agent(provider.clone(), dir.path());
+    let session = agent.new_session();
+    let typed = format!(
+        "what colour is {}/sky.png? answer in one word",
+        dir.path().display()
+    );
+    let mut lines = ScriptedLines::typed(&[&typed]);
+    let mut out = RecordingOutput::answering(vec![
+        airlok_core::Decision::Approve,
+        airlok_core::Decision::Approve,
+    ]);
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let sent = &provider.requests()[0].messages[0];
+    assert!(
+        sent.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. })),
+        "a path ending a question is still a path: {:?}",
+        out.events
+    );
+    let text: String = sent
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(!text.contains("sky.png"), "{text}");
+    assert!(
+        text.contains("answer in one word") && text.contains('?'),
+        "the sentence keeps its punctuation: {text}"
+    );
+}
+
+#[tokio::test]
+async fn images_are_confirmed_before_they_leave_and_yes_skips_it() {
+    for (confirm, expect_ask) in [(true, true), (false, false)] {
+        let dir = TempDir::new("attach-gate");
+        let provider = MockProvider::scripted(vec![reply("seen")]);
+        let mut agent = agent(provider.clone(), dir.path());
+        agent.config_mut().safety.confirm_images = confirm;
+        let session = agent.new_session();
+        let mut lines =
+            ScriptedLines::typed(&["what is this?"]).attaching(vec![attachment("image 1")]);
+        let mut out = RecordingOutput::answering(vec![airlok_core::Decision::Approve]);
+        {
+            let mut repl = Repl {
+                agent: &mut agent,
+                store: None,
+                interrupt: Interrupt::new(),
+                backend: Box::new(TestBackend::default()),
+                used: Vec::new(),
+            };
+            repl.run(session, &mut lines, &mut out).await;
+        }
+
+        let asked = out
+            .events
+            .iter()
+            .any(|e| matches!(e, airlok_tests::Shown::ConfirmUnscannedImages { .. }));
+        assert_eq!(asked, expect_ask, "confirm_images = {confirm}");
+        assert!(
+            provider.requests()[0].messages[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, airlok_llm::ContentBlock::Image { .. })),
+            "the image is sent either way once approved"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_front_end_is_told_when_a_model_takes_no_images() {
+    let dir = TempDir::new("attach-vision");
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = on_openai(provider, dir.path(), "gpt-6-astra");
+    agent.config_mut().models.insert(
+        "gpt-6-astra".into(),
+        ModelConfig {
+            reasoning_effort: None,
+            api: None,
+            vision: Some(false),
+        },
+    );
+    let session = agent.new_session();
+    let mut lines = ScriptedLines::typed(&[]);
+    let mut out = RecordingOutput::default();
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let policy = lines.policies.last().expect("a policy per prompt");
+    assert_eq!(policy.model, "gpt-6-astra");
+    assert!(
+        !policy.accepts_images,
+        "the front end refuses at attach time rather than sending and failing"
+    );
+}
+
 #[tokio::test]
 async fn raising_the_effort_off_a_none_config_warns_about_tools() {
     let dir = TempDir::new("effort-warn");
@@ -679,6 +899,7 @@ async fn raising_the_effort_off_a_none_config_warns_about_tools() {
         ModelConfig {
             reasoning_effort: Some("none".into()),
             api: None,
+            vision: None,
         },
     );
     let session = agent.new_session();
@@ -718,6 +939,7 @@ async fn the_tools_warning_is_for_chat_completions_only() {
         ModelConfig {
             reasoning_effort: Some("none".into()),
             api: Some(airlok_core::config::Api::Responses),
+            vision: None,
         },
     );
     let session = agent.new_session();

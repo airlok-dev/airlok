@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod config;
 pub mod context;
+pub mod image;
 pub mod interrupt;
 pub mod mcp;
 pub mod redact;
@@ -85,6 +86,10 @@ impl CoreError {
                     "the request was longer than {model} accepts. /compact summarises the older                      turns, /clear starts fresh, and [provider] context_window tells airlok the                      real size so it compacts on its own."
                 )
             }
+            400 if body_says("image") || body_says("image_url") => format!(
+                "{model} did not accept an image. Set vision = false under [models.\"{model}\"] \
+                 and airlok will say so when you attach one, instead of failing the turn."
+            ),
             400 if body_says("deploymentnotfound") => format!(
                 "{provider} has no deployment called {model}. On Azure the model id is the                  deployment name you created."
             ),

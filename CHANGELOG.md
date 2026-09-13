@@ -2,6 +2,21 @@
 
 All notable changes to airlok. The format follows Keep a Changelog; versions follow SemVer.
 
+## [0.9.2] - 2026-09-13
+
+### Added
+
+- Image input. Ctrl+V, or Alt+V, attaches an image from the clipboard and puts a chip like `[image 1: 1024x768 png, 210 KB]` in the line at the cursor, so the sentence can refer to it. Several images fit in one message. The backend is chosen per platform, `osascript` on macOS, `wl-paste` then `xclip` on Linux after checking a display server is running at all, and PowerShell on Windows; `-v` names the one that ran.
+- A path to an image, whether typed, Tab-completed or dropped into the terminal, is offered as an attachment. Taken, it becomes a chip and the picture is what the model gets; refused, the text stays exactly as typed. A path that does not exist, or is not an image, is left alone.
+- `ContentBlock::Image` in the llm crate, sent as base64 on all three wire shapes: Anthropic's `source` object, Chat Completions' `image_url` data URL, and the Responses API's `input_image`. Anything over 1568px on the long edge is downscaled and anything over 5 MB is re-encoded, with a line saying what was done; a message whose images come to more than 20 MB is refused.
+- `[safety] confirm_images`, on by default, asks before an image leaves, because an image cannot be scanned for secrets. `--yes` skips it like the other confirmations, and `/permissions` shows and sets it.
+- `[models."<id>"] vision = false` makes a model that takes no images refuse at attach time, naming the model, instead of failing the turn later as a provider error. A provider that rejects an image now explains itself in terms of that setting.
+
+### Fixed
+
+- Session files record an image as its hash, dimensions and format, never its bytes, so `--resume` shows that an image was sent without keeping it. A resumed image becomes a line of text on the way to the provider, since there are no bytes left to send.
+- An image is estimated at a flat token cost rather than the length of its base64. Counting those characters read one screenshot as hundreds of thousands of tokens, which compacted the session on the next turn and made `/context` and the token counter nonsense.
+
 ## [0.9.1] - 2026-09-13
 
 ### Added

@@ -17,6 +17,9 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    Image {
+        source: ImageSource,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -27,6 +30,31 @@ pub enum ContentBlock {
         content: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+    },
+}
+
+/// Where an image's bytes are. `Base64` is what a provider takes and is
+/// the only form that goes on the wire. `Reference` is what a session
+/// file keeps, so a resumed conversation remembers that an image was
+/// sent without storing a single byte of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSource {
+    Base64 {
+        media_type: String,
+        data: String,
+        /// In memory only, so a session file can record what was sent
+        /// without keeping the bytes. Serialised neither way.
+        #[serde(skip)]
+        width: u32,
+        #[serde(skip)]
+        height: u32,
+    },
+    Reference {
+        media_type: String,
+        width: u32,
+        height: u32,
+        hash: String,
     },
 }
 
@@ -87,6 +115,11 @@ impl std::fmt::Display for Api {
     }
 }
 
+/// What one image is counted as when estimating a request. Providers
+/// price images by area rather than by bytes; this is the right order of
+/// magnitude for a screenshot and keeps the estimate honest.
+pub const IMAGE_TOKENS: u64 = 1500;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub model: String,
@@ -137,21 +170,27 @@ impl Request {
     /// usage. Counts what the wire body carries, not its JSON framing.
     pub fn estimated_tokens(&self) -> u64 {
         let mut chars = self.system.len();
+        let mut tokens = 0u64;
         for message in &self.messages {
             for block in &message.content {
-                chars += match block {
-                    ContentBlock::Text { text } => text.len(),
+                match block {
+                    ContentBlock::Text { text } => chars += text.len(),
                     ContentBlock::ToolUse { name, input, .. } => {
-                        name.len() + input.to_string().len()
+                        chars += name.len() + input.to_string().len()
                     }
-                    ContentBlock::ToolResult { content, .. } => content.len(),
-                };
+                    ContentBlock::ToolResult { content, .. } => chars += content.len(),
+                    // What an image costs has nothing to do with how long
+                    // its base64 is. Counting those characters would read
+                    // one screenshot as hundreds of thousands of tokens
+                    // and compact the session on the next turn.
+                    ContentBlock::Image { .. } => tokens += IMAGE_TOKENS,
+                }
             }
         }
         for tool in &self.tools {
             chars += tool.name.len() + tool.description.len() + tool.input_schema.to_string().len();
         }
-        (chars / 4) as u64
+        (chars / 4) as u64 + tokens
     }
 }
 

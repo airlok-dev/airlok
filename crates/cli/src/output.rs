@@ -242,6 +242,18 @@ impl Output for Stdout {
                     terminal.ask_paged("Apply?", rest)
                 }
                 Confirmation::Command { command } => terminal.ask(&format!("Run `{command}`?")),
+                Confirmation::AttachPath { path, summary } => terminal.ask(&format!(
+                    "attach {} as an image? ({summary})",
+                    path.display()
+                )),
+                Confirmation::UnscannedImages { labels } => {
+                    let lines: Vec<String> = labels
+                        .iter()
+                        .map(|label| format!("[{label}] cannot be scanned for secrets"))
+                        .collect();
+                    terminal.show_lines(&lines);
+                    terminal.ask("Send them?")
+                }
                 Confirmation::McpProject { servers } => {
                     let mut lines = vec![
                         "This project's .mcp.json asks to start MCP servers in this repository."
@@ -499,7 +511,7 @@ mod tests {
             .block_on(async {
                 out.begin_turn();
                 agent
-                    .turn_with(&mut session, "go", &mut out, &interrupt)
+                    .turn_with(&mut session, "go", &[], &mut out, &interrupt)
                     .await
                     .unwrap();
                 out.end_turn();

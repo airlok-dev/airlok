@@ -262,6 +262,11 @@ impl Agent {
                         history += name.len() + input.to_string().len();
                     }
                     ContentBlock::ToolResult { content, .. } => tool_results += content.len(),
+                    // Counted as the estimator counts it, so the parts
+                    // still add up to the whole.
+                    ContentBlock::Image { .. } => {
+                        history += (airlok_llm::IMAGE_TOKENS * 4) as usize
+                    }
                 }
             }
         }
@@ -343,7 +348,7 @@ impl Agent {
         prompt: &str,
         out: &mut dyn Output,
     ) -> Result<usize, CoreError> {
-        self.turn_with(session, prompt, out, &Interrupt::new())
+        self.turn_with(session, prompt, &[], out, &Interrupt::new())
             .await
     }
 
@@ -354,6 +359,7 @@ impl Agent {
         &mut self,
         session: &mut Session,
         prompt: &str,
+        images: &[crate::image::Prepared],
         out: &mut dyn Output,
         interrupt: &Interrupt,
     ) -> Result<usize, CoreError> {
@@ -366,7 +372,9 @@ impl Agent {
             self.compact(session, out).await?;
         }
         let start = session.messages.len();
-        let result = self.rounds(session, prompt, out, &mut watcher).await;
+        let result = self
+            .rounds(session, prompt, images, out, &mut watcher)
+            .await;
         if result.is_err() {
             // A failed turn leaves no dangling user message for the next
             // turn (or a resume) to trip over.
@@ -584,6 +592,7 @@ impl Agent {
         &mut self,
         session: &mut Session,
         prompt: &str,
+        images: &[crate::image::Prepared],
         out: &mut dyn Output,
         watcher: &mut Watcher,
     ) -> Result<usize, CoreError> {
@@ -601,7 +610,21 @@ impl Agent {
             self.mcp_note().as_deref(),
         );
         let specs = self.specs();
-        session.messages.push(Message::user_text(prompt));
+        let mut content = Vec::new();
+        if !prompt.is_empty() {
+            content.push(ContentBlock::Text {
+                text: prompt.to_string(),
+            });
+        }
+        for image in images {
+            content.push(ContentBlock::Image {
+                source: image.source(),
+            });
+        }
+        session.messages.push(Message {
+            role: airlok_llm::Role::User,
+            content,
+        });
         session.interrupted = false;
         let mut approved = Approved::default();
         let spent_before = session.usage.spent();
@@ -746,6 +769,23 @@ impl Agent {
                 tool_use_id: tool_use_id.clone(),
                 content: self.redact_str(content, map),
                 is_error: *is_error,
+            },
+            // An image cannot be scanned, so its bytes go as they are.
+            // A reference has no bytes: it is all a resumed session kept,
+            // and sending it as an image would be a request with no data.
+            ContentBlock::Image { source } => match source {
+                airlok_llm::ImageSource::Base64 { .. } => block.clone(),
+                airlok_llm::ImageSource::Reference {
+                    media_type,
+                    width,
+                    height,
+                    ..
+                } => ContentBlock::Text {
+                    text: format!(
+                        "[image: {width}x{height} {}, sent earlier in this session and not retained]",
+                        media_type.strip_prefix("image/").unwrap_or(media_type)
+                    ),
+                },
             },
         }
     }

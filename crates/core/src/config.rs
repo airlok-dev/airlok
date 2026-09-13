@@ -26,6 +26,7 @@ pub fn with_safety_section(text: &str, safety: &SafetyConfig) -> Result<String, 
         confirm_writes: Some(safety.confirm_writes),
         confirm_bash: Some(safety.confirm_bash),
         confirm_mcp: Some(safety.confirm_mcp),
+        confirm_images: Some(safety.confirm_images),
         bash_allowlist: Some(safety.bash_allowlist.clone()),
         bash_denylist: Some(safety.bash_denylist.clone()),
     };
@@ -147,6 +148,8 @@ pub struct ModelSection {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api: Option<Api>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
 }
 
 /// One `[[mcp]]` entry on disk. `name` is required; everything else is
@@ -333,6 +336,8 @@ pub struct SafetySection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirm_mcp: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm_images: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bash_allowlist: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bash_denylist: Option<Vec<String>>,
@@ -404,6 +409,7 @@ impl ConfigFile {
                 confirm_writes: over.safety.confirm_writes.or(self.safety.confirm_writes),
                 confirm_bash: over.safety.confirm_bash.or(self.safety.confirm_bash),
                 confirm_mcp: over.safety.confirm_mcp.or(self.safety.confirm_mcp),
+                confirm_images: over.safety.confirm_images.or(self.safety.confirm_images),
                 bash_allowlist: over.safety.bash_allowlist.or(self.safety.bash_allowlist),
                 bash_denylist: over.safety.bash_denylist.or(self.safety.bash_denylist),
             },
@@ -464,6 +470,7 @@ fn layer_models(
             ModelSection {
                 reasoning_effort: section.reasoning_effort.or(merged.reasoning_effort),
                 api: section.api.or(merged.api),
+                vision: section.vision.or(merged.vision),
             },
         );
     }
@@ -501,6 +508,10 @@ pub struct ModelConfig {
     pub reasoning_effort: Option<String>,
     /// Overrides `[provider] api` for this model.
     pub api: Option<Api>,
+    /// Whether this model takes images. A deployment name says nothing
+    /// about it, so it cannot be inferred. Unset is treated as yes, and
+    /// the provider's refusal names this setting.
+    pub vision: Option<bool>,
 }
 
 /// A configured MCP server. Commands that produce secrets are kept as
@@ -665,6 +676,8 @@ pub struct SafetyConfig {
     pub confirm_bash: bool,
     /// Ask before a call to an MCP server whose `trust` is `prompt`.
     pub confirm_mcp: bool,
+    /// Ask before sending an image, which cannot be scanned for secrets.
+    pub confirm_images: bool,
     pub bash_allowlist: Vec<String>,
     pub bash_denylist: Vec<String>,
 }
@@ -805,6 +818,7 @@ impl Config {
                 confirm_writes: file.safety.confirm_writes.unwrap_or(true),
                 confirm_bash: file.safety.confirm_bash.unwrap_or(true),
                 confirm_mcp: file.safety.confirm_mcp.unwrap_or(true),
+                confirm_images: file.safety.confirm_images.unwrap_or(true),
                 bash_allowlist: file
                     .safety
                     .bash_allowlist
@@ -829,6 +843,7 @@ impl Config {
                         ModelConfig {
                             reasoning_effort: m.reasoning_effort,
                             api: m.api,
+                            vision: m.vision,
                         },
                     )
                 })
@@ -861,6 +876,7 @@ impl Config {
                 confirm_writes: Some(self.safety.confirm_writes),
                 confirm_bash: Some(self.safety.confirm_bash),
                 confirm_mcp: Some(self.safety.confirm_mcp),
+                confirm_images: Some(self.safety.confirm_images),
                 bash_allowlist: Some(self.safety.bash_allowlist.clone()),
                 bash_denylist: Some(self.safety.bash_denylist.clone()),
             },
@@ -879,6 +895,7 @@ impl Config {
                         ModelSection {
                             reasoning_effort: m.reasoning_effort.clone(),
                             api: m.api,
+                            vision: m.vision,
                         },
                     )
                 })
@@ -937,6 +954,7 @@ impl Overrides {
             layer.safety.confirm_writes = Some(false);
             layer.safety.confirm_bash = Some(false);
             layer.safety.confirm_mcp = Some(false);
+            layer.safety.confirm_images = Some(false);
         }
         layer
     }
@@ -1008,6 +1026,7 @@ pub const TEMPLATE: &str = r##"# airlok configuration. Precedence: CLI flags > .
 # confirm_writes = true    # show a diff and ask before write_file / edit_file
 # confirm_bash = true      # ask before running a command that is not allowlisted
 # confirm_mcp = true      # ask before calling a tool on an MCP server whose trust is "prompt"
+# confirm_images = true   # ask before sending an image, which cannot be scanned for secrets
 # bash_allowlist = ["git status", "git diff", "ls", "cat", "pwd", "find", "grep", "rg", "cargo check", "cargo test", "cargo build"]
 # bash_denylist = ["rm -rf", "git push --force", "sudo"]
 
@@ -1021,6 +1040,7 @@ pub const TEMPLATE: &str = r##"# airlok configuration. Precedence: CLI flags > .
 # [models."gpt-6-astra"]
 # reasoning_effort = "none"   # openai only, sent as reasoning_effort; Azure's gpt-6-astra needs "none" to use tools on Chat Completions
 # api = "responses"          # openai only: "chat" (the default) or "responses"
+# vision = false             # set when the model refuses images, so the refusal comes at attach time
 
 # An MCP server whose tools the model may call, offered as <name>__<tool>. Repeat the block for more.
 # [[mcp]]

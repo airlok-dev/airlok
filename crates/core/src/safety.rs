@@ -31,6 +31,18 @@ pub enum Confirmation<'a> {
         root: Option<&'a str>,
         paths: &'a [String],
     },
+    /// A path the user typed or dropped that is an image on disk.
+    /// Sending the path as text would tell the model nothing about the
+    /// picture, so it is offered as an attachment instead.
+    AttachPath {
+        path: &'a Path,
+        summary: &'a str,
+    },
+    /// Images about to leave the machine. They cannot be scanned for
+    /// secrets, so this is the last point at which they can be stopped.
+    UnscannedImages {
+        labels: &'a [String],
+    },
     /// The project's own `.mcp.json` names servers this checkout has not
     /// been asked about. Each pair is a server and what it would run, so
     /// the question is answerable without opening the file.

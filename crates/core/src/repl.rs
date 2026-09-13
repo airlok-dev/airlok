@@ -39,6 +39,33 @@ pub trait LineSource {
     /// Offered by Tab after a command that takes an argument. A front end
     /// that does not complete can ignore them.
     fn set_candidates(&mut self, _candidates: Candidates) {}
+
+    /// Images attached to the line just read, in the order their chips
+    /// appear in it. Taken once, so the next line starts with none.
+    fn take_attachments(&mut self) -> Vec<Attachment> {
+        Vec::new()
+    }
+
+    /// What may be attached, refreshed before every prompt so that a
+    /// /model switch is reflected without restarting.
+    fn set_attach_policy(&mut self, _policy: AttachPolicy) {}
+}
+
+/// An image a front end attached to the line being typed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    /// `image 1`, matching the chip shown in the line.
+    pub label: String,
+    pub image: crate::image::Prepared,
+}
+
+/// What the front end needs in order to refuse an attachment at the
+/// moment it is made, rather than a turn later as a provider error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachPolicy {
+    pub model: String,
+    /// False only when the config says so for this model.
+    pub accepts_images: bool,
 }
 
 /// One `/doctor` check: what was tried, whether it worked, and a line
@@ -320,11 +347,89 @@ pub const PERMISSION_NAMES: &[&str] = &[
     "confirm_writes",
     "confirm_bash",
     "confirm_mcp",
+    "confirm_images",
     "allow",
     "unallow",
     "deny",
     "undeny",
 ];
+
+/// The image a token names, with the trailing punctuation left out of
+/// both the path and the text that gets replaced.
+fn image_path(token: &Token) -> Option<Token> {
+    let trimmed = token
+        .text
+        .trim_end_matches(['?', '!', ',', ';', ':', ')', '.']);
+    for text in [token.text.as_str(), trimmed] {
+        let path = std::path::Path::new(text);
+        if crate::image::media_type_for_path(path).is_some() && path.is_file() {
+            // The raw form loses the same suffix, so the replacement
+            // keeps the sentence's punctuation.
+            let dropped = token.text.len() - text.len();
+            let raw = token.raw[..token.raw.len() - dropped].to_string();
+            return Some(Token {
+                raw,
+                text: text.to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// One word of a line, as typed and as it means.
+struct Token {
+    /// Exactly as it appears, so it can be replaced in the line.
+    raw: String,
+    /// Unescaped and unquoted, so it can be opened.
+    text: String,
+}
+
+/// Splits a line the way a terminal delivers a dropped path: quoted, or
+/// with its spaces escaped.
+fn tokens(line: &str) -> Vec<Token> {
+    let mut out = Vec::new();
+    let mut raw = String::new();
+    let mut text = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                raw.push(c);
+                if let Some(next) = chars.next() {
+                    raw.push(next);
+                    text.push(next);
+                }
+            }
+            '\'' | '"' if quote.is_none() => {
+                raw.push(c);
+                quote = Some(c);
+            }
+            c if Some(c) == quote => {
+                raw.push(c);
+                quote = None;
+            }
+            c if c.is_whitespace() && quote.is_none() => {
+                if !text.is_empty() {
+                    out.push(Token {
+                        raw: std::mem::take(&mut raw),
+                        text: std::mem::take(&mut text),
+                    });
+                } else {
+                    raw.clear();
+                }
+            }
+            c => {
+                raw.push(c);
+                text.push(c);
+            }
+        }
+    }
+    if !text.is_empty() {
+        out.push(Token { raw, text });
+    }
+    out
+}
 
 /// `part` as a percentage of `whole`, and 0 when there is no whole.
 fn share(part: u64, whole: u64) -> u64 {
@@ -428,11 +533,15 @@ impl Repl<'_> {
         loop {
             let prompt = self.prompt_text();
             lines.set_candidates(self.candidates(&session));
+            lines.set_attach_policy(self.attach_policy(&session));
             match lines.read_line(&prompt) {
                 Line::Eof => break,
                 // Ctrl-C at the prompt does nothing; Ctrl-D or /exit quits.
                 Line::Interrupt => continue,
                 Line::Text(line) => {
+                    // Drained whatever the line turns out to be, so an
+                    // image never carries over to a later one.
+                    let attached = lines.take_attachments();
                     let line = line.trim();
                     if let Some(command) = line.strip_prefix('/') {
                         if self.command(command, &mut session, out).await == Flow::Exit {
@@ -442,8 +551,8 @@ impl Repl<'_> {
                         self.run_local(command.trim(), &mut session, out).await;
                     } else if let Some(note) = line.strip_prefix('#') {
                         self.remember(note.trim(), out);
-                    } else if !line.is_empty() {
-                        self.turn(&mut session, line, out).await;
+                    } else if !line.is_empty() || !attached.is_empty() {
+                        self.turn(&mut session, line, attached, out).await;
                     }
                 }
             }
@@ -515,11 +624,99 @@ impl Repl<'_> {
         format!("{} {dir}{plan}> ", config.provider.model)
     }
 
-    async fn turn(&mut self, session: &mut Session, line: &str, out: &mut dyn Output) {
+    /// Offers any path in the line that is an image on disk. An
+    /// approved one is replaced by its chip, so the model is never handed
+    /// the bare path; a refused one is left exactly as typed, because
+    /// that is what the user chose.
+    fn offer_paths(
+        &mut self,
+        line: &str,
+        mut attached: Vec<Attachment>,
+        out: &mut dyn Output,
+    ) -> (String, Vec<Attachment>) {
+        let mut rebuilt = line.to_string();
+        for token in tokens(line) {
+            // A path typed mid-sentence carries the punctuation that
+            // follows it, and "sky.png?" is not an extension airlok knows.
+            let Some(found) = image_path(&token) else {
+                continue;
+            };
+            let path = std::path::Path::new(&found.text);
+            match crate::image::prepare_path(path) {
+                Err(e) => out.status(&e.to_string()),
+                Ok(image) => {
+                    let summary = image.summary();
+                    let decision = out.confirm(&Confirmation::AttachPath {
+                        path,
+                        summary: &summary,
+                    });
+                    match decision {
+                        Decision::Approve | Decision::ApproveAll | Decision::SaveAll => {
+                            let label = format!("image {}", attached.len() + 1);
+                            rebuilt = rebuilt.replace(&found.raw, &format!("[{label}: {summary}]"));
+                            for note in &image.notes {
+                                out.status(note);
+                            }
+                            attached.push(Attachment { label, image });
+                        }
+                        Decision::Reject | Decision::Quit => {}
+                    }
+                }
+            }
+        }
+        (rebuilt.trim().to_string(), attached)
+    }
+
+    /// What the front end may attach right now.
+    fn attach_policy(&mut self, session: &Session) -> AttachPolicy {
+        let model = session.model.clone();
+        let accepts_images = self
+            .agent
+            .config()
+            .models
+            .get(&model)
+            .and_then(|m| m.vision)
+            .unwrap_or(true);
+        AttachPolicy {
+            model,
+            accepts_images,
+        }
+    }
+
+    async fn turn(
+        &mut self,
+        session: &mut Session,
+        line: &str,
+        attached: Vec<Attachment>,
+        out: &mut dyn Output,
+    ) {
+        // A path that is an image on disk is worth more as the picture
+        // than as its own name, so it is offered rather than sent as text.
+        let (line, attached) = self.offer_paths(line, attached, out);
+        let images: Vec<crate::image::Prepared> =
+            attached.iter().map(|a| a.image.clone()).collect();
+        if let Err(e) = crate::image::within_budget(&images) {
+            out.status(&format!("{e}"));
+            return;
+        }
+        if !images.is_empty() && self.agent.config().safety.confirm_images {
+            let labels: Vec<String> = attached.iter().map(|a| a.label.clone()).collect();
+            match out.confirm(&Confirmation::UnscannedImages { labels: &labels }) {
+                Decision::Approve | Decision::ApproveAll | Decision::SaveAll => {}
+                Decision::Reject | Decision::Quit => {
+                    out.status("nothing sent");
+                    return;
+                }
+            }
+        }
+        if images.is_empty() && line.is_empty() {
+            return;
+        }
+        let line = line.as_str();
         out.begin_turn();
         match self
             .agent
-            .turn_with(session, line, out, &self.interrupt)
+            .turn_with(session, line, &images, out, &self.interrupt)
             .await
         {
             Ok(_) => {}
@@ -824,8 +1021,13 @@ impl Repl<'_> {
         };
         self.agent.set_plan_mode(false);
         out.status("plan mode off; carrying out the plan");
-        self.turn(session, &format!("Carry out this plan:\n\n{plan}"), out)
-            .await;
+        self.turn(
+            session,
+            &format!("Carry out this plan:\n\n{plan}"),
+            Vec::new(),
+            out,
+        )
+        .await;
     }
 
     /// Runs a `!` command in the working directory, shows what it printed,
@@ -1176,20 +1378,23 @@ impl Repl<'_> {
             _ => None,
         };
         match name {
-            "confirm_writes" | "confirm_bash" | "confirm_mcp" => match flag(&value) {
-                Some(on) => {
-                    match name {
-                        "confirm_writes" => safety.confirm_writes = on,
-                        "confirm_bash" => safety.confirm_bash = on,
-                        _ => safety.confirm_mcp = on,
+            "confirm_writes" | "confirm_bash" | "confirm_mcp" | "confirm_images" => {
+                match flag(&value) {
+                    Some(on) => {
+                        match name {
+                            "confirm_writes" => safety.confirm_writes = on,
+                            "confirm_bash" => safety.confirm_bash = on,
+                            "confirm_images" => safety.confirm_images = on,
+                            _ => safety.confirm_mcp = on,
+                        }
+                        out.status(&format!(
+                            "{name} {} for the rest of this session",
+                            if on { "on" } else { "off" }
+                        ));
                     }
-                    out.status(&format!(
-                        "{name} {} for the rest of this session",
-                        if on { "on" } else { "off" }
-                    ));
+                    None => out.status(&format!("{name} takes on or off, not {value}")),
                 }
-                None => out.status(&format!("{name} takes on or off, not {value}")),
-            },
+            }
             "allow" => {
                 if !safety.bash_allowlist.iter().any(|e| e == &value) {
                     safety.bash_allowlist.push(value.clone());
@@ -1233,10 +1438,11 @@ impl Repl<'_> {
         let safety = &self.agent.config().safety;
         let onoff = |on: bool| if on { "on" } else { "off" };
         out.status(&format!(
-            "confirm_writes {} · confirm_bash {} · confirm_mcp {}",
+            "confirm_writes {} · confirm_bash {} · confirm_mcp {} · confirm_images {}",
             onoff(safety.confirm_writes),
             onoff(safety.confirm_bash),
-            onoff(safety.confirm_mcp)
+            onoff(safety.confirm_mcp),
+            onoff(safety.confirm_images)
         ));
         out.status(&if safety.bash_allowlist.is_empty() {
             "allow list: empty, so every command asks".to_string()

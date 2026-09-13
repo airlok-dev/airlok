@@ -55,6 +55,8 @@ While a turn runs, a status line below the output shows a spinner, what airlok i
 | Tab | take the first `/` command, `@` path, or command argument on offer; Tab again cycles through the rest |
 | Right arrow | take the rest of the `/` command shown after the cursor |
 | Esc or Ctrl-C | during a turn, cancel it |
+| Ctrl+V | attach an image from the clipboard. A chip like `[image 1: 1024x768 png, 210 KB]` goes in at the cursor, so the sentence can refer to it; several fit in one message. Alt+V does the same, for terminals that keep Ctrl+V for themselves. Every failure says why on its own line |
+| a path to an image | typed, Tab-completed or dropped into the terminal, a path ending `.png`, `.jpg`, `.jpeg`, `.gif` or `.webp` is offered as an attachment. Approved, it becomes a chip, so the model gets the picture rather than the path; refused, it stays as typed |
 | Ctrl-C | at the prompt, clear the line; on an empty line it does nothing |
 | Ctrl-D | save and quit |
 | Ctrl-R | search this run's history; Up and Down step through it |
@@ -267,6 +269,7 @@ keep_recent_turns = 4    # turns kept verbatim after the summary
 [safety]
 confirm_writes = true    # show a diff and ask before write_file / edit_file
 confirm_bash = true      # ask before running a command that is not allow-listed
+confirm_images = true    # ask before sending an image, which cannot be scanned for secrets
 bash_allowlist = ["git status", "git diff", "ls", "cat", "pwd", "find", "grep", "rg", "cargo check", "cargo test", "cargo build"]
 bash_denylist = ["rm -rf", "git push --force", "sudo"]
 
@@ -279,6 +282,7 @@ show_secrets_in_output = false   # show secrets from files in full in the termin
 [models."gpt-6-astra"]    # settings for one model id (the deployment name on Azure); none by default
 reasoning_effort = "none" # openai only, sent as reasoning_effort; not validated
 api = "responses"         # openai only, overrides [provider] api for this model
+vision = false            # the model takes no images, so airlok refuses at attach time
 ```
 
 For openai, `base_url` falls back to the `OPENAI_BASE_URL` environment variable when the config does not set it.
