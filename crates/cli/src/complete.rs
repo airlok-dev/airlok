@@ -134,7 +134,13 @@ impl Prompt {
         if let Some((command, _, typed)) = argument_word(line, pos) {
             let matching = self.arguments_matching(command, typed);
             let first = matching.first()?;
-            let mut display = first[typed.len()..].to_string();
+            // With nothing typed, ghosting the first candidate reads as an
+            // offer to take it, and for /goal that one clears the goal.
+            let mut display = if typed.is_empty() {
+                String::new()
+            } else {
+                first[typed.len()..].to_string()
+            };
             for candidate in matching.iter().take(MENU_ROWS) {
                 display.push_str(&format!("\n  {candidate}"));
             }
@@ -371,6 +377,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["openai"]
         );
+    }
+
+    #[test]
+    fn an_untyped_argument_is_listed_without_offering_the_first() {
+        let mut prompt = Prompt::new(std::env::temp_dir(), false);
+        let mut candidates = Candidates::new();
+        candidates.insert("goal", vec!["clear".to_string()]);
+        prompt.set_candidates(candidates);
+
+        // Nothing typed, so the candidates are listed but none is ghosted
+        // at the cursor: taking that one would clear the goal.
+        let line = "/goal ";
+        let hint = prompt.menu(line, line.len()).unwrap();
+        assert!(
+            hint.display.starts_with('\n'),
+            "nothing inline: {:?}",
+            hint.display
+        );
+        assert!(hint.display.contains("clear"), "{:?}", hint.display);
+
+        // Once something is typed, the rest of the match is offered again.
+        let line = "/goal cl";
+        let hint = prompt.menu(line, line.len()).unwrap();
+        assert!(hint.display.starts_with("ear"), "{:?}", hint.display);
     }
 
     #[test]
