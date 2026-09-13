@@ -121,6 +121,15 @@ impl CoreError {
                  this session. `/effort {back_to}` puts it back; the config is not the problem."
             ));
         }
+        // Suggesting the configured value is useless when that value is
+        // the one being rejected.
+        if let Some(configured) = config_effort {
+            return Some(format!(
+                "hint: [models.\"{model}\"] sets reasoning_effort = \"{configured}\", which the \
+                 provider rejected. Use one of the values it lists above, or remove the line to \
+                 take the provider's default."
+            ));
+        }
         Some(format!(
             "hint: the provider rejected its reasoning effort for {model}. \
              Set one in the config, for example:\n[models.\"{model}\"]\nreasoning_effort = \"none\""

@@ -219,11 +219,17 @@ fn a_rejected_reasoning_effort_gets_a_config_hint() {
         hint.contains("[models.\"gpt-6-astra\"]\nreasoning_effort = \"none\""),
         "{hint}"
     );
-    // A value matching the config is not an override either.
+    // A value matching the config is not an override, and saying to set
+    // what is already set, and was just rejected, helps nobody.
     let hint = rejected
         .hint("gpt-6-astra", Some("none"), Some("none"))
         .unwrap();
     assert!(hint.contains("[models.\"gpt-6-astra\"]"), "{hint}");
+    assert!(hint.contains("which the provider rejected"), "{hint}");
+    assert!(
+        !hint.contains("Set one in the config"),
+        "it is already set: {hint}"
+    );
 
     let other = CoreError::Llm(LlmError::Api {
         status: 400,
