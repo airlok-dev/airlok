@@ -97,6 +97,10 @@ pub struct Request {
     /// Sent as `reasoning_effort` by the openai provider, and only when set.
     /// The Anthropic provider ignores it.
     pub reasoning_effort: Option<String>,
+    /// Which OpenAI HTTP API to send this on. The Anthropic provider
+    /// ignores it.
+    #[serde(default)]
+    pub api: Api,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

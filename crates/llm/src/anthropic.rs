@@ -284,6 +284,7 @@ mod tests {
             messages: vec![Message::user_text("hi")],
             tools: Vec::new(),
             reasoning_effort: None,
+            api: Default::default(),
         };
         let body = serde_json::to_value(WireRequest::new(&request)).unwrap();
         assert!(body.get("tools").is_none(), "{body}");

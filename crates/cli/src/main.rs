@@ -1035,6 +1035,11 @@ async fn doctor_checks(
                     .models
                     .get(model)
                     .and_then(|m| m.reasoning_effort.clone()),
+                api: config
+                    .models
+                    .get(model)
+                    .and_then(|m| m.api)
+                    .unwrap_or(config.provider.api),
             };
             let mut stream = provider.stream(request);
             let mut failure = None;

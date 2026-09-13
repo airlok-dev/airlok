@@ -706,6 +706,12 @@ impl Agent {
                 .models
                 .get(&self.config.provider.model)
                 .and_then(|m| m.reasoning_effort.clone()),
+            api: self
+                .config
+                .models
+                .get(&self.config.provider.model)
+                .and_then(|m| m.api)
+                .unwrap_or(self.config.provider.api),
         };
         (request, map)
     }
