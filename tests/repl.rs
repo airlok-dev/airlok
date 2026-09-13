@@ -767,6 +767,57 @@ async fn a_dropped_image_path_is_offered_and_anything_else_is_left_as_text() {
 }
 
 #[tokio::test]
+async fn a_path_followed_by_punctuation_is_still_an_image() {
+    let dir = TempDir::new("attach-punct");
+    std::fs::write(dir.path().join("sky.png"), PNG_1X1).unwrap();
+
+    let provider = MockProvider::scripted(vec![reply("blue")]);
+    let mut agent = agent(provider.clone(), dir.path());
+    let session = agent.new_session();
+    let typed = format!(
+        "what colour is {}/sky.png? answer in one word",
+        dir.path().display()
+    );
+    let mut lines = ScriptedLines::typed(&[&typed]);
+    let mut out = RecordingOutput::answering(vec![
+        airlok_core::Decision::Approve,
+        airlok_core::Decision::Approve,
+    ]);
+    {
+        let mut repl = Repl {
+            agent: &mut agent,
+            store: None,
+            interrupt: Interrupt::new(),
+            backend: Box::new(TestBackend::default()),
+            used: Vec::new(),
+        };
+        repl.run(session, &mut lines, &mut out).await;
+    }
+
+    let sent = &provider.requests()[0].messages[0];
+    assert!(
+        sent.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. })),
+        "a path ending a question is still a path: {:?}",
+        out.events
+    );
+    let text: String = sent
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(!text.contains("sky.png"), "{text}");
+    assert!(
+        text.contains("answer in one word") && text.contains('?'),
+        "the sentence keeps its punctuation: {text}"
+    );
+}
+
+#[tokio::test]
 async fn images_are_confirmed_before_they_leave_and_yes_skips_it() {
     for (confirm, expect_ask) in [(true, true), (false, false)] {
         let dir = TempDir::new("attach-gate");

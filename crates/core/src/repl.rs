@@ -354,6 +354,28 @@ pub const PERMISSION_NAMES: &[&str] = &[
     "undeny",
 ];
 
+/// The image a token names, with the trailing punctuation left out of
+/// both the path and the text that gets replaced.
+fn image_path(token: &Token) -> Option<Token> {
+    let trimmed = token
+        .text
+        .trim_end_matches(['?', '!', ',', ';', ':', ')', '.']);
+    for text in [token.text.as_str(), trimmed] {
+        let path = std::path::Path::new(text);
+        if crate::image::media_type_for_path(path).is_some() && path.is_file() {
+            // The raw form loses the same suffix, so the replacement
+            // keeps the sentence's punctuation.
+            let dropped = token.text.len() - text.len();
+            let raw = token.raw[..token.raw.len() - dropped].to_string();
+            return Some(Token {
+                raw,
+                text: text.to_string(),
+            });
+        }
+    }
+    None
+}
+
 /// One word of a line, as typed and as it means.
 struct Token {
     /// Exactly as it appears, so it can be replaced in the line.
@@ -614,10 +636,12 @@ impl Repl<'_> {
     ) -> (String, Vec<Attachment>) {
         let mut rebuilt = line.to_string();
         for token in tokens(line) {
-            let path = std::path::Path::new(&token.text);
-            if crate::image::media_type_for_path(path).is_none() || !path.is_file() {
+            // A path typed mid-sentence carries the punctuation that
+            // follows it, and "sky.png?" is not an extension airlok knows.
+            let Some(found) = image_path(&token) else {
                 continue;
-            }
+            };
+            let path = std::path::Path::new(&found.text);
             match crate::image::prepare_path(path) {
                 Err(e) => out.status(&e.to_string()),
                 Ok(image) => {
@@ -629,7 +653,7 @@ impl Repl<'_> {
                     match decision {
                         Decision::Approve | Decision::ApproveAll | Decision::SaveAll => {
                             let label = format!("image {}", attached.len() + 1);
-                            rebuilt = rebuilt.replace(&token.raw, &format!("[{label}: {summary}]"));
+                            rebuilt = rebuilt.replace(&found.raw, &format!("[{label}: {summary}]"));
                             for note in &image.notes {
                                 out.status(note);
                             }
