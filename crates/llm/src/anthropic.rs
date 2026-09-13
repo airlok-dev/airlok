@@ -318,6 +318,8 @@ mod tests {
                     source: crate::types::ImageSource::Base64 {
                         media_type: "image/png".into(),
                         data: "AAAB".into(),
+                        width: 2,
+                        height: 2,
                     },
                 }],
             }],

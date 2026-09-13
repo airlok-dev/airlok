@@ -39,6 +39,33 @@ pub trait LineSource {
     /// Offered by Tab after a command that takes an argument. A front end
     /// that does not complete can ignore them.
     fn set_candidates(&mut self, _candidates: Candidates) {}
+
+    /// Images attached to the line just read, in the order their chips
+    /// appear in it. Taken once, so the next line starts with none.
+    fn take_attachments(&mut self) -> Vec<Attachment> {
+        Vec::new()
+    }
+
+    /// What may be attached, refreshed before every prompt so that a
+    /// /model switch is reflected without restarting.
+    fn set_attach_policy(&mut self, _policy: AttachPolicy) {}
+}
+
+/// An image a front end attached to the line being typed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    /// `image 1`, matching the chip shown in the line.
+    pub label: String,
+    pub image: crate::image::Prepared,
+}
+
+/// What the front end needs in order to refuse an attachment at the
+/// moment it is made, rather than a turn later as a provider error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachPolicy {
+    pub model: String,
+    /// False only when the config says so for this model.
+    pub accepts_images: bool,
 }
 
 /// One `/doctor` check: what was tried, whether it worked, and a line
@@ -327,6 +354,61 @@ pub const PERMISSION_NAMES: &[&str] = &[
     "undeny",
 ];
 
+/// One word of a line, as typed and as it means.
+struct Token {
+    /// Exactly as it appears, so it can be replaced in the line.
+    raw: String,
+    /// Unescaped and unquoted, so it can be opened.
+    text: String,
+}
+
+/// Splits a line the way a terminal delivers a dropped path: quoted, or
+/// with its spaces escaped.
+fn tokens(line: &str) -> Vec<Token> {
+    let mut out = Vec::new();
+    let mut raw = String::new();
+    let mut text = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                raw.push(c);
+                if let Some(next) = chars.next() {
+                    raw.push(next);
+                    text.push(next);
+                }
+            }
+            '\'' | '"' if quote.is_none() => {
+                raw.push(c);
+                quote = Some(c);
+            }
+            c if Some(c) == quote => {
+                raw.push(c);
+                quote = None;
+            }
+            c if c.is_whitespace() && quote.is_none() => {
+                if !text.is_empty() {
+                    out.push(Token {
+                        raw: std::mem::take(&mut raw),
+                        text: std::mem::take(&mut text),
+                    });
+                } else {
+                    raw.clear();
+                }
+            }
+            c => {
+                raw.push(c);
+                text.push(c);
+            }
+        }
+    }
+    if !text.is_empty() {
+        out.push(Token { raw, text });
+    }
+    out
+}
+
 /// `part` as a percentage of `whole`, and 0 when there is no whole.
 fn share(part: u64, whole: u64) -> u64 {
     (part * 100).checked_div(whole).unwrap_or(0)
@@ -429,11 +511,15 @@ impl Repl<'_> {
         loop {
             let prompt = self.prompt_text();
             lines.set_candidates(self.candidates(&session));
+            lines.set_attach_policy(self.attach_policy(&session));
             match lines.read_line(&prompt) {
                 Line::Eof => break,
                 // Ctrl-C at the prompt does nothing; Ctrl-D or /exit quits.
                 Line::Interrupt => continue,
                 Line::Text(line) => {
+                    // Drained whatever the line turns out to be, so an
+                    // image never carries over to a later one.
+                    let attached = lines.take_attachments();
                     let line = line.trim();
                     if let Some(command) = line.strip_prefix('/') {
                         if self.command(command, &mut session, out).await == Flow::Exit {
@@ -443,8 +529,8 @@ impl Repl<'_> {
                         self.run_local(command.trim(), &mut session, out).await;
                     } else if let Some(note) = line.strip_prefix('#') {
                         self.remember(note.trim(), out);
-                    } else if !line.is_empty() {
-                        self.turn(&mut session, line, out).await;
+                    } else if !line.is_empty() || !attached.is_empty() {
+                        self.turn(&mut session, line, attached, out).await;
                     }
                 }
             }
@@ -516,11 +602,97 @@ impl Repl<'_> {
         format!("{} {dir}{plan}> ", config.provider.model)
     }
 
-    async fn turn(&mut self, session: &mut Session, line: &str, out: &mut dyn Output) {
+    /// Offers any path in the line that is an image on disk. An
+    /// approved one is replaced by its chip, so the model is never handed
+    /// the bare path; a refused one is left exactly as typed, because
+    /// that is what the user chose.
+    fn offer_paths(
+        &mut self,
+        line: &str,
+        mut attached: Vec<Attachment>,
+        out: &mut dyn Output,
+    ) -> (String, Vec<Attachment>) {
+        let mut rebuilt = line.to_string();
+        for token in tokens(line) {
+            let path = std::path::Path::new(&token.text);
+            if crate::image::media_type_for_path(path).is_none() || !path.is_file() {
+                continue;
+            }
+            match crate::image::prepare_path(path) {
+                Err(e) => out.status(&e.to_string()),
+                Ok(image) => {
+                    let summary = image.summary();
+                    let decision = out.confirm(&Confirmation::AttachPath {
+                        path,
+                        summary: &summary,
+                    });
+                    match decision {
+                        Decision::Approve | Decision::ApproveAll | Decision::SaveAll => {
+                            let label = format!("image {}", attached.len() + 1);
+                            rebuilt = rebuilt.replace(&token.raw, &format!("[{label}: {summary}]"));
+                            for note in &image.notes {
+                                out.status(note);
+                            }
+                            attached.push(Attachment { label, image });
+                        }
+                        Decision::Reject | Decision::Quit => {}
+                    }
+                }
+            }
+        }
+        (rebuilt.trim().to_string(), attached)
+    }
+
+    /// What the front end may attach right now.
+    fn attach_policy(&mut self, session: &Session) -> AttachPolicy {
+        let model = session.model.clone();
+        let accepts_images = self
+            .agent
+            .config()
+            .models
+            .get(&model)
+            .and_then(|m| m.vision)
+            .unwrap_or(true);
+        AttachPolicy {
+            model,
+            accepts_images,
+        }
+    }
+
+    async fn turn(
+        &mut self,
+        session: &mut Session,
+        line: &str,
+        attached: Vec<Attachment>,
+        out: &mut dyn Output,
+    ) {
+        // A path that is an image on disk is worth more as the picture
+        // than as its own name, so it is offered rather than sent as text.
+        let (line, attached) = self.offer_paths(line, attached, out);
+        let images: Vec<crate::image::Prepared> =
+            attached.iter().map(|a| a.image.clone()).collect();
+        if let Err(e) = crate::image::within_budget(&images) {
+            out.status(&format!("{e}"));
+            return;
+        }
+        if !images.is_empty() && self.agent.config().safety.confirm_images {
+            let labels: Vec<String> = attached.iter().map(|a| a.label.clone()).collect();
+            match out.confirm(&Confirmation::UnscannedImages { labels: &labels }) {
+                Decision::Approve | Decision::ApproveAll | Decision::SaveAll => {}
+                Decision::Reject | Decision::Quit => {
+                    out.status("nothing sent");
+                    return;
+                }
+            }
+        }
+        if images.is_empty() && line.is_empty() {
+            return;
+        }
+        let line = line.as_str();
         out.begin_turn();
         match self
             .agent
-            .turn_with(session, line, out, &self.interrupt)
+            .turn_with(session, line, &images, out, &self.interrupt)
             .await
         {
             Ok(_) => {}
@@ -825,8 +997,13 @@ impl Repl<'_> {
         };
         self.agent.set_plan_mode(false);
         out.status("plan mode off; carrying out the plan");
-        self.turn(session, &format!("Carry out this plan:\n\n{plan}"), out)
-            .await;
+        self.turn(
+            session,
+            &format!("Carry out this plan:\n\n{plan}"),
+            Vec::new(),
+            out,
+        )
+        .await;
     }
 
     /// Runs a `!` command in the working directory, shows what it printed,

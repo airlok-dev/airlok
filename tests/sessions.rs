@@ -37,6 +37,79 @@ async fn saved_session(dir: &TempDir, store: &SessionStore) -> Session {
 }
 
 #[tokio::test]
+async fn a_session_file_records_an_image_without_its_bytes() {
+    let dir = TempDir::new("session-image");
+    let store = SessionStore::new(dir.path().join("data"));
+    let provider = MockProvider::scripted(vec![]);
+    let mut agent = agent(provider, dir.path());
+    let mut session = agent.new_session();
+
+    // Stands in for a screenshot: what matters is that none of it lands.
+    let data = "QUJDREVGRwo".repeat(64);
+    session.messages.push(airlok_llm::Message {
+        role: Role::User,
+        content: vec![
+            ContentBlock::Text {
+                text: "what is this?".into(),
+            },
+            ContentBlock::Image {
+                source: airlok_llm::ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: data.clone(),
+                    width: 1024,
+                    height: 768,
+                },
+            },
+        ],
+    });
+
+    let path = store.save(&session).unwrap();
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !raw.contains(&data),
+        "the image bytes must never reach the session file"
+    );
+    assert!(
+        !raw.contains("base64"),
+        "not even as an empty base64 block: {raw}"
+    );
+    assert!(raw.contains("reference"), "{raw}");
+    assert!(
+        raw.contains("1024") && raw.contains("768"),
+        "dimensions are kept"
+    );
+    assert!(raw.contains("image/png"), "the format is kept");
+    assert!(
+        raw.contains("what is this?"),
+        "the words around it are kept"
+    );
+
+    // What --resume sees: the image is remembered, the bytes are gone.
+    let resumed = store
+        .load(&session.cwd, Some(&session.id))
+        .unwrap()
+        .expect("the session is on disk");
+    let blocks = &resumed.messages[0].content;
+    assert!(matches!(blocks[0], ContentBlock::Text { .. }));
+    match &blocks[1] {
+        ContentBlock::Image {
+            source:
+                airlok_llm::ImageSource::Reference {
+                    media_type,
+                    width,
+                    height,
+                    hash,
+                },
+        } => {
+            assert_eq!(media_type, "image/png");
+            assert_eq!((*width, *height), (1024, 768));
+            assert_eq!(hash.len(), 16, "a hash, not the picture");
+        }
+        other => panic!("expected a reference, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn round_trip_keeps_history_and_file_secrets_but_never_the_provider_key() {
     let dir = TempDir::new("session-roundtrip");
     let store = SessionStore::new(dir.path().join("data"));

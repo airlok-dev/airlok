@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use airlok_core::config::{ProviderConfig, ProviderName};
 use airlok_core::redact::SecretRedactor;
 use airlok_core::redact::{RedactionMap, Redactor};
-use airlok_core::repl::{Backend, Line, LineSource, Switch};
+use airlok_core::repl::{AttachPolicy, Attachment, Backend, Line, LineSource, Switch};
 use airlok_core::tools::ToolRegistry;
 use airlok_core::{Agent, Config, Confirmation, Decision, Output};
 use airlok_llm::{LlmError, Provider, Request, StopReason, StreamEvent};
@@ -92,6 +92,12 @@ pub fn partial(text: &str) -> Vec<StreamEvent> {
 pub struct ScriptedLines {
     pub lines: VecDeque<Line>,
     pub prompts: Vec<String>,
+    /// One batch per line read, in order. An exhausted queue attaches
+    /// nothing, which is what a front end with no clipboard does.
+    pub attachments: VecDeque<Vec<Attachment>>,
+    /// Every policy the REPL set, so a test can check what a front end
+    /// would have been told about the model in use.
+    pub policies: Vec<AttachPolicy>,
 }
 
 impl ScriptedLines {
@@ -99,11 +105,19 @@ impl ScriptedLines {
         Self {
             lines: lines.into(),
             prompts: Vec::new(),
+            attachments: VecDeque::new(),
+            policies: Vec::new(),
         }
     }
 
     pub fn typed(lines: &[&str]) -> Self {
         Self::new(lines.iter().map(|l| Line::Text(l.to_string())).collect())
+    }
+
+    /// Attaches `attachments` to the next line read.
+    pub fn attaching(mut self, attachments: Vec<Attachment>) -> Self {
+        self.attachments.push_back(attachments);
+        self
     }
 }
 
@@ -111,6 +125,14 @@ impl LineSource for ScriptedLines {
     fn read_line(&mut self, prompt: &str) -> Line {
         self.prompts.push(prompt.to_string());
         self.lines.pop_front().unwrap_or(Line::Eof)
+    }
+
+    fn take_attachments(&mut self) -> Vec<Attachment> {
+        self.attachments.pop_front().unwrap_or_default()
+    }
+
+    fn set_attach_policy(&mut self, policy: AttachPolicy) {
+        self.policies.push(policy);
     }
 }
 
@@ -247,6 +269,13 @@ pub enum Shown {
     ConfirmMcpProject {
         servers: Vec<(String, String)>,
     },
+    ConfirmAttachPath {
+        path: PathBuf,
+        summary: String,
+    },
+    ConfirmUnscannedImages {
+        labels: Vec<String>,
+    },
     ConfirmMcp {
         server: String,
         tool: String,
@@ -340,6 +369,13 @@ impl Output for RecordingOutput {
             },
             Confirmation::McpProject { servers } => Shown::ConfirmMcpProject {
                 servers: servers.to_vec(),
+            },
+            Confirmation::AttachPath { path, summary } => Shown::ConfirmAttachPath {
+                path: path.to_path_buf(),
+                summary: summary.to_string(),
+            },
+            Confirmation::UnscannedImages { labels } => Shown::ConfirmUnscannedImages {
+                labels: labels.to_vec(),
             },
             Confirmation::Mcp {
                 server,

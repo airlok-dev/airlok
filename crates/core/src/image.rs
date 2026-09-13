@@ -177,6 +177,32 @@ pub fn prepare(bytes: &[u8], media_type: &str) -> Result<Prepared, ImageError> {
     })
 }
 
+impl Prepared {
+    /// The block a provider takes.
+    pub fn source(&self) -> airlok_llm::ImageSource {
+        airlok_llm::ImageSource::Base64 {
+            media_type: self.media_type.clone(),
+            data: self.data.clone(),
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    /// `1024x768 png, 210 KB`: what the chip in the line says and what a
+    /// confirmation shows.
+    pub fn summary(&self) -> String {
+        format!(
+            "{}x{} {}, {}",
+            self.width,
+            self.height,
+            self.media_type
+                .strip_prefix("image/")
+                .unwrap_or(&self.media_type),
+            human(self.bytes)
+        )
+    }
+}
+
 /// Refuses a message whose images come to more than [`MESSAGE_BUDGET`].
 pub fn within_budget(prepared: &[Prepared]) -> Result<(), ImageError> {
     let total: usize = prepared.iter().map(|p| p.bytes).sum();

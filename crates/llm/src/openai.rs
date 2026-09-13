@@ -464,9 +464,9 @@ impl sse::Assembler for ResponsesAssembler {
 /// text long before a request is built.
 fn data_url(source: &ImageSource) -> Option<String> {
     match source {
-        ImageSource::Base64 { media_type, data } => {
-            Some(format!("data:{media_type};base64,{data}"))
-        }
+        ImageSource::Base64 {
+            media_type, data, ..
+        } => Some(format!("data:{media_type};base64,{data}")),
         ImageSource::Reference { .. } => None,
     }
 }
@@ -1144,6 +1144,8 @@ mod tests {
                         source: ImageSource::Base64 {
                             media_type: "image/png".into(),
                             data: "AAAB".into(),
+                            width: 2,
+                            height: 2,
                         },
                     },
                 ],

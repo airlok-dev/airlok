@@ -43,6 +43,12 @@ pub enum ImageSource {
     Base64 {
         media_type: String,
         data: String,
+        /// In memory only, so a session file can record what was sent
+        /// without keeping the bytes. Serialised neither way.
+        #[serde(skip)]
+        width: u32,
+        #[serde(skip)]
+        height: u32,
     },
     Reference {
         media_type: String,
