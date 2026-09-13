@@ -1010,11 +1010,6 @@ async fn doctor_checks(
 
     let key = config.resolve_key();
     match &key {
-        // The rest read files or talk to local processes.
-        _ if offline => checks.push(Check::pass(
-            "provider request",
-            "skipped: --offline".to_string(),
-        )),
         Ok(_) => checks.push(Check::pass(
             "provider key",
             format!("resolved from {}", config.key_source()),
@@ -1026,6 +1021,12 @@ async fn doctor_checks(
     }
 
     match key {
+        // The one check that leaves the machine. Everything else reads
+        // files or talks to local processes.
+        _ if offline => checks.push(Check::pass(
+            "provider request",
+            "skipped: --offline".to_string(),
+        )),
         Err(_) => checks.push(Check::fail(
             "provider request",
             "not attempted: no key to send".to_string(),
