@@ -94,7 +94,7 @@ A cancelled turn keeps the text streamed so far in the history, marked as interr
 | `/init` | propose an AIRLOK.md for this repository, as a diff to approve |
 | `/copy [<n>\|code]` | copy the last reply to the clipboard; a number takes the Nth from the end, `code` the last fenced block |
 | `/diff [<path>]` | what airlok changed on disk this session, diffed from before its first write |
-| `/doctor` | check the config, key, provider, MCP servers, git, terminal and storage; `airlok doctor` does the same and exits non-zero on failure |
+| `/doctor` | check the config, key, provider, MCP servers, git, terminal and storage; `airlok doctor` does the same and exits non-zero on failure. `--offline` skips the provider request, the one check that leaves the machine |
 | `/goal [<statement>\|clear]` | what the session is working toward, kept in the system prompt every turn and shown in the footer |
 | `/clear` | start a new session; the current one stays saved |
 | `/exit` | save and quit; `/quit` works too |
@@ -254,6 +254,7 @@ model = "claude-sonnet-4-6"   # per provider: anthropic "claude-sonnet-4-6", ope
 # base_url = "https://api.openai.com/v1"   # openai only; Azure: "https://<resource>.openai.azure.com/openai/v1"
 # api_key_env = "ANTHROPIC_API_KEY"        # env var holding the key
 # api_key_cmd = "..."                      # shell command whose stdout is the key
+# api = "chat"                             # openai only: "chat" (the default) or "responses"
 context_window = 200000       # input tokens the model accepts; used to decide when to compact
 
 [agent]
@@ -277,6 +278,7 @@ show_secrets_in_output = false   # show secrets from files in full in the termin
 
 [models."gpt-6-astra"]    # settings for one model id (the deployment name on Azure); none by default
 reasoning_effort = "none" # openai only, sent as reasoning_effort; not validated
+api = "responses"         # openai only, overrides [provider] api for this model
 ```
 
 For openai, `base_url` falls back to the `OPENAI_BASE_URL` environment variable when the config does not set it.
@@ -299,7 +301,7 @@ base_url = "https://<resource>.openai.azure.com/openai/v1"
 api_key_cmd = "az cognitiveservices account keys list -n <resource> -g <resource-group> --query key1 -o tsv"
 ```
 
-Azure's `gpt-6-astra` accepts tools on Chat Completions only with reasoning off, so it needs `[models."gpt-6-astra"]` with `reasoning_effort = "none"`. Without it, airlok shows the provider's error and names that setting. The entry applies however the model is chosen, `/model gpt-6-astra` included.
+Azure's `gpt-6-astra` accepts tools on Chat Completions only with reasoning off, so on that API it needs `[models."gpt-6-astra"]` with `reasoning_effort = "none"`. Giving the model `api = "responses"` instead keeps both the tools and the reasoning effort, which is what makes `/effort` worth using there. With neither, airlok shows the provider's error and names the setting behind it. The entry applies however the model is chosen, `/model gpt-6-astra` included.
 
 With this in the user config, plain `airlok "..."` works. The key is sent in Azure's `api-key` header, chosen from the host. No shell wrapper or exported variable is needed.
 
