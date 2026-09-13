@@ -1020,6 +1020,7 @@ pub const TEMPLATE: &str = r##"# airlok configuration. Precedence: CLI flags > .
 # Settings for one model id (the deployment name on Azure), applied however it is chosen, /model included.
 # [models."gpt-6-astra"]
 # reasoning_effort = "none"   # openai only, sent as reasoning_effort; Azure's gpt-6-astra needs "none" to use tools on Chat Completions
+# api = "responses"          # openai only: "chat" (the default) or "responses"
 
 # An MCP server whose tools the model may call, offered as <name>__<tool>. Repeat the block for more.
 # [[mcp]]
